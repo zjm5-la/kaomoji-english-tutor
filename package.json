@@ -1,0 +1,23 @@
+{
+  "name": "kaomoji-english-tutor",
+  "version": "0.1.0",
+  "description": "A kaomoji pet that teaches you English based on your conversation topic",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@earendil-works/pi-tui": "*"
+  }
+}
