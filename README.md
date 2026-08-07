@@ -56,18 +56,18 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 
 | 设置项 | 默认值 | 说明 |
 | --------- | --------- | ------------- |
-| `provider` | *(自动选择)* | 备课使用的模型 |
-| `model` | *(自动选择)* | 备课使用的模型 ID |
-| `thinkingLevel` | *(默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
+| `provider` | *(自动检测)* | 备课模型提供商 |
+| `model` | *(自动检测)* | 备课模型 ID |
+| `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `debounceTurns` | `3` | 每多少个会话回合宠物活动一次 |
 | `dailyNewLimit` | `3` | 每天新学学习项上限 |
-| `maxTokens` | `600` | 单次备课内容的长度上限 |
+| `maxTokens` | `600` | 备课 LLM 响应的最大 token 数 |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
 ### 说明
 
-- 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash 等）
+- 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash、grok-4.3、glm-5.2）
 - 复习为展示式（宠物展示卡片，默认按「Good」推进 FSRS 调度）；数据结构保留评分入口，未来可加交互
 - 学习数据位于 `~/.pi/agent/kaomoji-english-tutor.db`，删除该文件即清空学习记录
 
@@ -107,17 +107,17 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 
 | Setting | Default | Description |
 | --------- | --------- | ------------- |
-| `provider` | *(auto)* | Lesson model provider |
-| `model` | *(auto)* | Lesson model ID |
-| `thinkingLevel` | *(default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `provider` | *(auto-detect)* | Lesson model provider |
+| `model` | *(auto-detect)* | Lesson model ID |
+| `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `debounceTurns` | `3` | Pet acts every N conversation turns |
 | `dailyNewLimit` | `3` | Max new items taught per day |
-| `maxTokens` | `600` | Max lesson content length |
+| `maxTokens` | `600` | Max tokens for lesson generation |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 
 ### Notes
 
-- Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash)
+- Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash, grok-4.3, glm-5.2)
 - Reviews are display-based (the pet shows the card and advances FSRS with a Good rating); the data model keeps a rating hook for future interactivity
 - Learning data lives in `~/.pi/agent/kaomoji-english-tutor.db`; delete it to wipe all progress
