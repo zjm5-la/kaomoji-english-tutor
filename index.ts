@@ -39,7 +39,6 @@ const AUTO_DETECT_MODELS = [
 	"grok-4.3",
 	"glm-5.2",
 ];
-
 function loadConfig(cwd: string): PetConfig {
 	const globalPath = join(getAgentDir(), "kaomoji-english-tutor.json");
 	const projectPath = join(cwd, ".pi", "kaomoji-english-tutor.json");
@@ -305,13 +304,25 @@ interface Lesson {
 	items: GeneratedItem[];
 }
 
+interface ResolvedModel {
+	provider: string;
+	model: string;
+	fromSession: boolean;
+}
+
 async function generateLesson(
 	ctx: ExtensionContext,
+	resolved: ResolvedModel,
 	conversation: string,
 	known: string[],
 	config: PetConfig,
 ): Promise<Lesson> {
-	const model = ctx.modelRegistry.find(config.provider!, config.model!);
+	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
+	if (!model) {
+		const err = new Error("MODEL_NOT_FOUND");
+		(err as Error & { code?: string }).code = "MODEL_NOT_FOUND";
+		throw err;
+	}
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth?.ok || !auth.apiKey) {
 		const err = new Error("NO_API_KEY");
@@ -457,19 +468,39 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		resolvedModelName = "";
 	}
 
-	function resolveModel(ctx: ExtensionContext): { provider: string; model: string } | undefined {
+	/**
+	 * Resolve the lesson model: explicit config first, then auto-detect among
+	 * models whose provider has configured auth (logged in / API key present),
+	 * falling back to the current session model.
+	 */
+	function resolveModel(ctx: ExtensionContext): { provider: string; model: string; fromSession: boolean } | undefined {
+		const withAuth = (m: { provider: string; id: string }) =>
+			ctx.modelRegistry.hasConfiguredAuth(m as never);
+
 		if (config.provider && config.model) {
-			resolvedModelName = `${config.provider}/${config.model}`;
-			return { provider: config.provider, model: config.model };
+			const found = ctx.modelRegistry.find(config.provider, config.model);
+			if (found && withAuth(found)) {
+				resolvedModelName = `${config.provider}/${config.model}`;
+				return { provider: config.provider, model: config.model, fromSession: false };
+			}
 		}
-		const available = ctx.modelRegistry.getAvailable();
+
+		const available = ctx.modelRegistry.getAvailable().filter(withAuth);
 		for (const candidateId of AUTO_DETECT_MODELS) {
 			const match = available.find((m) => m.id === candidateId);
 			if (match) {
 				resolvedModelName = `${match.provider}/${match.id}`;
-				return { provider: match.provider, model: match.id };
+				return { provider: match.provider, model: match.id, fromSession: false };
 			}
 		}
+
+		// Last resort: the model currently driving this session (it is by
+		// definition authenticated and reachable).
+		if (ctx.model) {
+			resolvedModelName = `${ctx.model.provider}/${ctx.model.id}（当前会话）`;
+			return { provider: ctx.model.provider, model: ctx.model.id, fromSession: true };
+		}
+
 		resolvedModelName = "";
 		return undefined;
 	}
@@ -550,7 +581,27 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (!resolved) throw new Error("NO_MODEL");
 			const conversation = buildConversation(ctx.sessionManager.getBranch());
 			if (!conversation.trim()) return;
-			const lesson = await generateLesson(ctx, conversation, db ? knownList(db) : [], config);
+
+			let lesson: Lesson;
+			try {
+				lesson = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
+			} catch (err) {
+				// Fallback: when the chosen model is unreachable (missing auth,
+				// network or provider errors), retry once with the current session
+				// model — it is authenticated and known to work.
+				if (!resolved.fromSession && ctx.model && ctx.model.id !== resolved.model) {
+					const fallback: ResolvedModel = {
+						provider: ctx.model.provider,
+						model: ctx.model.id,
+						fromSession: true,
+					};
+					lesson = await generateLesson(ctx, fallback, conversation, db ? knownList(db) : [], config);
+					resolvedModelName = `${fallback.provider}/${fallback.model}（当前会话·降级）`;
+				} else {
+					throw err;
+				}
+			}
+
 			if (!db) return;
 			for (const it of lesson.items) {
 				insertItem(db, it.type, it.text, it.phonetic || null, it.meaning, it.example || null, it.example_cn || null, now);

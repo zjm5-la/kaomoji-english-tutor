@@ -67,7 +67,8 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 
 ### 说明
 
-- 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash、grok-4.3、glm-5.2）
+- 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash、grok-4.3、glm-5.2），仅从已登录或已配置密钥的提供商中选择
+- 若选中的模型无法访问（密钥缺失、网络或服务端错误），自动降级到当前会话正在使用的模型重试
 - 复习为展示式（宠物展示卡片，默认按「Good」推进 FSRS 调度）；数据结构保留评分入口，未来可加交互
 - 学习数据位于 `~/.pi/agent/kaomoji-english-tutor.db`，删除该文件即清空学习记录
 
@@ -118,6 +119,7 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 
 ### Notes
 
-- Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash, grok-4.3, glm-5.2)
+- Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash, grok-4.3, glm-5.2), only from providers with configured auth (logged in or API key present)
+- If the chosen model is unreachable (missing key, network or provider errors), it falls back to the model driving the current session and retries
 - Reviews are display-based (the pet shows the card and advances FSRS with a Good rating); the data model keeps a rating hook for future interactivity
 - Learning data lives in `~/.pi/agent/kaomoji-english-tutor.db`; delete it to wipe all progress
