@@ -19,5 +19,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "^0.80.0",
     "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "fsrs.js": "^1.2.2"
   }
 }
