@@ -5,6 +5,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { FSRS, Rating, Card } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // -- Configuration --------------------------------------------------------
 
@@ -178,7 +179,7 @@ function touchStreak(db: DatabaseSync, now: Date) {
 
 function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
 	return db
-		.prepare("SELECT * FROM items WHERE due_at <= ? ORDER BY due_at ASC LIMIT 1")
+		.prepare("SELECT * FROM items WHERE due_at <= ? ORDER BY due_at ASC, id ASC LIMIT 1")
 		.get(now.toISOString()) as ItemRow | undefined;
 }
 
@@ -223,8 +224,8 @@ function insertCompanionWords(db: DatabaseSync, keyWords: GeneratedItem["keyWord
 	}
 }
 
-function markShown(db: DatabaseSync, id: number, fsrsState: string, dueAt: string) {
-	db.prepare("UPDATE items SET shown = 1, fsrs_state = ?, due_at = ? WHERE id = ?").run(fsrsState, dueAt, id);
+function markShown(db: DatabaseSync, id: number) {
+	db.prepare("UPDATE items SET shown = 1 WHERE id = ?").run(id);
 }
 
 function advanceReview(db: DatabaseSync, id: number, fsrsState: string, dueAt: string, reviews: number) {
@@ -245,7 +246,9 @@ function countTodayNew(db: DatabaseSync, now: Date): number {
 
 function countTodayReviews(db: DatabaseSync, now: Date): number {
 	const row = db
-		.prepare("SELECT COUNT(*) AS n FROM items WHERE reviews >= 1 AND due_at >= ? AND learned_at < ?")
+		.prepare(
+			"SELECT COUNT(*) AS n FROM items WHERE reviews >= 1 AND json_extract(fsrs_state, '$.last_review') >= ? AND json_extract(fsrs_state, '$.last_review') < ?",
+		)
 		.get(localDayStartISO(now), localDayStartISO(new Date(now.getTime() + 24 * 3600 * 1000))) as { n: number };
 	return Number(row.n);
 }
@@ -255,10 +258,6 @@ function knownList(db: DatabaseSync): string[] {
 		text: string;
 	}[];
 	return rows.map((r) => r.text);
-}
-
-function latestItem(db: DatabaseSync): ItemRow | undefined {
-	return db.prepare("SELECT * FROM items ORDER BY id DESC LIMIT 1").get() as ItemRow | undefined;
 }
 
 // -- FSRS scheduling ------------------------------------------------------
@@ -282,7 +281,7 @@ function restoreCard(stateJson: string): Card {
 }
 
 /**
- * Advance a card with a rating (display-based review defaults to Good).
+ * Advance a card only after an explicit user rating.
  * Passing null state creates the first schedule for a brand-new item.
  */
 function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } {
@@ -385,22 +384,31 @@ async function generateLesson(
 		throw err;
 	}
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth?.ok || !auth.apiKey) {
+	if (!auth.ok || !auth.apiKey) {
 		const err = new Error("NO_API_KEY");
 		(err as Error & { code?: string }).code = "NO_API_KEY";
 		throw err;
 	}
+	const requestAuth = {
+		apiKey: auth.apiKey,
+		headers: auth.headers as Record<string, string> | undefined,
+	};
 
 	const prompt = [
 		"你是「英语小宠物」的备课大脑。看下面的会话内容，判断用户当前在做什么主题，",
-		"然后围绕这个主题准备 3 个学习项：1 个单词、1 个词组、1 个句子。",
+		"然后围绕这个主题准备 3 个学习项：1 个单词、1 个词组、1 个渐进长句。",
 		"",
 		"要求：",
 		"- 内容要真实常用，宁简单不冷僻，适合中级学习者",
-		"- 句子短小自然，贴近主题的实际使用场景",
+		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
+		"- sentence 的 text 必须是真正的长句：至少 15 个单词，包含从句或插入成分；禁止用简单句或短句充数",
+		"- 长句结构要多样化：定语从句、状语从句、宾语从句、插入语、分词短语、同位语等轮换使用，避免总是使用 which 定语从句",
+		"- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（2-3 个生词）",
+		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
+		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
 		"- 只输出 JSON，不要任何其他文字：",
-		'{"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"英文句子","phonetic":"","meaning":"中文翻译","example":"","example_cn":""}]}',
-		"- 不要与已学内容重复：" + (known.length ? known.join("、") : "（暂无已学内容）"),
+		'{"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
+		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		"",
 		"<conversation>",
 		conversation,
@@ -408,8 +416,8 @@ async function generateLesson(
 	].join("\n");
 
 	const llmOptions: Record<string, unknown> = {
-		apiKey: auth.apiKey,
-		headers: auth.headers,
+		apiKey: requestAuth.apiKey,
+		headers: requestAuth.headers,
 		maxTokens: config.maxTokens,
 	};
 	if (config.thinkingLevel) {
@@ -468,7 +476,7 @@ async function generateLesson(
 	// Models sometimes omit them — backfill with a dedicated follow-up call.
 	for (const it of items) {
 		if (it.type === "sentence" && (!it.levels?.length || !it.levels_cn?.length || !it.chunks?.length || !it.keyWords?.length)) {
-			await completeSentenceData(ctx, model, auth, config, it);
+			await completeSentenceData(ctx, model, requestAuth, config, it);
 		}
 	}
 
@@ -486,7 +494,7 @@ async function completeSentenceData(
 	const prompt = [
 		"为下面的英文句子生成长句训练数据，只输出 JSON：",
 		'{"levels":["主干短句（去掉所有修饰成分，同一语义）","主干+一个修饰成分","与原文完全相同的完整长句"],"levels_cn":["主干短句的中文翻译","加一个成分后的中文翻译","完整长句的中文翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}',
-		"要求：levels 最后一级必须与原文完全相同；levels_cn 与 levels 一一对应；chunks 是原文的意群切分（3-5 个，每个 2-6 个词）；keyWords 是句中 2-3 个可能生僻的词（含音标和中文释义）。",
+		"要求：levels 最后一级必须与原文完全相同；三个级别互不相同，每级只增加一个主要意群，L2 词数约为 L3 的 50%-75%；levels_cn 与 levels 一一对应，使用自然地道的中文；chunks 是原文的意群切分（3-5 个）；keyWords 是句中 2-3 个可能生僻的词（含音标和中文释义）。",
 		"",
 		"<sentence>",
 		item.text,
@@ -538,7 +546,7 @@ async function completeSentenceData(
 	const levelsCn = Array.isArray(parsed.levels_cn) ? parsed.levels_cn.filter((l): l is string => typeof l === "string") : [];
 	const chunks = Array.isArray(parsed.chunks) ? parsed.chunks.filter((c): c is string => typeof c === "string") : [];
 	const keyWords = Array.isArray(parsed.keyWords)
-		? parsed.keyWords.filter((k): k is GeneratedItem["keyWords"][number] =>
+		? parsed.keyWords.filter((k): k is NonNullable<GeneratedItem["keyWords"]>[number] =>
 				!!k && typeof k === "object" && typeof (k as { text?: unknown }).text === "string" && typeof (k as { meaning?: unknown }).meaning === "string",
 			)
 		: [];
@@ -584,7 +592,7 @@ function parseJsonCol<T>(raw: string | null): T | undefined {
 }
 
 /** Render a teach/review card as widget lines (front = question, back = answer). */
-function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: string, showAnswer = false): string[] {
+function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false): string[] {
 	const label = TYPE_LABELS[item.type] ?? item.type;
 	const lines: string[] = [];
 
@@ -607,10 +615,12 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: st
 			}
 			lines.push(`  翻译：${levelsCn?.[level] ?? item.meaning}`);
 		}
-		if (level < levels.length - 1) {
-			lines.push(`💬 flip 翻面看翻译 · good 升一级 · again 退一级（读到 L${levels.length} 才算完）`);
+		if (level === 0) {
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 稍后重学`);
+		} else if (level < levels.length - 1) {
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 退到 L${level}`);
 		} else {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 退到 L${level}`);
 		}
 		return lines;
 	}
@@ -618,7 +628,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: st
 	if (isReview) {
 		if (showAnswer) {
 			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
-			lines.push(`  第 ${item.reviews + 1} 次复习，下次 ${(nextDue ?? item.due_at).slice(0, 10)}`);
+			lines.push(`  第 ${item.reviews + 1} 次复习`);
 		} else {
 			lines.push(`${face} 复习时间到：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		}
@@ -627,7 +637,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: st
 		}
 		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
 	} else {
-		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " / " + item.phonetic : ""}`);
+		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
 			lines.push(`  释义：${item.meaning}`);
 			if (item.example) {
@@ -665,6 +675,18 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingLLMCall = false;
 		turnsSinceTick = 0;
 		resolvedModelName = "";
+	}
+
+	/** Close the session-scoped SQLite connection before reload/switch/exit. */
+	function closeDb() {
+		const current = db;
+		db = null;
+		if (!current) return;
+		try {
+			current.close();
+		} catch (err) {
+			console.error(`[kaomoji-english-tutor] Failed to close DB: ${err}`);
+		}
 	}
 
 	/**
@@ -718,19 +740,17 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				return s;
 			}
 		};
-		const cols = process.stdout.columns || 120;
-		const out = lines.map((line) =>
-			line.length > cols - 2 ? line.slice(0, cols - 5) + "..." : line,
-		);
+		const width = Math.max(20, (process.stdout.columns || 120) - 2);
+		const out = lines.flatMap((line) => wrapTextWithAnsi(line, width));
 		ctx.ui.setWidget("kaomoji-english-tutor", out.map(accent), { placement: "belowEditor" });
 	}
 
-	function showItem(ctx: ExtensionContext, item: ItemRow, isReview: boolean, nextDue?: string) {
+	function showItem(ctx: ExtensionContext, item: ItemRow, isReview: boolean) {
 		if (!db) return;
 		const face = isReview ? FACES.review : FACES.teach;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
-		const lines = renderCard(item, isReview, face, nextDue, false);
+		const lines = renderCard(item, isReview, face, false);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		if (config.verbose) {
@@ -738,14 +758,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	/** Flip the pending card to its answer side. */
+	/** Toggle the pending card between its question and answer sides. */
 	function flipPending(ctx: ExtensionContext): boolean {
 		if (pendingItemId == null || !db) return false;
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
-		pendingFlipped = true;
+		pendingFlipped = !pendingFlipped;
 		const face = pendingIsReview ? FACES.review : FACES.teach;
-		const lines = renderCard(item, pendingIsReview, face, item.due_at, true);
+		const lines = renderCard(item, pendingIsReview, face, pendingFlipped);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		return true;
@@ -766,7 +786,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const shown = { ...item, progress: level } as ItemRow;
 		pendingFlipped = false;
 		pendingIsReview = false;
-		const lines = renderCard(shown, false, FACES.teach, undefined, false);
+		const lines = renderCard(shown, false, FACES.teach, false);
 		lines.push(statsLine(db!));
 		updateWidget(ctx, FACES.teach, lines);
 	}
@@ -858,25 +878,20 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	async function petTick(ctx: ExtensionContext) {
 		if (isCtxStale(ctx)) return;
 		if (!db) return;
+		// An Anki-style card stays active until the user rates or skips it.
+		// Never let the turn timer replace the pending card with another due item.
+		if (pendingItemId != null) return;
 		const now = new Date();
 
 		// 1. Due item first: show a review card (or the first showing of a new item)
 		const due = getDueItem(db, now);
 		if (due) {
 			if (due.shown === 0) {
-				const next = scheduleNext(null, now);
-				markShown(db, due.id, next.state, next.due);
+				markShown(db, due.id);
 				touchStreak(db, now);
-				pendingItemId = due.id;
-				showItem(ctx, due, false);
-			} else {
-				const next = scheduleNext(due.fsrs_state, now);
-				advanceReview(db, due.id, next.state, next.due, due.reviews + 1);
-				bumpStat(db, "total_reviews", 1);
-				touchStreak(db, now);
-				pendingItemId = due.id;
-				showItem(ctx, due, true, next.due);
 			}
+			pendingItemId = due.id;
+			showItem(ctx, due, due.shown === 1);
 			return;
 		}
 
@@ -935,10 +950,15 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			}
 			bumpStat(db, "total_learned", lesson.items.length);
 			touchStreak(db, now);
-			const first = latestItem(db);
+			const first = getDueItem(db, now);
 			if (first) {
+				markShown(db, first.id);
+				const shown = { ...first, shown: 1 };
+				pendingItemId = first.id;
+				pendingFlipped = false;
+				pendingIsReview = false;
 				const topicLine = lesson.topic ? `${FACES.teach} 今日主题：${lesson.topic}` : FACES.teach;
-				const lines = [topicLine, ...renderCard(first, false, FACES.teach).slice(1)];
+				const lines = [topicLine, ...renderCard(shown, false, FACES.teach, false)];
 				lines.push(statsLine(db));
 				updateWidget(ctx, FACES.teach, lines);
 			}
@@ -1071,12 +1091,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("kaomoji:flip", {
-		description: "Flip the shown card to reveal its answer side",
+		description: "Toggle the shown card between question and answer sides",
 		handler: async (_args, ctx) => {
-			if (pendingFlipped) {
-				ctx.ui.notify("已经翻面了，直接评分吧", "info");
-				return;
-			}
 			if (!flipPending(ctx)) {
 				ctx.ui.notify("当前没有可翻面的卡片", "info");
 			}
@@ -1111,6 +1127,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		closeDb();
 		config = loadConfig(ctx.cwd);
 		resetState();
 		latestCtx = ctx;
@@ -1122,6 +1139,15 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		}
 		resolveModel(ctx);
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+	});
+
+	pi.on("session_shutdown", async () => {
+		latestCtx = undefined;
+		pendingItemId = null;
+		pendingFlipped = false;
+		pendingIsReview = false;
+		pendingLLMCall = false;
+		closeDb();
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
