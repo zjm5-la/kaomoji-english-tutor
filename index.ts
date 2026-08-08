@@ -229,12 +229,12 @@ function restoreCard(stateJson: string): Card {
 }
 
 /**
- * Advance a card with a Good rating (display-based review, no user feedback).
+ * Advance a card with a rating (display-based review defaults to Good).
  * Passing null state creates the first schedule for a brand-new item.
  */
-function scheduleNext(stateJson: string | null, now: Date): { state: string; due: string } {
+function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } {
 	const card = stateJson ? restoreCard(stateJson) : new Card();
-	const info = scheduler.repeat(card, now)[Rating.Good];
+	const info = scheduler.repeat(card, now)[rating];
 	return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
 }
 
@@ -430,6 +430,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: st
 	if (isReview) {
 		lines.push(`${face} 复习时间到：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 		lines.push(`  第 ${item.reviews + 1} 次复习，下次 ${(nextDue ?? item.due_at).slice(0, 10)}`);
+		lines.push(`💬 回复「A」记得 /「B」忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " / " + item.phonetic : ""}`);
 		lines.push(`  释义：${item.meaning}`);
@@ -539,6 +540,63 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	// -- Pet tick ---------------------------------------------------------
 
+	/** Pending review awaiting a rating reply (item id). */
+	let pendingReviewId: number | null = null;
+
+	/**
+	 * Parse a rating reply from the last user message: A/记得 -> Good,
+	 * B/忘了 -> Again. Anything else (or no pending card) is ignored.
+	 */
+	function parseRatingReply(text: string): Rating | undefined {
+		const t = text.trim().toLowerCase();
+		if (/^a\b|^a[。.！!]?$|记得|记住了|会了/.test(t)) return Rating.Good;
+		if (/^b\b|^b[。.！!]?$|忘了|忘记了|不会/.test(t)) return Rating.Again;
+		return undefined;
+	}
+
+	/** Last user message text from the branch, if any. */
+	function lastUserText(entries: SessionEntry[]): string | undefined {
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const e = entries[i];
+			if (e.type !== "message" || e.message?.role !== "user") continue;
+			const text = renderText(e.message.content).trim();
+			if (text) return text;
+		}
+		return undefined;
+	}
+
+	/** Handle a rating reply for the pending review card, if one is due. */
+	function handleRatingReply(ctx: ExtensionContext): boolean {
+		if (pendingReviewId == null || !db) return false;
+		const reply = lastUserText(ctx.sessionManager.getBranch());
+		if (!reply) return false;
+		const rating = parseRatingReply(reply);
+		if (rating === undefined) return false;
+
+		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingReviewId) as ItemRow | undefined;
+		pendingReviewId = null;
+		if (!item || item.shown === 0) return true;
+
+		const now = new Date();
+		const next = scheduleNext(item.fsrs_state, now, rating);
+		advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
+		bumpStat(db, "total_reviews", 1);
+		touchStreak(db, now);
+
+		if (rating === Rating.Good) {
+			updateWidget(ctx, FACES.review, [
+				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个词`,
+				statsLine(db),
+			]);
+		} else {
+			updateWidget(ctx, FACES.error, [
+				`${FACES.error} 没关系，待会儿再考你一次 ${item.text}`,
+				statsLine(db),
+			]);
+		}
+		return true;
+	}
+
 	async function petTick(ctx: ExtensionContext) {
 		if (isCtxStale(ctx)) return;
 		if (!db) return;
@@ -557,6 +615,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				advanceReview(db, due.id, next.state, next.due, due.reviews + 1);
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
+				pendingReviewId = due.id;
 				showItem(ctx, due, true, next.due);
 			}
 			return;
@@ -739,6 +798,12 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
+		try {
+			// Rate the pending review card from the last user message first
+			if (handleRatingReply(ctx)) return;
+		} catch {
+			// rating parsing must never break the normal tick
+		}
 		turnsSinceTick++;
 		if (turnsSinceTick < config.debounceTurns) return;
 		turnsSinceTick = 0;
