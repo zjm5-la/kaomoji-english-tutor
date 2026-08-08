@@ -37,6 +37,16 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 }
 ```
 
+### 命令
+
+| 命令 | 说明 |
+| --------- | ------------- |
+| `/kaomoji:model` | 交互式选择备课模型（仅列出已登录/已配置密钥的模型，按推荐优先级排序） |
+| `/kaomoji:model <编号>` | 按列表编号直接选择 |
+| `/kaomoji:model <provider/model>` | 直接指定模型（如 `deepseek/deepseek-v4-flash`） |
+
+设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。
+
 ### 配置
 
 创建 `~/.pi/agent/kaomoji-english-tutor.json`（全局）或 `.pi/kaomoji-english-tutor.json`（项目覆盖）。所有字段可选：
@@ -101,6 +111,16 @@ Or add to `settings.json`:
   "packages": ["git:github.com/zjm5-la/kaomoji-english-tutor"]
 }
 ```
+
+### Commands
+
+| Command | Description |
+| --------- | ------------- |
+| `/kaomoji:model` | Interactively pick the lesson model (only authenticated providers, sorted by preference) |
+| `/kaomoji:model <number>` | Pick by list number |
+| `/kaomoji:model <provider/model>` | Set explicitly (e.g. `deepseek/deepseek-v4-flash`) |
+
+Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`.
 
 ### Configuration
 
