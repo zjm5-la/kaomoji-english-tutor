@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -626,6 +626,100 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			pendingLLMCall = false;
 		}
 	}
+
+	// -- Commands ---------------------------------------------------------
+
+	/** Authenticated, selectable models (ordered by auto-detect priority). */
+	function selectableModels(ctx: ExtensionContext) {
+		const available = ctx.modelRegistry.getAvailable();
+		const withAuth = available.filter((m) => ctx.modelRegistry.hasConfiguredAuth(m));
+		return withAuth.sort((a, b) => {
+			const ia = AUTO_DETECT_MODELS.indexOf(a.id);
+			const ib = AUTO_DETECT_MODELS.indexOf(b.id);
+			return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+		});
+	}
+
+	/** Persist provider/model to the global config file, keeping other keys. */
+	function persistLessonModel(provider: string, model: string) {
+		const globalPath = join(getAgentDir(), "kaomoji-english-tutor.json");
+		try {
+			const existing = existsSync(globalPath) ? JSON.parse(readFileSync(globalPath, "utf-8")) : {};
+			writeFileSync(globalPath, JSON.stringify({ ...existing, provider, model }, null, 2) + "\n");
+		} catch (err) {
+			console.error(`[kaomoji-english-tutor] Failed to persist config: ${err}`);
+		}
+	}
+
+	function applyLessonModel(ctx: ExtensionContext, spec: string) {
+		const [provider, model] = spec.split("/", 2);
+		if (!provider || !model) {
+			ctx.ui.notify(`无效的模型格式：${spec}（应为 provider/model）`, "error");
+			return false;
+		}
+		const found = ctx.modelRegistry.find(provider, model);
+		if (!found || !ctx.modelRegistry.hasConfiguredAuth(found)) {
+			ctx.ui.notify(`模型不可用或未配置密钥：${spec}`, "error");
+			return false;
+		}
+		config.provider = provider;
+		config.model = model;
+		resolvedModelName = `${provider}/${model}`;
+		persistLessonModel(provider, model);
+		ctx.ui.notify(`备课模型已设为 ${spec}（已保存，立即生效）`, "info");
+		return true;
+	}
+
+	pi.registerCommand("kaomoji:model", {
+		description: "Show/set the lesson model: pick from authenticated models or pass provider/model",
+		handler: async (args, ctx) => {
+			const target = String(args ?? "").trim();
+			const models = selectableModels(ctx);
+
+			// Show current model first
+			if (!resolvedModelName) resolveModel(ctx);
+			ctx.ui.notify(`当前备课模型：${resolvedModelName || "（未确定）"}`, "info");
+
+			if (!models.length) {
+				ctx.ui.notify("没有已认证的可用模型", "error");
+				return;
+			}
+
+			// Bare invocation: interactive picker
+			if (!target) {
+				const options = models.map((m, i) => `${i + 1}. ${m.provider}/${m.id}`);
+				const chosen = await ctx.ui.select("选择备课模型", options);
+				if (!chosen) {
+					ctx.ui.notify("已取消", "info");
+					return;
+				}
+				const idx = parseInt(chosen.split(".")[0], 10) - 1;
+				const picked = models[idx];
+				if (picked) applyLessonModel(ctx, `${picked.provider}/${picked.id}`);
+				return;
+			}
+
+			// Number: index into the listed models
+			if (/^\d+$/.test(target)) {
+				const idx = parseInt(target, 10) - 1;
+				if (idx < 0 || idx >= models.length) {
+					ctx.ui.notify(`编号无效（1-${models.length}）`, "error");
+					return;
+				}
+				const picked = models[idx];
+				applyLessonModel(ctx, `${picked.provider}/${picked.id}`);
+				return;
+			}
+
+			// provider/model form
+			if (target.includes("/")) {
+				applyLessonModel(ctx, target);
+				return;
+			}
+
+			ctx.ui.notify(`用法：/kaomoji:model（交互选择）或 /kaomoji:model <provider/model|编号>`, "info");
+		},
+	});
 
 	// -- Event handlers ---------------------------------------------------
 
