@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -629,6 +629,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	// -- Event handlers ---------------------------------------------------
 
+	let diagCount = 0;
+	function diag(msg: string, data?: unknown) {
+		// TEMP: diagnostic hook, remove after debugging
+		try {
+			appendFileSync("/tmp/kaomoji-diag.log", `[${new Date().toISOString()}] ${msg} ${data ? JSON.stringify(data).slice(0, 800) : ""}\n`);
+		} catch {}
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
 		resetState();
@@ -639,17 +647,24 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			console.error(`[kaomoji-english-tutor] Failed to open DB: ${err}`);
 			db = null;
 		}
+		diag("session_start", {
+			dbOk: !!db,
+			available: ctx.modelRegistry.getAvailable().slice(0, 5).map((m) => ({ p: m.provider, id: m.id })),
+			auth: ctx.modelRegistry.getAvailable().slice(0, 5).map((m) => ctx.modelRegistry.hasConfiguredAuth(m)),
+			ctxModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
+			branchLen: ctx.sessionManager.getBranch().length,
+		});
 		resolveModel(ctx);
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
+		diagCount++;
+		diag("agent_end #" + diagCount, { turns: turnsSinceTick });
 		turnsSinceTick++;
 		if (turnsSinceTick < config.debounceTurns) return;
 		turnsSinceTick = 0;
-		petTick(ctx).catch(() => {
-			// background failures are recorded inside petTick
-		});
+		petTick(ctx).catch((e) => diag("petTick error", String(e)));
 	});
 }
