@@ -62,7 +62,6 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
   "debounceTurns": 3,
   "dailyNewLimit": 3,
   "maxTokens": 600,
-  "maxReviewIntervalDays": 30,
   "showWidget": true,
   "verbose": false
 }
@@ -76,7 +75,6 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `debounceTurns` | `3` | 每多少个会话回合宠物活动一次 |
 | `dailyNewLimit` | `3` | 每天新学学习项上限 |
 | `maxTokens` | `600` | 备课 LLM 响应的最大 token 数 |
-| `maxReviewIntervalDays` | `30` | 复习间隔上限（天）：即使一直记得，最多这么多天必再见一次 |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
@@ -141,7 +139,6 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `debounceTurns` | `3` | Pet acts every N conversation turns |
 | `dailyNewLimit` | `3` | Max new items taught per day |
 | `maxTokens` | `600` | Max tokens for lesson generation |
-| `maxReviewIntervalDays` | `30` | Cap on review interval (days): a word always comes back within this span |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 

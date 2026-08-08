@@ -20,8 +20,6 @@ interface PetConfig {
 	/** Max new items (word/phrase/sentence) taught per day. */
 	dailyNewLimit: number;
 	maxTokens: number;
-	/** Cap on the FSRS review interval in days (words always come back by then). */
-	maxReviewIntervalDays: number;
 	showWidget: boolean;
 	verbose: boolean;
 }
@@ -30,7 +28,6 @@ const DEFAULTS: PetConfig = {
 	debounceTurns: 3,
 	dailyNewLimit: 3,
 	maxTokens: 600,
-	maxReviewIntervalDays: 30,
 	showWidget: true,
 	verbose: false,
 };
@@ -214,11 +211,6 @@ function latestItem(db: DatabaseSync): ItemRow | undefined {
 // -- FSRS scheduling ------------------------------------------------------
 
 const scheduler = new FSRS();
-
-/** Apply the interval cap from config (FSRS clamps all scheduled intervals). */
-function applyIntervalCap(days: number) {
-	scheduler.p.maximum_interval = Math.max(1, days);
-}
 
 /** Rebuild a Card from its stored JSON state (dates come back as strings). */
 function restoreCard(stateJson: string): Card {
@@ -784,7 +776,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
-		applyIntervalCap(config.maxReviewIntervalDays);
 		resetState();
 		latestCtx = ctx;
 		try {
