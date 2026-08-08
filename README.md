@@ -20,7 +20,7 @@
 - **自动触发**：每 3 个会话回合（可配置）宠物活动一次
 - **主题教学**：宠物从最近对话中识别主题，围绕主题自动备好一节课——1 个单词、1 个词组、1 个句子，之后几个回合逐个展示
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度复习；到期优先复习，间隔随复习次数自动拉长（约 1 天 → 2 天 → 4 天 → …）
-- **卡片交互**：复习卡上宠物会问「回复 A 记得 / B 忘了」——回 **A** 间隔拉长，回 **B** 很快再考你一次（不回也没关系，默认按记得处理）
+- **卡片交互**：复习卡上宠物会提示用命令评分——`/kaomoji:good` 记得（间隔拉长），`/kaomoji:again` 忘了（很快再考一次）。命令不进入会话历史，不污染任务会话
 - **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式防损坏），跨会话累积；每天新学上限 3 个（可配置）
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
 
@@ -45,6 +45,8 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:model` | 交互式选择备课模型（仅列出已登录/已配置密钥的模型，按推荐优先级排序） |
 | `/kaomoji:model <编号>` | 按列表编号直接选择 |
 | `/kaomoji:model <provider/model>` | 直接指定模型（如 `deepseek/deepseek-v4-flash`） |
+| `/kaomoji:good` | 复习卡评分：记得（间隔拉长） |
+| `/kaomoji:again` | 复习卡评分：忘了（很快再考一次） |
 
 设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。
 
@@ -95,7 +97,7 @@ A kaomoji pet that lives in a widget below the editor and teaches you English ba
 - **Auto-triggered**: the pet acts every N conversation turns (default 3)
 - **Topic-based lessons**: it picks the topic from your recent conversation and automatically prepares a lesson — 1 word, 1 phrase, 1 sentence — shown one by one in the following turns
 - **Spaced repetition**: items are scheduled with [FSRS](https://github.com/open-spaced-repetition/fsrs.js) (the algorithm behind Anki); due reviews come first, intervals grow automatically (~1d → 2d → 4d → …)
-- **Card interaction**: on review cards the pet asks "reply A = remember / B = forgot" — **A** lengthens the interval, **B** re-quizzes you soon (no reply = treated as remembered)
+- **Card interaction**: review cards ask for a rating via commands — `/kaomoji:good` = remembered (longer interval), `/kaomoji:again` = forgotten (re-quiz soon). Commands never enter the session history, keeping task conversations clean
 - **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode), accumulated across sessions; daily new-item cap defaults to 3
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`
 
@@ -120,6 +122,8 @@ Or add to `settings.json`:
 | `/kaomoji:model` | Interactively pick the lesson model (only authenticated providers, sorted by preference) |
 | `/kaomoji:model <number>` | Pick by list number |
 | `/kaomoji:model <provider/model>` | Set explicitly (e.g. `deepseek/deepseek-v4-flash`) |
+| `/kaomoji:good` | Rate the review card as remembered (longer interval) |
+| `/kaomoji:again` | Rate the review card as forgotten (re-quiz soon) |
 
 Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`.
 

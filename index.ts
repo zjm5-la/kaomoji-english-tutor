@@ -430,7 +430,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, nextDue?: st
 	if (isReview) {
 		lines.push(`${face} 复习时间到：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 		lines.push(`  第 ${item.reviews + 1} 次复习，下次 ${(nextDue ?? item.due_at).slice(0, 10)}`);
-		lines.push(`💬 回复「A」记得 /「B」忘了`);
+		lines.push(`💬 /kaomoji:good 记得 · /kaomoji:again 忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " / " + item.phonetic : ""}`);
 		lines.push(`  释义：${item.meaning}`);
@@ -540,38 +540,12 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	// -- Pet tick ---------------------------------------------------------
 
-	/** Pending review awaiting a rating reply (item id). */
+	/** Pending review awaiting a rating (item id). */
 	let pendingReviewId: number | null = null;
 
-	/**
-	 * Parse a rating reply from the last user message: A/记得 -> Good,
-	 * B/忘了 -> Again. Anything else (or no pending card) is ignored.
-	 */
-	function parseRatingReply(text: string): Rating | undefined {
-		const t = text.trim().toLowerCase();
-		if (/^a\b|^a[。.！!]?$|记得|记住了|会了/.test(t)) return Rating.Good;
-		if (/^b\b|^b[。.！!]?$|忘了|忘记了|不会/.test(t)) return Rating.Again;
-		return undefined;
-	}
-
-	/** Last user message text from the branch, if any. */
-	function lastUserText(entries: SessionEntry[]): string | undefined {
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const e = entries[i];
-			if (e.type !== "message" || e.message?.role !== "user") continue;
-			const text = renderText(e.message.content).trim();
-			if (text) return text;
-		}
-		return undefined;
-	}
-
-	/** Handle a rating reply for the pending review card, if one is due. */
-	function handleRatingReply(ctx: ExtensionContext): boolean {
+	/** Rate the pending review card; returns false if no card is awaiting a rating. */
+	function ratePending(ctx: ExtensionContext, rating: Rating): boolean {
 		if (pendingReviewId == null || !db) return false;
-		const reply = lastUserText(ctx.sessionManager.getBranch());
-		if (!reply) return false;
-		const rating = parseRatingReply(reply);
-		if (rating === undefined) return false;
 
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingReviewId) as ItemRow | undefined;
 		pendingReviewId = null;
@@ -782,6 +756,24 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	// -- Event handlers ---------------------------------------------------
 
+	pi.registerCommand("kaomoji:good", {
+		description: "Rate the pending review card as remembered (FSRS Good)",
+		handler: async (_args, ctx) => {
+			if (!ratePending(ctx, Rating.Good)) {
+				ctx.ui.notify("当前没有待评分的复习卡", "info");
+			}
+		},
+	});
+
+	pi.registerCommand("kaomoji:again", {
+		description: "Rate the pending review card as forgotten (FSRS Again)",
+		handler: async (_args, ctx) => {
+			if (!ratePending(ctx, Rating.Again)) {
+				ctx.ui.notify("当前没有待评分的复习卡", "info");
+			}
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
 		resetState();
@@ -798,12 +790,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		latestCtx = ctx;
-		try {
-			// Rate the pending review card from the last user message first
-			if (handleRatingReply(ctx)) return;
-		} catch {
-			// rating parsing must never break the normal tick
-		}
 		turnsSinceTick++;
 		if (turnsSinceTick < config.debounceTurns) return;
 		turnsSinceTick = 0;
