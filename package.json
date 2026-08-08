@@ -6,6 +6,9 @@
     "pi-package"
   ],
   "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-sqlite --test test/*.test.ts"
+  },
   "files": [
     "index.ts",
     "README.md"

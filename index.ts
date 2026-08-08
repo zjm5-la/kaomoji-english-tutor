@@ -16,8 +16,8 @@ interface PetConfig {
 	model?: string;
 	/** Reasoning/thinking level passed to the model. Omit for provider default. */
 	thinkingLevel?: ThinkingLevel;
-	/** How many agent turns between pet actions. */
-	debounceTurns: number;
+	/** Minutes between automatic lesson/review checks. Zero disables the timer. */
+	intervalMinutes: number;
 	/** Max new items (word/phrase/sentence) taught per day. */
 	dailyNewLimit: number;
 	maxTokens: number;
@@ -26,7 +26,7 @@ interface PetConfig {
 }
 
 const DEFAULTS: PetConfig = {
-	debounceTurns: 3,
+	intervalMinutes: 10,
 	dailyNewLimit: 3,
 	maxTokens: 900,
 	showWidget: true,
@@ -57,6 +57,9 @@ function loadConfig(cwd: string): PetConfig {
 		}
 	}
 
+	if (!Number.isFinite(config.intervalMinutes) || config.intervalMinutes < 0 || config.intervalMinutes > 1440) {
+		config.intervalMinutes = DEFAULTS.intervalMinutes;
+	}
 	return config;
 }
 
@@ -193,8 +196,8 @@ function insertItem(
 	example_cn: string | null,
 	now: Date,
 	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"] },
-) {
-	db.prepare(
+): number {
+	const result = db.prepare(
 		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	).run(
 		type,
@@ -210,6 +213,7 @@ function insertItem(
 		extra?.chunks ? JSON.stringify(extra.chunks) : null,
 		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
 	);
+	return Number(result.lastInsertRowid);
 }
 
 /** Insert companion word cards for sentence keyWords (skipping duplicates). */
@@ -217,8 +221,8 @@ function insertCompanionWords(db: DatabaseSync, keyWords: GeneratedItem["keyWord
 	for (const kw of keyWords ?? []) {
 		if (!kw?.text || !kw?.meaning) continue;
 		const dup = db
-			.prepare("SELECT COUNT(*) AS n FROM items WHERE text = ? AND type = 'word'")
-			.get(kw.text) as { n: number };
+			.prepare("SELECT COUNT(*) AS n FROM items WHERE type = 'word' AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)")
+			.get(kw.text, kw.meaning) as { n: number };
 		if (Number(dup.n) > 0) continue;
 		insertItem(db, "word", kw.text, kw.phonetic || null, kw.meaning, null, null, now);
 	}
@@ -260,24 +264,69 @@ function knownList(db: DatabaseSync): string[] {
 	return rows.map((r) => r.text);
 }
 
+function replacementKnownList(db: DatabaseSync): string[] {
+	const rows = db.prepare("SELECT type, text, meaning FROM items ORDER BY id DESC LIMIT 50").all() as Array<{
+		type: string;
+		text: string;
+		meaning: string;
+	}>;
+	return rows.map((row) => `${row.type}: ${row.text} = ${row.meaning}`);
+}
+
+function pendingReplacementTypes(db: DatabaseSync): GeneratedItem["type"][] {
+	const raw = getStat(db, "pending_replacements");
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((type): type is GeneratedItem["type"] =>
+			type === "word" || type === "phrase" || type === "sentence"
+		);
+	} catch {
+		return [];
+	}
+}
+
+function enqueueReplacement(db: DatabaseSync, type: GeneratedItem["type"]) {
+	setStat(db, "pending_replacements", JSON.stringify([...pendingReplacementTypes(db), type]));
+}
+
+function consumeReplacement(db: DatabaseSync, type: GeneratedItem["type"]): boolean {
+	const queue = pendingReplacementTypes(db);
+	if (queue[0] !== type) return false;
+	queue.shift();
+	setStat(db, "pending_replacements", JSON.stringify(queue));
+	return true;
+}
+
+function latestMasteredItem(db: DatabaseSync, type: GeneratedItem["type"]): ItemRow | undefined {
+	return db
+		.prepare("SELECT * FROM items WHERE type = ? AND status = 'mastered' ORDER BY id DESC LIMIT 1")
+		.get(type) as ItemRow | undefined;
+}
+
 // -- FSRS scheduling ------------------------------------------------------
 
 const scheduler = new FSRS();
 
 /** Rebuild a Card from its stored JSON state (dates come back as strings). */
 function restoreCard(stateJson: string): Card {
-	const parsed = JSON.parse(stateJson) as Card;
-	const card = new Card();
-	card.due = new Date(parsed.due);
-	card.last_review = new Date(parsed.last_review);
-	card.stability = parsed.stability;
-	card.difficulty = parsed.difficulty;
-	card.elapsed_days = parsed.elapsed_days;
-	card.scheduled_days = parsed.scheduled_days;
-	card.reps = parsed.reps;
-	card.lapses = parsed.lapses;
-	card.state = parsed.state;
-	return card;
+	try {
+		const parsed = JSON.parse(stateJson) as Card;
+		const card = new Card();
+		card.due = new Date(parsed.due);
+		card.last_review = new Date(parsed.last_review);
+		card.stability = parsed.stability;
+		card.difficulty = parsed.difficulty;
+		card.elapsed_days = parsed.elapsed_days;
+		card.scheduled_days = parsed.scheduled_days;
+		card.reps = parsed.reps;
+		card.lapses = parsed.lapses;
+		card.state = parsed.state;
+		return card;
+	} catch {
+		return new Card();
+	}
 }
 
 /**
@@ -359,10 +408,88 @@ interface GeneratedItem {
 	keyWords?: { text: string; phonetic?: string; meaning: string }[];
 }
 
-interface Lesson {
+function stringArray(value: unknown): string[] | undefined {
+	if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.trim())) return undefined;
+	return value;
+}
+
+function keyWordArray(value: unknown): GeneratedItem["keyWords"] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const result: NonNullable<GeneratedItem["keyWords"]> = [];
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object") return undefined;
+		const record = entry as Record<string, unknown>;
+		if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) {
+			return undefined;
+		}
+		if (record.phonetic != null && typeof record.phonetic !== "string") return undefined;
+		result.push({ text: record.text, meaning: record.meaning, phonetic: record.phonetic as string | undefined });
+	}
+	return result;
+}
+
+function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]): GeneratedItem | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const record = raw as Record<string, unknown>;
+	const type = record.type;
+	if (type !== "word" && type !== "phrase" && type !== "sentence") return undefined;
+	if (expectedType && type !== expectedType) return undefined;
+	if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) return undefined;
+	for (const key of ["phonetic", "example", "example_cn"] as const) {
+		if (record[key] != null && typeof record[key] !== "string") return undefined;
+	}
+	const item: GeneratedItem = {
+		type,
+		text: record.text,
+		meaning: record.meaning,
+		phonetic: record.phonetic as string | undefined,
+		example: record.example as string | undefined,
+		example_cn: record.example_cn as string | undefined,
+	};
+	if (type === "sentence") {
+		if (record.levels != null && !(item.levels = stringArray(record.levels))) return undefined;
+		if (record.levels_cn != null && !(item.levels_cn = stringArray(record.levels_cn))) return undefined;
+		if (record.chunks != null && !(item.chunks = stringArray(record.chunks))) return undefined;
+		if (record.keyWords != null && !(item.keyWords = keyWordArray(record.keyWords))) return undefined;
+	}
+	return item;
+}
+
+function validSentenceTraining(item: GeneratedItem): boolean {
+	if (item.type !== "sentence" || !item.levels || !item.levels_cn || !item.chunks || !item.keyWords) return false;
+	const fullWords = item.text.trim().split(/\s+/).length;
+	const middleWords = item.levels[1]?.trim().split(/\s+/).length ?? 0;
+	return (
+		fullWords >= 15 &&
+		item.levels.length === 3 &&
+		new Set(item.levels.map((level) => level.trim())).size === 3 &&
+		item.levels_cn.length === 3 &&
+		item.chunks.length >= 2 && item.chunks.length <= 5 &&
+		item.keyWords.length >= 1 && item.keyWords.length <= 3 &&
+		item.levels[2].trim() === item.text.trim() &&
+		middleWords / fullWords >= 0.35 && middleWords / fullWords <= 0.9
+	);
+}
+
+interface ReadyLesson {
+	ready: true;
 	topic: string;
 	items: GeneratedItem[];
 }
+
+interface WaitingLesson {
+	ready: false;
+	reason?: string;
+}
+
+type LessonDecision = ReadyLesson | WaitingLesson;
+
+interface ReadyReplacement {
+	ready: true;
+	item: GeneratedItem;
+}
+
+type ReplacementDecision = ReadyReplacement | WaitingLesson;
 
 interface ResolvedModel {
 	provider: string;
@@ -376,7 +503,7 @@ async function generateLesson(
 	conversation: string,
 	known: string[],
 	config: PetConfig,
-): Promise<Lesson> {
+): Promise<LessonDecision> {
 	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
 	if (!model) {
 		const err = new Error("MODEL_NOT_FOUND");
@@ -395,10 +522,16 @@ async function generateLesson(
 	};
 
 	const prompt = [
-		"你是「英语小宠物」的备课大脑。看下面的会话内容，判断用户当前在做什么主题，",
-		"然后围绕这个主题准备 3 个学习项：1 个单词、1 个词组、1 个渐进长句。",
+		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
+		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
+		"只有信息充分时，才围绕主题准备 3 个学习项：1 个单词、1 个词组、1 个渐进长句。",
 		"",
-		"要求：",
+		"备课条件：",
+		"- 已形成相对明确、稳定的话题，有足够上下文生成真实有用的英语内容",
+		"- 不能只是寒暄、数字、命令、测试占位文本或环境通知",
+		"- 不确定时必须返回 ready=false，等待后续会话补充信息",
+		"",
+		"学习项要求：",
 		"- 内容要真实常用，宁简单不冷僻，适合中级学习者",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
 		"- sentence 的 text 必须是真正的长句：至少 15 个单词，包含从句或插入成分；禁止用简单句或短句充数",
@@ -407,7 +540,7 @@ async function generateLesson(
 		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
 		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
 		"- 只输出 JSON，不要任何其他文字：",
-		'{"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
+		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		"",
 		"<conversation>",
@@ -427,7 +560,7 @@ async function generateLesson(
 	const response = await completeSimple(
 		model,
 		{
-			systemPrompt: "你是英语小宠物的备课助手，只输出 JSON 学习卡。",
+			systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
 			messages: [{
 				role: "user" as const,
 				content: [{ type: "text" as const, text: prompt }],
@@ -460,32 +593,117 @@ async function generateLesson(
 		throw new Error("BAD_JSON");
 	}
 
-	const items = (Array.isArray(parsed.items) ? parsed.items : [])
-		.filter(
-			(it): it is GeneratedItem =>
-				!!it &&
-				typeof it === "object" &&
-				["word", "phrase", "sentence"].includes((it as GeneratedItem).type) &&
-				typeof (it as GeneratedItem).text === "string" &&
-				typeof (it as GeneratedItem).meaning === "string",
-		)
-		.slice(0, 3);
-	if (!items.length) throw new Error("EMPTY_LESSON");
+	if (parsed.ready === false) {
+		return {
+			ready: false,
+			reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+		};
+	}
+	if (parsed.ready !== true) throw new Error("INVALID_READY");
+
+	if (!Array.isArray(parsed.items) || parsed.items.length !== 3) throw new Error("INVALID_LESSON_SHAPE");
+	const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
+	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
+	const items = parsedItems as GeneratedItem[];
+	if (new Set(items.map((item) => item.type)).size !== 3) throw new Error("INVALID_LESSON_SHAPE");
 
 	// Sentence cards need levels/chunks/keyWords for progressive training.
 	// Models sometimes omit them — backfill with a dedicated follow-up call.
 	for (const it of items) {
-		if (it.type === "sentence" && (!it.levels?.length || !it.levels_cn?.length || !it.chunks?.length || !it.keyWords?.length)) {
-			await completeSentenceData(ctx, model, requestAuth, config, it);
+		if (it.type === "sentence" && !validSentenceTraining(it)) {
+			await completeSentenceData(model, requestAuth, config, it);
 		}
 	}
+	const sentence = items.find((item) => item.type === "sentence")!;
+	if (!validSentenceTraining(sentence)) throw new Error("INVALID_SENTENCE_TRAINING");
 
-	return { topic: String(parsed.topic ?? ""), items };
+	return { ready: true, topic: String(parsed.topic ?? ""), items };
+}
+
+async function generateReplacement(
+	ctx: ExtensionContext,
+	resolved: ResolvedModel,
+	conversation: string,
+	known: string[],
+	config: PetConfig,
+	skipped: ItemRow,
+): Promise<ReplacementDecision> {
+	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
+	if (!model) throw new Error("MODEL_NOT_FOUND");
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey) throw new Error("NO_API_KEY");
+	const requestAuth = {
+		apiKey: auth.apiKey,
+		headers: auth.headers as Record<string, string> | undefined,
+	};
+	const itemSchema = skipped.type === "sentence"
+		? '{"type":"sentence","text":"完整长句","meaning":"中文翻译","levels":["L1主干","L2扩展","与text相同的L3"],"levels_cn":["L1翻译","L2翻译","L3翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"释义"}]}'
+		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
+	const prompt = [
+		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟。`,
+		`请根据会话主题补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
+		"如果会话信息不足以生成真实有用的同类型卡片，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
+		"信息充分时只输出：",
+		`{"ready":true,"item":${itemSchema}}`,
+		skipped.type === "sentence"
+			? "句子必须至少 15 个单词；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文。"
+			: "内容要真实常用，贴近当前会话主题，适合中级学习者。",
+		"已有内容：" + (known.length ? known.join("；") : "（无）"),
+		"",
+		"<conversation>",
+		conversation,
+		"</conversation>",
+	].join("\n");
+	const llmOptions: Record<string, unknown> = {
+		apiKey: requestAuth.apiKey,
+		headers: requestAuth.headers,
+		maxTokens: skipped.type === "sentence" ? config.maxTokens : 450,
+	};
+	if (config.thinkingLevel) llmOptions.reasoning = config.thinkingLevel;
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
+			messages: [{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: prompt }],
+				timestamp: Date.now(),
+			}],
+		},
+		llmOptions as any,
+	);
+	if (response.stopReason === "error") throw new Error(response.errorMessage || "provider error");
+	const text = response.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text)
+		.join(" ")
+		.trim();
+	if (!text) throw new Error("EMPTY_RESPONSE");
+	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	const start = cleaned.indexOf("{");
+	const end = cleaned.lastIndexOf("}");
+	if (start < 0 || end <= start) throw new Error("BAD_JSON");
+	let parsed: Record<string, unknown>;
+	try {
+		parsed = JSON.parse(cleaned.slice(start, end + 1));
+	} catch {
+		throw new Error("BAD_JSON");
+	}
+	if (parsed.ready === false) {
+		return { ready: false, reason: typeof parsed.reason === "string" ? parsed.reason : undefined };
+	}
+	if (parsed.ready !== true) throw new Error("INVALID_READY");
+	const item = parseGeneratedItem(parsed.item, skipped.type);
+	if (!item) throw new Error("EMPTY_REPLACEMENT");
+	if (item.type === "sentence" && !validSentenceTraining(item)) {
+		await completeSentenceData(model, requestAuth, config, item);
+	}
+	if (item.type === "sentence" && !validSentenceTraining(item)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
+	return { ready: true, item };
 }
 
 /** Backfill levels/chunks/keyWords for a sentence card via a focused call. */
 async function completeSentenceData(
-	ctx: ExtensionContext,
 	model: ReturnType<ExtensionContext["modelRegistry"]["find"]> & object,
 	auth: { apiKey: string; headers?: Record<string, string> },
 	config: PetConfig,
@@ -542,23 +760,17 @@ async function completeSentenceData(
 		return;
 	}
 
-	const levels = Array.isArray(parsed.levels) ? parsed.levels.filter((l): l is string => typeof l === "string") : [];
-	const levelsCn = Array.isArray(parsed.levels_cn) ? parsed.levels_cn.filter((l): l is string => typeof l === "string") : [];
-	const chunks = Array.isArray(parsed.chunks) ? parsed.chunks.filter((c): c is string => typeof c === "string") : [];
-	const keyWords = Array.isArray(parsed.keyWords)
-		? parsed.keyWords.filter((k): k is NonNullable<GeneratedItem["keyWords"]>[number] =>
-				!!k && typeof k === "object" && typeof (k as { text?: unknown }).text === "string" && typeof (k as { meaning?: unknown }).meaning === "string",
-			)
-		: [];
-
-	if (levels.length > 1) {
-		// Guarantee the last level equals the full sentence
-		levels[levels.length - 1] = item.text;
+	const levels = stringArray(parsed.levels);
+	const levelsCn = stringArray(parsed.levels_cn);
+	const chunks = stringArray(parsed.chunks);
+	const keyWords = keyWordArray(parsed.keyWords);
+	if (levels?.length === 3) {
+		levels[2] = item.text;
 		item.levels = levels;
-		if (levelsCn.length === levels.length) item.levels_cn = levelsCn;
 	}
-	if (chunks.length >= 2) item.chunks = chunks;
-	if (keyWords.length) item.keyWords = keyWords;
+	if (levelsCn?.length === 3) item.levels_cn = levelsCn;
+	if (chunks) item.chunks = chunks;
+	if (keyWords) item.keyWords = keyWords;
 }
 
 // -- Widget rendering -----------------------------------------------------
@@ -658,7 +870,10 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let resolvedModelName = "";
 	let lastError = "";
 	let pendingLLMCall = false;
-	let turnsSinceTick = 0;
+	let lastRejectedConversation = "";
+	let lastRejectedReplacementKey = "";
+	let sessionGeneration = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	let latestCtx: ExtensionContext | undefined;
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
@@ -673,8 +888,45 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	function resetState() {
 		lastError = "";
 		pendingLLMCall = false;
-		turnsSinceTick = 0;
+		lastRejectedConversation = "";
+		lastRejectedReplacementKey = "";
 		resolvedModelName = "";
+	}
+
+	function stopTimer() {
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+	}
+
+	function intervalMs(): number {
+		return Math.max(0, config.intervalMinutes) * 60_000;
+	}
+
+	function scheduleTimer(delay = intervalMs()) {
+		stopTimer();
+		if (!latestCtx || config.intervalMinutes <= 0 || pendingItemId != null) return;
+		timer = setTimeout(() => {
+			timer = undefined;
+			void runTimerTick();
+		}, Math.max(0, delay));
+		timer.unref?.();
+	}
+
+	async function runTimerTick() {
+		const ctx = latestCtx;
+		const generation = sessionGeneration;
+		if (!ctx || isCtxStale(ctx) || config.intervalMinutes <= 0) return;
+		if ((typeof ctx.isIdle === "function" && !ctx.isIdle()) || pendingLLMCall) {
+			scheduleTimer(Math.min(30_000, intervalMs()));
+			return;
+		}
+		try {
+			await petTick(ctx);
+		} catch (err) {
+			console.error(`[kaomoji-english-tutor] Timer tick failed: ${err}`);
+		}
+		if (sessionGeneration !== generation) return;
+		if (pendingItemId == null) scheduleTimer();
 	}
 
 	/** Close the session-scoped SQLite connection before reload/switch/exit. */
@@ -782,7 +1034,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	/** Show the sentence card at a given level (0-based). */
 	function showSentenceLevel(ctx: ExtensionContext, item: ItemRow, level: number) {
-		const levels = parseJsonCol<string[]>(item.levels) ?? [item.text];
 		const shown = { ...item, progress: level } as ItemRow;
 		pendingFlipped = false;
 		pendingIsReview = false;
@@ -849,39 +1100,162 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
-	/** Mark the pending card as well-known: FSRS Easy, back in ~365 days. */
-	function skipPending(ctx: ExtensionContext): boolean {
-		if (pendingItemId == null || !db) return false;
+	/** Atomically mark the pending card as well-known and enqueue its replacement. */
+	function skipPending(ctx: ExtensionContext): ItemRow | undefined {
+		if (pendingItemId == null || !db) return undefined;
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
+		if (!item) return undefined;
+		const now = new Date();
+		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
+		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
+		const due = next.due < minDue ? minDue : next.due;
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
+				next.state,
+				due,
+				item.id,
+			);
+			bumpStat(db, "total_skipped", 1);
+			enqueueReplacement(db, item.type);
+			db.exec("COMMIT");
+		} catch (err) {
+			db.exec("ROLLBACK");
+			throw err;
+		}
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
-		if (!item) return true;
-		const now = new Date();
-		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
-		// A well-known word still comes back occasionally: guarantee >= 365 days
-		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
-		const due = next.due < minDue ? minDue : next.due;
-		db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
-			next.state,
-			due,
-			item.id,
-		);
-		bumpStat(db, "total_skipped", 1);
 		updateWidget(ctx, FACES.party, [
-			`${FACES.party} 好，${item.text} 记作很熟的词，明年见！`,
+			`${FACES.party} 好，${item.text} 记作很熟的内容，正在补充同类型卡片…`,
 			statsLine(db),
 		]);
-		return true;
+		return item;
+	}
+
+	async function generateReplacementAndInsert(
+		ctx: ExtensionContext,
+		type: GeneratedItem["type"],
+		skippedItem?: ItemRow,
+	): Promise<boolean> {
+		if (!db) return false;
+		const skipped = skippedItem ?? latestMasteredItem(db, type);
+		if (!skipped) {
+			updateWidget(ctx, FACES.error, ["待补卡片缺少来源记录，请保留队列并稍后重试。", statsLine(db)]);
+			return false;
+		}
+		const conversation = buildConversation(ctx.sessionManager.getBranch());
+		if (!conversation.trim()) {
+			updateWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
+			return false;
+		}
+		const rejectionKey = `${type}\n${conversation}`;
+		if (rejectionKey === lastRejectedReplacementKey) {
+			updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+			return false;
+		}
+
+		const generation = sessionGeneration;
+		pendingLLMCall = true;
+		updateWidget(ctx, FACES.teach, ["正在补充同类型卡片，喵…"]);
+		try {
+			const resolved = resolveModel(ctx);
+			if (!resolved) throw new Error("NO_MODEL");
+			let decision: ReplacementDecision;
+			try {
+				decision = await generateReplacement(ctx, resolved, conversation, replacementKnownList(db), config, skipped);
+			} catch (err) {
+				if (
+					!resolved.fromSession &&
+					ctx.model &&
+					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)
+				) {
+					if (sessionGeneration !== generation || !db) return false;
+					decision = await generateReplacement(
+						ctx,
+						{ provider: ctx.model.provider, model: ctx.model.id, fromSession: true },
+						conversation,
+						replacementKnownList(db),
+						config,
+						skipped,
+					);
+				} else {
+					throw err;
+				}
+			}
+			if (sessionGeneration !== generation || !db) return false;
+			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+			if (!decision.ready) {
+				lastRejectedReplacementKey = rejectionKey;
+				updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+				if (config.verbose && decision.reason) ctx.ui.notify(`暂不补卡：${decision.reason}`, "info");
+				return false;
+			}
+			const item = decision.item;
+			const duplicate = db.prepare(
+				"SELECT COUNT(*) AS n FROM items WHERE type = ? AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)",
+			).get(item.type, item.text, item.meaning) as { n: number };
+			if (Number(duplicate.n) > 0) {
+				lastRejectedReplacementKey = rejectionKey;
+				updateWidget(ctx, FACES.idle, ["模型给出了重复内容，等话题变化后再补卡…", statsLine(db)]);
+				return false;
+			}
+			const now = new Date();
+			const currentDb = db;
+			let inserted: ItemRow | undefined;
+			currentDb.exec("BEGIN IMMEDIATE");
+			try {
+				const id = insertItem(currentDb, item.type, item.text, item.phonetic || null, item.meaning, item.example || null, item.example_cn || null, now, {
+					levels: item.levels,
+					levels_cn: item.levels_cn,
+					chunks: item.chunks,
+					keyWords: item.keyWords,
+				});
+				insertCompanionWords(currentDb, item.keyWords, now);
+				bumpStat(currentDb, "total_learned", 1);
+				touchStreak(currentDb, now);
+				if (!consumeReplacement(currentDb, type)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
+				markShown(currentDb, id);
+				inserted = currentDb.prepare("SELECT * FROM items WHERE id = ?").get(id) as unknown as ItemRow | undefined;
+				if (!inserted) throw new Error("REPLACEMENT_INSERT_FAILED");
+				currentDb.exec("COMMIT");
+			} catch (err) {
+				currentDb.exec("ROLLBACK");
+				throw err;
+			}
+			lastRejectedReplacementKey = "";
+			pendingItemId = inserted.id;
+			showItem(ctx, inserted, false);
+			if (config.verbose) ctx.ui.notify(`已补充 ${TYPE_LABELS[type]}：${item.text}`, "info");
+			return true;
+		} catch (err) {
+			if (sessionGeneration !== generation) return false;
+			const msg = (err as Error)?.message || String(err);
+			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
+			if (db && !isCtxStale(ctx)) updateWidget(ctx, FACES.error, [`补卡失败：${lastError}`, statsLine(db)]);
+			return false;
+		} finally {
+			if (sessionGeneration === generation) pendingLLMCall = false;
+		}
 	}
 
 	async function petTick(ctx: ExtensionContext) {
+		const generation = sessionGeneration;
 		if (isCtxStale(ctx)) return;
 		if (!db) return;
 		// An Anki-style card stays active until the user rates or skips it.
 		// Never let the turn timer replace the pending card with another due item.
 		if (pendingItemId != null) return;
 		const now = new Date();
+
+		// A skipped card reserves one same-type replacement, even past the daily limit.
+		const replacementType = pendingReplacementTypes(db)[0];
+		let replacementWaiting = false;
+		if (replacementType) {
+			if (await generateReplacementAndInsert(ctx, replacementType)) return;
+			if (sessionGeneration !== generation || !db) return;
+			replacementWaiting = true;
+		}
 
 		// 1. Due item first: show a review card (or the first showing of a new item)
 		const due = getDueItem(db, now);
@@ -894,6 +1268,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			showItem(ctx, due, due.shown === 1);
 			return;
 		}
+		if (replacementWaiting) return;
 
 		// 2. Otherwise teach new items (LLM), up to the daily limit
 		if (countTodayNew(db, now) < config.dailyNewLimit) {
@@ -907,37 +1282,60 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	}
 
 	async function generateAndInsert(ctx: ExtensionContext, now: Date) {
+		const conversation = buildConversation(ctx.sessionManager.getBranch());
+		if (!conversation.trim()) {
+			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			return;
+		}
+		if (conversation === lastRejectedConversation) {
+			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+			return;
+		}
+
+		const generation = sessionGeneration;
 		pendingLLMCall = true;
 		if (db) updateWidget(ctx, FACES.teach, ["备课中，喵…"]);
 		try {
 			const resolved = resolveModel(ctx);
 			if (!resolved) throw new Error("NO_MODEL");
-			const conversation = buildConversation(ctx.sessionManager.getBranch());
-			if (!conversation.trim()) {
-				if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
-				return;
-			}
-
-			let lesson: Lesson;
+			let decision: LessonDecision;
 			try {
-				lesson = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
+				decision = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
 			} catch (err) {
+				if (sessionGeneration !== generation) return;
 				// Fallback: when the chosen model is unreachable (missing auth,
 				// network or provider errors), retry once with the current session
 				// model — it is authenticated and known to work.
-				if (!resolved.fromSession && ctx.model && ctx.model.id !== resolved.model) {
+				if (
+					!resolved.fromSession &&
+					ctx.model &&
+					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)
+				) {
 					const fallback: ResolvedModel = {
 						provider: ctx.model.provider,
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					lesson = await generateLesson(ctx, fallback, conversation, db ? knownList(db) : [], config);
+					decision = await generateLesson(ctx, fallback, conversation, db ? knownList(db) : [], config);
+					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${fallback.provider}/${fallback.model}（当前会话·降级）`;
 				} else {
 					throw err;
 				}
 			}
 
+			// The session or conversation may have changed while the timer's LLM call was in flight.
+			// Discard stale output; the next timer check will evaluate the newer context.
+			if (sessionGeneration !== generation || buildConversation(ctx.sessionManager.getBranch()) !== conversation) return;
+
+			if (!decision.ready) {
+				lastRejectedConversation = conversation;
+				if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+				if (config.verbose && decision.reason) ctx.ui.notify(`暂不备课：${decision.reason}`, "info");
+				return;
+			}
+			lastRejectedConversation = "";
+			const lesson = decision;
 			if (!db) return;
 			for (const it of lesson.items) {
 				insertItem(db, it.type, it.text, it.phonetic || null, it.meaning, it.example || null, it.example_cn || null, now, {
@@ -966,11 +1364,12 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`备好课啦：${lesson.topic || "主题"}，共 ${lesson.items.length} 个学习项`, "info");
 			}
 		} catch (err) {
+			if (sessionGeneration !== generation) return;
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
 			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`]);
 		} finally {
-			pendingLLMCall = false;
+			if (sessionGeneration === generation) pendingLLMCall = false;
 		}
 	}
 
@@ -1068,7 +1467,36 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// -- Event handlers ---------------------------------------------------
+	pi.registerCommand("kaomoji:interval", {
+		description: "Show/set the automatic lesson interval in minutes, or off",
+		handler: async (args, ctx) => {
+			const target = String(args ?? "").trim().toLowerCase();
+			if (!target) {
+				ctx.ui.notify(
+					config.intervalMinutes > 0 ? `当前自动检查间隔：${config.intervalMinutes} 分钟` : "自动检查已关闭",
+					"info",
+				);
+				ctx.ui.notify("用法：/kaomoji:interval <分钟|off>", "info");
+				return;
+			}
+			if (target === "off") {
+				config.intervalMinutes = 0;
+				persistConfig({ intervalMinutes: 0 });
+				stopTimer();
+				ctx.ui.notify("自动检查已关闭", "info");
+				return;
+			}
+			const minutes = Number(target);
+			if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
+				ctx.ui.notify("请输入大于 0 且不超过 1440 的分钟数，或 off", "error");
+				return;
+			}
+			config.intervalMinutes = minutes;
+			persistConfig({ intervalMinutes: minutes });
+			scheduleTimer();
+			ctx.ui.notify(`自动检查间隔已设为 ${minutes} 分钟（立即生效）`, "info");
+		},
+	});
 
 	pi.registerCommand("kaomoji:thinking", {
 		description: "Show/set the lesson thinking level (off|minimal|low|medium|high|xhigh|max)",
@@ -1102,7 +1530,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("kaomoji:good", {
 		description: "Rate the pending review card as remembered (FSRS Good)",
 		handler: async (_args, ctx) => {
-			if (!ratePending(ctx, Rating.Good)) {
+			if (ratePending(ctx, Rating.Good)) {
+				scheduleTimer();
+			} else {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
 			}
 		},
@@ -1111,22 +1541,45 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("kaomoji:again", {
 		description: "Rate the pending review card as forgotten (FSRS Again)",
 		handler: async (_args, ctx) => {
-			if (!ratePending(ctx, Rating.Again)) {
+			if (ratePending(ctx, Rating.Again)) {
+				scheduleTimer();
+			} else {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
 			}
 		},
 	});
 
 	pi.registerCommand("kaomoji:skip", {
-		description: "Skip the shown card: mark as already known, remove from review queue",
+		description: "Mark the shown card as known and generate a same-type replacement",
 		handler: async (_args, ctx) => {
-			if (!skipPending(ctx)) {
+			if (!db) {
 				ctx.ui.notify("当前没有可跳过的卡片", "info");
+				return;
 			}
+			const queueWasEmpty = pendingReplacementTypes(db).length === 0;
+			let skipped: ItemRow | undefined;
+			try {
+				skipped = skipPending(ctx);
+			} catch (err) {
+				ctx.ui.notify(`标记失败：${(err as Error).message}`, "error");
+				return;
+			}
+			if (!skipped || !db) {
+				ctx.ui.notify("当前没有可跳过的卡片", "info");
+				return;
+			}
+			const nextType = pendingReplacementTypes(db)[0];
+			const source = queueWasEmpty && nextType === skipped.type ? skipped : undefined;
+			const generation = sessionGeneration;
+			const inserted = nextType ? await generateReplacementAndInsert(ctx, nextType, source) : false;
+			if (sessionGeneration !== generation) return;
+			if (!inserted) scheduleTimer();
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionGeneration++;
+		stopTimer();
 		closeDb();
 		config = loadConfig(ctx.cwd);
 		resetState();
@@ -1139,9 +1592,12 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		}
 		resolveModel(ctx);
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+		scheduleTimer();
 	});
 
 	pi.on("session_shutdown", async () => {
+		sessionGeneration++;
+		stopTimer();
 		latestCtx = undefined;
 		pendingItemId = null;
 		pendingFlipped = false;
@@ -1150,13 +1606,4 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		closeDb();
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
-		latestCtx = ctx;
-		turnsSinceTick++;
-		if (turnsSinceTick < config.debounceTurns) return;
-		turnsSinceTick = 0;
-		petTick(ctx).catch(() => {
-			// background failures are recorded inside petTick
-		});
-	});
 }

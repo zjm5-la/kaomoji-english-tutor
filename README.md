@@ -17,11 +17,12 @@
 
 ### 机制
 
-- **自动触发**：每 3 个会话回合（可配置）宠物活动一次
-- **主题教学**：宠物从最近对话中识别主题，围绕主题自动备好一节课——1 个单词、1 个词组、1 个句子，之后几个回合逐个展示
-- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度复习；到期优先复习，间隔随复习次数自动拉长（约 1 天 → 2 天 → 4 天 → …）
-- **卡片交互**：复习卡上宠物会提示用命令评分——`/kaomoji:good` 记得（间隔拉长），`/kaomoji:again` 忘了（很快再考一次）。命令不进入会话历史，不污染任务会话
-- **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式防损坏），跨会话累积；每天新学上限 3 个（可配置）
+- **时间触发**：默认每 10 分钟自动检查一次（可配置）；有待评分卡片时暂停，评分后重新计时
+- **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句
+- **渐进长句**：同一张句子卡按 L1 主干 → L2 扩展 → L3 完整长句训练，配有逐级翻译、意群切分和独立生词卡
+- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；只有明确的 Good/Again/Skip 才修改调度，展示卡片不会自动评分
+- **卡片交互**：`/kaomoji:flip` 正反面切换；`/kaomoji:good` 记得；`/kaomoji:again` 忘了；`/kaomoji:skip` 标记很熟并立即补充一张同类型卡片（补卡不占每日新卡上限）。命令不进入会话历史
+- **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
 
 ### 安装
@@ -45,10 +46,14 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:model` | 交互式选择备课模型（仅列出已登录/已配置密钥的模型，按推荐优先级排序） |
 | `/kaomoji:model <编号>` | 按列表编号直接选择 |
 | `/kaomoji:model <provider/model>` | 直接指定模型（如 `deepseek/deepseek-v4-flash`） |
-| `/kaomoji:good` | 复习卡评分：记得（间隔拉长） |
-| `/kaomoji:again` | 复习卡评分：忘了（很快再考一次） |
+| `/kaomoji:thinking <等级>` | 设置备课思考等级：`off` 到 `max` |
+| `/kaomoji:interval <分钟|off>` | 设置自动检查间隔，或关闭自动检查 |
+| `/kaomoji:flip` | 在问题面和答案面之间切换 |
+| `/kaomoji:good` | 评分为记得；长句训练中升级 |
+| `/kaomoji:again` | 评分为忘了；长句训练中退级，L1 时进入 FSRS Again |
+| `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并立即补充同类型卡片 |
 
-设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。
+设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。如果项目配置包含同名字段，reload 后仍以项目配置为准。
 
 ### 配置
 
@@ -58,10 +63,10 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 {
   "provider": "deepseek",
   "model": "deepseek-v4-flash",
-  "thinkingLevel": "off",
-  "debounceTurns": 3,
+  "thinkingLevel": "medium",
+  "intervalMinutes": 10,
   "dailyNewLimit": 3,
-  "maxTokens": 600,
+  "maxTokens": 900,
   "showWidget": true,
   "verbose": false
 }
@@ -72,9 +77,9 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `provider` | *(自动检测)* | 备课模型提供商 |
 | `model` | *(自动检测)* | 备课模型 ID |
 | `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
-| `debounceTurns` | `3` | 每多少个会话回合宠物活动一次 |
+| `intervalMinutes` | `10` | 自动检查间隔（分钟）；设为 `0` 可关闭 |
 | `dailyNewLimit` | `3` | 每天新学学习项上限 |
-| `maxTokens` | `600` | 备课 LLM 响应的最大 token 数 |
+| `maxTokens` | `900` | 备课 LLM 响应的最大 token 数 |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
@@ -82,7 +87,8 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 
 - 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash、grok-4.3、glm-5.2），仅从已登录或已配置密钥的提供商中选择
 - 若选中的模型无法访问（密钥缺失、网络或服务端错误），自动降级到当前会话正在使用的模型重试
-- 复习为展示式（宠物展示卡片，默认按「Good」推进 FSRS 调度）；数据结构保留评分入口，未来可加交互- 学习数据位于 `~/.pi/agent/kaomoji-english-tutor.db`，删除该文件即清空学习记录
+- 模型判断信息不足时不会硬凑学习卡；本次会话内，同一份被拒绝的会话内容不会重复请求模型
+- 学习数据位于 `~/.pi/agent/kaomoji-english-tutor.db`；请先退出 Pi 再删除数据库文件，以免运行中的 SQLite 连接继续写入旧文件
 
 ---
 
@@ -94,11 +100,12 @@ A kaomoji pet that lives in a widget below the editor and teaches you English ba
 
 ### How it works
 
-- **Auto-triggered**: the pet acts every N conversation turns (default 3)
-- **Topic-based lessons**: it picks the topic from your recent conversation and automatically prepares a lesson — 1 word, 1 phrase, 1 sentence — shown one by one in the following turns
-- **Spaced repetition**: items are scheduled with [FSRS](https://github.com/open-spaced-repetition/fsrs.js) (the algorithm behind Anki); due reviews come first, intervals grow automatically (~1d → 2d → 4d → …)
-- **Card interaction**: review cards ask for a rating via commands — `/kaomoji:good` = remembered (longer interval), `/kaomoji:again` = forgotten (re-quiz soon). Commands never enter the session history, keeping task conversations clean
-- **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode), accumulated across sessions; daily new-item cap defaults to 3
+- **Time-triggered**: checks automatically every 10 minutes by default; pauses while a card awaits a rating and restarts after completion
+- **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence
+- **Progressive sentences**: one sentence card advances from L1 core clause to L2 expansion and L3 full sentence, with per-level translations, chunks, and companion word cards
+- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); only explicit Good/Again/Skip actions change scheduling—displaying a card never rates it
+- **Card interaction**: `/kaomoji:flip` toggles front/back, `/kaomoji:good` remembers, `/kaomoji:again` forgets, and `/kaomoji:skip` marks content as well known and immediately creates a same-type replacement (replacements bypass the daily new-item cap)
+- **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`
 
 ### Install
@@ -122,10 +129,14 @@ Or add to `settings.json`:
 | `/kaomoji:model` | Interactively pick the lesson model (only authenticated providers, sorted by preference) |
 | `/kaomoji:model <number>` | Pick by list number |
 | `/kaomoji:model <provider/model>` | Set explicitly (e.g. `deepseek/deepseek-v4-flash`) |
-| `/kaomoji:good` | Rate the review card as remembered (longer interval) |
-| `/kaomoji:again` | Rate the review card as forgotten (re-quiz soon) |
+| `/kaomoji:thinking <level>` | Set lesson reasoning level (`off` through `max`) |
+| `/kaomoji:interval <minutes|off>` | Set or disable automatic checks |
+| `/kaomoji:flip` | Toggle question and answer sides |
+| `/kaomoji:good` | Remember; advances progressive sentences |
+| `/kaomoji:again` | Forget; steps progressive sentences back, or schedules FSRS Again at L1 |
+| `/kaomoji:skip` | Mark as well known, return after at least 365 days, and add a same-type replacement |
 
-Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`.
+Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`. If project config defines the same field, the project value wins after reload.
 
 ### Configuration
 
@@ -136,9 +147,9 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `provider` | *(auto-detect)* | Lesson model provider |
 | `model` | *(auto-detect)* | Lesson model ID |
 | `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| `debounceTurns` | `3` | Pet acts every N conversation turns |
+| `intervalMinutes` | `10` | Automatic check interval in minutes; `0` disables it |
 | `dailyNewLimit` | `3` | Max new items taught per day |
-| `maxTokens` | `600` | Max tokens for lesson generation |
+| `maxTokens` | `900` | Max tokens for lesson generation |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 
@@ -146,4 +157,5 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 
 - Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash, grok-4.3, glm-5.2), only from providers with configured auth (logged in or API key present)
 - If the chosen model is unreachable (missing key, network or provider errors), it falls back to the model driving the current session and retries
-- Reviews are display-based (the pet shows the card and advances FSRS with a Good rating); the data model keeps a rating hook for future interactivity- Learning data lives in `~/.pi/agent/kaomoji-english-tutor.db`; delete it to wipe all progress
+- When context is insufficient, the model waits instead of fabricating cards; within the current session, unchanged rejected context is not requested again
+- Learning data lives in `~/.pi/agent/kaomoji-english-tutor.db`; exit Pi before deleting the file so a live SQLite connection cannot keep writing to an unlinked database
