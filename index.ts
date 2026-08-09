@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -5,7 +6,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { FSRS, Rating, Card } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // -- Configuration --------------------------------------------------------
 
@@ -99,6 +100,7 @@ interface ItemRow {
 function openDb(): DatabaseSync {
 	const db = new DatabaseSync(join(getAgentDir(), "kaomoji-english-tutor.db"));
 	db.exec(`
+		PRAGMA busy_timeout = 5000;
 		PRAGMA journal_mode = WAL;
 		CREATE TABLE IF NOT EXISTS items (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +127,29 @@ function openDb(): DatabaseSync {
 			value TEXT NOT NULL
 		);
 	`);
+	// Single global card-slot row.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS runtime_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			active_item_id INTEGER,
+			active_kind TEXT,
+			active_version INTEGER NOT NULL DEFAULT 0,
+			next_check_at TEXT NOT NULL,
+			coordinator TEXT,
+			coordinator_until TEXT,
+			generation_token TEXT,
+			generation_until TEXT,
+			last_activity TEXT
+		);
+		INSERT OR IGNORE INTO runtime_state (id, active_version, next_check_at) VALUES (1, 0, '');
+	`);
+	for (const col of ["generation_token TEXT", "generation_until TEXT"]) {
+		try {
+			db.exec(`ALTER TABLE runtime_state ADD COLUMN ${col}`);
+		} catch {
+			// column already exists
+		}
+	}
 	// Upgrade older databases without the new columns
 	for (const col of [
 		"status TEXT NOT NULL DEFAULT 'learning'",
@@ -297,6 +322,114 @@ function consumeReplacement(db: DatabaseSync, type: GeneratedItem["type"]): bool
 	queue.shift();
 	setStat(db, "pending_replacements", JSON.stringify(queue));
 	return true;
+}
+
+// -- Multi-session runtime state ------------------------------------------
+
+/**
+ * Single global learning slot shared across every concurrent Pi session.
+ * One row (id=1) in SQLite is the single source of truth; each process keeps
+ * only a local cache of the active card for rendering. State transitions that
+ * must happen at most once globally (rating, skip, claiming a due card) run in
+ * short `BEGIN IMMEDIATE` transactions with optimistic CAS checks.
+ */
+
+/** Expiry and renewal cadence of the coordinator lease. */
+const COORDINATOR_LEASE_MS = 15_000;
+const COORDINATOR_HEARTBEAT_MS = 5_000;
+const GENERATION_LEASE_MS = 5 * 60_000;
+/** How often each process polls SQLite for cross-session changes. */
+const SYNC_POLL_MS = 1000;
+/** Grace window a session has to own an in-flight replacement generation. */
+const REPLACEMENT_GRACE_MS = 8000;
+
+interface RuntimeState {
+	active_item_id: number | null;
+	active_kind: "review" | "teach" | null;
+	active_version: number;
+	next_check_at: string;
+	coordinator: string | null;
+	coordinator_until: string | null;
+	generation_token: string | null;
+	generation_until: string | null;
+	last_activity: string | null;
+}
+
+/** Build the non-null default runtime state when the row is missing. */
+function defaultRuntimeState(): RuntimeState {
+	return {
+		active_item_id: null,
+		active_kind: null,
+		active_version: 0,
+		next_check_at: new Date(0).toISOString(),
+		coordinator: null,
+		coordinator_until: null,
+		generation_token: null,
+		generation_until: null,
+		last_activity: null,
+	};
+}
+
+function getRuntimeState(db: DatabaseSync): RuntimeState {
+	let row = db.prepare("SELECT * FROM runtime_state WHERE id = 1").get() as RuntimeState | undefined;
+	if (!row) {
+		db.prepare("INSERT OR IGNORE INTO runtime_state (id, active_version, next_check_at) VALUES (1, 0, '')").run();
+		row = db.prepare("SELECT * FROM runtime_state WHERE id = 1").get() as RuntimeState | undefined;
+	}
+	if (!row) return defaultRuntimeState();
+	return {
+		active_item_id: row.active_item_id,
+		active_kind: row.active_kind as RuntimeState["active_kind"],
+		active_version: Number(row.active_version ?? 0),
+		next_check_at: row.next_check_at ?? "",
+		coordinator: row.coordinator,
+		coordinator_until: row.coordinator_until,
+		generation_token: row.generation_token,
+		generation_until: row.generation_until,
+		last_activity: row.last_activity,
+	};
+}
+
+const RUNTIME_COLUMNS = new Set<keyof RuntimeState>([
+	"active_item_id",
+	"active_kind",
+	"active_version",
+	"next_check_at",
+	"coordinator",
+	"coordinator_until",
+	"generation_token",
+	"generation_until",
+	"last_activity",
+]);
+
+/** Update only the supplied columns so unrelated cross-process state cannot be clobbered. */
+function setRuntimeState(db: DatabaseSync, patch: Partial<RuntimeState>) {
+	const entries = Object.entries(patch).filter(([key]) => RUNTIME_COLUMNS.has(key as keyof RuntimeState));
+	if (!entries.length) return;
+	const assignments = entries.map(([key]) => `${key} = ?`).join(", ");
+	db.prepare(`UPDATE runtime_state SET ${assignments} WHERE id = 1`).run(...entries.map(([, value]) => value));
+}
+
+/** True when the global pacing window (next_check_at) has elapsed. */
+function pacingReady(state: RuntimeState, now: Date): boolean {
+	if (!state.next_check_at) return true;
+	return now.getTime() >= new Date(state.next_check_at).getTime();
+}
+
+/** My coordinator identity: `<sessionId>::<instanceToken>`. */
+function myCoordinatorId(sessionId: string, instanceToken: string): string {
+	return `${sessionId || "session"}::${instanceToken}`;
+}
+
+/** Lower the global pacing window to `now` (used when a card is activated). */
+function resetPacing(db: DatabaseSync) {
+	setRuntimeState(db, { next_check_at: new Date().toISOString() });
+}
+
+function activeItem(db: DatabaseSync): ItemRow | undefined {
+	const state = getRuntimeState(db);
+	if (state.active_item_id == null) return undefined;
+	return db.prepare("SELECT * FROM items WHERE id = ?").get(state.active_item_id) as ItemRow | undefined;
 }
 
 function latestMasteredItem(db: DatabaseSync, type: GeneratedItem["type"]): ItemRow | undefined {
@@ -785,12 +918,11 @@ function statsLine(db: DatabaseSync): string {
 	const total = Number(
 		(db.prepare("SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND status = 'learning'").get() as { n: number }).n,
 	);
-	const mastered = Number(
-		(db.prepare("SELECT COUNT(*) AS n FROM items WHERE status = 'mastered'").get() as { n: number }).n,
-	);
-	const todayReviews = countTodayReviews(db, new Date());
+	const now = new Date();
+	const todayNew = countTodayNew(db, now);
+	const todayReviews = countTodayReviews(db, now);
 	const streak = Number(getStat(db, "streak_days") ?? 0);
-	return `📚 已学 ${total}${mastered ? ` · 已会 ${mastered}` : ""} · 今日复习 ${todayReviews} · 连续学习 ${streak} 天`;
+	return `📚 已学 ${total} · 今日新增 ${todayNew} · 今日复习 ${todayReviews} · 连续学习 ${streak} 天`;
 }
 
 /** Parse a JSON column safely. */
@@ -827,13 +959,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 			}
 			lines.push(`  翻译：${levelsCn?.[level] ?? item.meaning}`);
 		}
-		if (level === 0) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 稍后重学`);
-		} else if (level < levels.length - 1) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 退到 L${level}`);
-		} else {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 退到 L${level}`);
-		}
+		lines.push(`💬 ⌃⌥K 打开复习面板`);
 		return lines;
 	}
 
@@ -847,7 +973,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 		}
-		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
+		lines.push(`💬 ⌃⌥K 打开复习面板`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
@@ -856,7 +982,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 				lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 			}
 		}
-		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:skip 已会`);
+		lines.push(`💬 ⌃⌥K 打开复习面板`);
 	}
 	return lines;
 }
@@ -874,7 +1000,27 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let lastRejectedReplacementKey = "";
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let latestCtx: ExtensionContext | undefined;
+	let reviewPanelOpen = false;
+	let closeReviewPanel: (() => void) | undefined;
+	/** Per-runtime identity; distinct even when two processes open the same logical session. */
+	const instanceToken = randomUUID();
+	/** Current session id, for the coordinator lease identity. */
+	let sessionId = "";
+	/** My `sessionId::instanceToken` coordinator identity. */
+	let myId = "";
+	let lastCoordinatorRenewal = 0;
+	/** Last active_version we rendered locally (to detect cross-session card changes). */
+	let localVersion = -1;
+	/** Cached `PRAGMA data_version` to avoid redundant SQLite reads. */
+	let lastDataVersion: number | null = null;
+	/** Most recently shown card awaiting a rating/skip decision (mirrors the global slot). */
+	let pendingItemId: number | null = null;
+	/** Whether the pending card is currently showing its answer side (local-only). */
+	let pendingFlipped = false;
+	/** Whether the pending card is a review (vs first showing / training). */
+	let pendingIsReview = false;
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
 		try {
@@ -904,11 +1050,16 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	function scheduleTimer(delay = intervalMs()) {
 		stopTimer();
-		if (!latestCtx || config.intervalMinutes <= 0 || pendingItemId != null) return;
+		if (!latestCtx || config.intervalMinutes <= 0 || db == null || activeItem(db) != null) return;
+		const state = getRuntimeState(db);
+		const pacingDelay = state.next_check_at
+			? new Date(state.next_check_at).getTime() - Date.now()
+			: 0;
+		const effectiveDelay = pacingDelay > 0 ? pacingDelay : delay;
 		timer = setTimeout(() => {
 			timer = undefined;
 			void runTimerTick();
-		}, Math.max(0, delay));
+		}, Math.max(0, effectiveDelay));
 		timer.unref?.();
 	}
 
@@ -926,11 +1077,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			console.error(`[kaomoji-english-tutor] Timer tick failed: ${err}`);
 		}
 		if (sessionGeneration !== generation) return;
+		// Keep re-evaluating unless leaving a locally-rated card up for this session.
 		if (pendingItemId == null) scheduleTimer();
 	}
 
+
 	/** Close the session-scoped SQLite connection before reload/switch/exit. */
 	function closeDb() {
+		stopPolling();
 		const current = db;
 		db = null;
 		if (!current) return;
@@ -940,6 +1094,203 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			console.error(`[kaomoji-english-tutor] Failed to close DB: ${err}`);
 		}
 	}
+
+	// -- Coordinator lease & cross-session sync ----------------------------
+
+	/** Stop the cross-session poll timer. */
+	function stopPolling() {
+		if (pollTimer) clearTimeout(pollTimer);
+		pollTimer = undefined;
+	}
+
+	function leaseMs(): number {
+		return COORDINATOR_LEASE_MS;
+	}
+
+	/** I hold the current, unexpired coordinator lease. */
+	function iAmCoordinator(state: RuntimeState, now: Date): boolean {
+		return Boolean(
+			myId &&
+			state.coordinator === myId &&
+			state.coordinator_until &&
+			now.getTime() < new Date(state.coordinator_until).getTime()
+		);
+	}
+
+	/** Acquire/renew leadership, or force takeover after real user activity. */
+	function ensureCoordinator(now = new Date(), force = false): boolean {
+		if (!db || !myId) return false;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const state = getRuntimeState(db);
+			const expired = !state.coordinator || !state.coordinator_until ||
+				now.getTime() >= new Date(state.coordinator_until).getTime();
+			if (!force && state.coordinator !== myId && !expired) {
+				db.exec("ROLLBACK");
+				return false;
+			}
+			const changedOwner = state.coordinator !== myId;
+			setRuntimeState(db, {
+				coordinator: myId,
+				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
+				last_activity: now.toISOString(),
+				...(changedOwner ? { generation_token: null, generation_until: null } : {}),
+			});
+			db.exec("COMMIT");
+			lastCoordinatorRenewal = now.getTime();
+			return true;
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[kaomoji-english-tutor] Coordinator lease failed: ${err}`);
+			return false;
+		}
+	}
+
+	/** Release only this runtime's ownership; never disturb a newer session. */
+	function releaseCoordinator() {
+		if (!db || !myId) return;
+		db.prepare(
+			"UPDATE runtime_state SET coordinator = NULL, coordinator_until = NULL, generation_token = NULL, generation_until = NULL WHERE id = 1 AND coordinator = ?",
+		).run(myId);
+	}
+
+	/** Claim one generation token without holding a transaction across the LLM call. */
+	function claimGeneration(now = new Date()): string | null {
+		if (!ensureCoordinator(now)) return null;
+		const token = randomUUID();
+		try {
+			db!.exec("BEGIN IMMEDIATE");
+			const state = getRuntimeState(db!);
+			const generationBusy = Boolean(
+				state.generation_token && state.generation_until &&
+				now.getTime() < new Date(state.generation_until).getTime()
+			);
+			if (!iAmCoordinator(state, now) || generationBusy) {
+				db!.exec("ROLLBACK");
+				return null;
+			}
+			setRuntimeState(db!, {
+				generation_token: token,
+				generation_until: new Date(now.getTime() + GENERATION_LEASE_MS).toISOString(),
+			});
+			db!.exec("COMMIT");
+			return token;
+		} catch (err) {
+			try { db!.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[kaomoji-english-tutor] Generation lease failed: ${err}`);
+			return null;
+		}
+	}
+
+	function ownsGeneration(state: RuntimeState, token: string, now = new Date()): boolean {
+		return Boolean(
+			iAmCoordinator(state, now) &&
+			state.generation_token === token &&
+			state.generation_until &&
+			now.getTime() < new Date(state.generation_until).getTime()
+		);
+	}
+
+	function releaseGeneration(token: string) {
+		if (!db) return;
+		db.prepare(
+			"UPDATE runtime_state SET generation_token = NULL, generation_until = NULL WHERE id = 1 AND coordinator = ? AND generation_token = ?",
+		).run(myId, token);
+	}
+
+	/** Bump the global card version and cache the rendered state locally. */
+	function recordRendered(state: RuntimeState | undefined) {
+		if (!state) {
+			localVersion = -1;
+			return;
+		}
+		localVersion = state.active_version;
+	}
+
+	/**
+	 * Re-render the widget from the global active card. Returns true when the
+	 * global card changed (so the caller knows a stale local panel should close).
+	 */
+	function renderGlobalCard(ctx: ExtensionContext): boolean {
+		if (!db) return false;
+		const state = getRuntimeState(db);
+		const changed = state.active_version !== localVersion;
+		const item = activeItem(db);
+		if (item && state.active_kind) {
+			const isReview = state.active_kind === "review";
+			pendingItemId = state.active_item_id;
+			pendingIsReview = isReview;
+			if (changed || pendingFlipped === false) pendingFlipped = false;
+			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped);
+			lines.push(statsLine(db));
+			updateWidget(ctx, isReview ? FACES.review : FACES.teach, lines);
+			recordRendered(state);
+		} else {
+			// No global card: reflect cleared state (respecting pacing status line).
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+			if (changed || localVersion < 0) {
+				updateWidget(ctx, FACES.idle, [statsLine(db)]);
+				recordRendered(state);
+			}
+		}
+		return changed;
+	}
+
+	/**
+	 * Poll SQLite for cross-session changes (~1s) using PRAGMA data_version.
+	 * Re-renders the global card and resumes timer work after another session
+	 * rates/skips the active card so every process converges on the same card.
+	 */
+	function startPolling() {
+		stopPolling();
+		if (!db || !latestCtx) return;
+		try {
+			lastDataVersion = Number(db.prepare("PRAGMA data_version").get()?.data_version ?? 0);
+			renderGlobalCard(latestCtx);
+		} catch {
+			lastDataVersion = null;
+		}
+		const tick = () => {
+			if (!db || !latestCtx || isCtxStale(latestCtx)) {
+				pollTimer = undefined;
+				return;
+			}
+			try {
+				const version = Number(db.prepare("PRAGMA data_version").get()?.data_version ?? 0);
+				if (lastDataVersion === null || version !== lastDataVersion) {
+					lastDataVersion = version;
+					const previousActive = pendingItemId;
+					const changed = renderGlobalCard(latestCtx);
+					const state = getRuntimeState(db);
+					if (reviewPanelOpen && changed) closeReviewPanel?.();
+					if (state.active_item_id != null) {
+						stopTimer();
+					} else if (previousActive != null && config.intervalMinutes > 0) {
+						// scheduleTimer respects the persisted next_check_at pacing boundary.
+						scheduleTimer(0);
+					}
+				}
+				const state = getRuntimeState(db);
+				const generationExpired = Boolean(
+					pendingLLMCall && (!state.generation_until || Date.now() >= new Date(state.generation_until).getTime())
+				);
+				if (!generationExpired && state.coordinator === myId && Date.now() - lastCoordinatorRenewal >= COORDINATOR_HEARTBEAT_MS) {
+					ensureCoordinator(new Date());
+				}
+			} catch (err) {
+				console.error(`[kaomoji-english-tutor] Sync poll failed: ${err}`);
+			}
+			pollTimer = setTimeout(tick, SYNC_POLL_MS);
+			(pollTimer as unknown as { kaomojiPoll?: boolean }).kaomojiPoll = true;
+			pollTimer.unref?.();
+		};
+		pollTimer = setTimeout(tick, SYNC_POLL_MS);
+		(pollTimer as unknown as { kaomojiPoll?: boolean }).kaomojiPoll = true;
+		pollTimer.unref?.();
+	}
+
 
 	/**
 	 * Resolve the lesson model: explicit config first, then auto-detect among
@@ -997,22 +1348,78 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget("kaomoji-english-tutor", out.map(accent), { placement: "belowEditor" });
 	}
 
-	function showItem(ctx: ExtensionContext, item: ItemRow, isReview: boolean) {
-		if (!db) return;
-		const face = isReview ? FACES.review : FACES.teach;
+	/** Atomically select, mark, and activate the next due card. */
+	function claimDueItem(now: Date): ItemRow | undefined {
+		if (!db) return undefined;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const state = getRuntimeState(db);
+			if (state.active_item_id != null || !pacingReady(state, now)) {
+				db.exec("ROLLBACK");
+				return undefined;
+			}
+			const due = getDueItem(db, now);
+			if (!due) {
+				db.exec("ROLLBACK");
+				return undefined;
+			}
+			const isReview = due.shown === 1;
+			if (!isReview) {
+				markShown(db, due.id);
+				touchStreak(db, now);
+			}
+			setRuntimeState(db, {
+				active_item_id: due.id,
+				active_kind: isReview ? "review" : "teach",
+				active_version: state.active_version + 1,
+				next_check_at: now.toISOString(),
+			});
+			db.exec("COMMIT");
+			return db.prepare("SELECT * FROM items WHERE id = ?").get(due.id) as unknown as ItemRow | undefined;
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[kaomoji-english-tutor] Due-card claim failed: ${err}`);
+			return undefined;
+		}
+	}
+
+	/** Render an item only when it is still the authoritative global card. */
+	function showItem(ctx: ExtensionContext, item: ItemRow): boolean {
+		if (!db) return false;
+		const state = getRuntimeState(db);
+		if (state.active_item_id !== item.id || !state.active_kind) return false;
+		const isReview = state.active_kind === "review";
+		pendingItemId = item.id;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
+		recordRendered(state);
+		const face = isReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, isReview, face, false);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		if (config.verbose) {
 			ctx.ui.notify(`${isReview ? "复习" : "新学"}：${item.text} — ${item.meaning}`, "info");
 		}
+		return true;
+	}
+
+	/** Populate the local projection when another session activated a card before this session observed it. */
+	function hydratePending(ctx: ExtensionContext) {
+		if (pendingItemId == null && db && getRuntimeState(db).active_item_id != null) {
+			renderGlobalCard(ctx);
+		}
 	}
 
 	/** Toggle the pending card between its question and answer sides. */
 	function flipPending(ctx: ExtensionContext): boolean {
+		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
+		const state = getRuntimeState(db);
+		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
+			const changed = renderGlobalCard(ctx);
+			if (reviewPanelOpen && changed) closeReviewPanel?.();
+			return true;
+		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
 		pendingFlipped = !pendingFlipped;
@@ -1025,13 +1432,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	// -- Pet tick ---------------------------------------------------------
 
-	/** Most recently shown card awaiting a rating/skip decision (item id). */
-	let pendingItemId: number | null = null;
-	/** Whether the pending card is currently showing its answer side. */
-	let pendingFlipped = false;
-	/** Whether the pending card is a review (vs first showing / training). */
-	let pendingIsReview = false;
-
 	/** Show the sentence card at a given level (0-based). */
 	function showSentenceLevel(ctx: ExtensionContext, item: ItemRow, level: number) {
 		const shown = { ...item, progress: level } as ItemRow;
@@ -1042,50 +1442,118 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		updateWidget(ctx, FACES.teach, lines);
 	}
 
-	/** Rate the pending review card; returns false if no card is awaiting a rating. */
+	/** Rate the pending review card; returns true once an action was taken (or a stale action was safely refreshed). */
 	function ratePending(ctx: ExtensionContext, rating: Rating): boolean {
+		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
 
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
-		pendingItemId = null;
-		pendingFlipped = false;
-		pendingIsReview = false;
-		if (!item || item.shown === 0) return true;
+		if (!item || item.shown === 0) {
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+			return true;
+		}
 
 		const now = new Date();
 		const levels = parseJsonCol<string[]>(item.levels);
-
-		// Sentence in progressive training: good advances a level, again steps back
-		if (item.type === "sentence" && levels && levels.length > 1) {
-			if (rating === Rating.Good && item.progress < levels.length - 1) {
-				db.prepare("UPDATE items SET progress = ?, due_at = ? WHERE id = ?").run(
-					item.progress + 1,
-					now.toISOString(),
-					item.id,
-				);
-				showSentenceLevel(ctx, item, item.progress + 1);
-				pendingItemId = item.id; // keep the card up for the next rating
-				return true;
-			}
-			if (rating === Rating.Again && item.progress > 0) {
-				db.prepare("UPDATE items SET progress = ?, due_at = ? WHERE id = ?").run(
-					item.progress - 1,
-					now.toISOString(),
-					item.id,
-				);
-				showSentenceLevel(ctx, item, item.progress - 1);
-				pendingItemId = item.id; // keep the card up for the next rating
-				return true;
-			}
-			// Full level + Good: hand over to FSRS (from the state saved at first showing)
-			// or bottom level + Again: relearn from scratch via FSRS Again
+		const stateAtStart = getRuntimeState(db);
+		// A stale rating (another session changed the global card) must not double-apply.
+		if (stateAtStart.active_item_id !== item.id || stateAtStart.active_version !== localVersion) {
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+			renderGlobalCard(ctx);
+			return true;
 		}
 
-		const next = scheduleNext(item.fsrs_state, now, rating);
-		advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
-		bumpStat(db, "total_reviews", 1);
-		touchStreak(db, now);
+		// Sentence in progressive training: update progress and slot version in one transaction.
+		if (item.type === "sentence" && levels && levels.length > 1) {
+			const nextProgress = rating === Rating.Good && item.progress < levels.length - 1
+				? item.progress + 1
+				: rating === Rating.Again && item.progress > 0
+					? item.progress - 1
+					: null;
+			if (nextProgress != null) {
+				let applied = false;
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					const cur = getRuntimeState(db);
+					const current = db.prepare("SELECT progress FROM items WHERE id = ?").get(item.id) as { progress: number } | undefined;
+					if (cur.active_item_id === item.id && cur.active_version === stateAtStart.active_version && current?.progress === item.progress) {
+						db.prepare("UPDATE items SET progress = ?, due_at = ? WHERE id = ?").run(nextProgress, now.toISOString(), item.id);
+						setRuntimeState(db, {
+							active_kind: "teach",
+							active_version: cur.active_version + 1,
+							next_check_at: now.toISOString(),
+						});
+						applied = true;
+					}
+					db.exec("COMMIT");
+				} catch (err) {
+					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+					console.error(`[kaomoji-english-tutor] Sentence CAS failed: ${err}`);
+				}
+				if (!applied) {
+					pendingItemId = null;
+					pendingFlipped = false;
+					pendingIsReview = false;
+					renderGlobalCard(ctx);
+					return true;
+				}
+				const state = getRuntimeState(db);
+				recordRendered(state);
+				const refreshed = db.prepare("SELECT * FROM items WHERE id = ?").get(item.id) as unknown as ItemRow;
+				showSentenceLevel(ctx, refreshed, nextProgress);
+				pendingItemId = item.id;
+				pendingIsReview = false;
+				return true;
+			}
+			// Full level + Good hands over to FSRS; bottom-level Again relearns via FSRS.
+		}
 
+		// Full rating: one-shot, atomic, applies at most once globally.
+		const next = scheduleNext(item.fsrs_state, now, rating);
+		const nextCheck = new Date(now.getTime() + intervalMs()).toISOString();
+		let applied = false;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			if (cur.active_item_id === item.id && cur.active_version === stateAtStart.active_version) {
+				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
+				bumpStat(db, "total_reviews", 1);
+				touchStreak(db, now);
+				setRuntimeState(db, {
+					active_item_id: null,
+					active_kind: null,
+					active_version: cur.active_version + 1,
+					next_check_at: nextCheck,
+					coordinator: cur.coordinator,
+					coordinator_until: cur.coordinator_until,
+					last_activity: cur.last_activity,
+				});
+				applied = true;
+			}
+			db.exec("COMMIT");
+		} catch (err) {
+			try {
+				db.exec("ROLLBACK");
+			} catch {
+				/* already rolled back */
+			}
+			console.error(`[kaomoji-english-tutor] Rate CAS failed: ${err}`);
+		} finally {
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+		}
+
+		if (!applied) {
+			// Another session rated first; just refresh.
+			renderGlobalCard(ctx);
+			return true;
+		}
+		recordRendered(getRuntimeState(db));
 		if (rating === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个词`,
@@ -1102,6 +1570,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	/** Atomically mark the pending card as well-known and enqueue its replacement. */
 	function skipPending(ctx: ExtensionContext): ItemRow | undefined {
+		hydratePending(ctx);
 		if (pendingItemId == null || !db) return undefined;
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return undefined;
@@ -1109,8 +1578,18 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
 		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
 		const due = next.due < minDue ? minDue : next.due;
-		db.exec("BEGIN IMMEDIATE");
+		let applied = false;
 		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			if (cur.active_item_id !== item.id || cur.active_version !== localVersion) {
+				db.exec("ROLLBACK");
+				renderGlobalCard(ctx);
+				pendingItemId = null;
+				pendingFlipped = false;
+				pendingIsReview = false;
+				return undefined;
+			}
 			db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
 				next.state,
 				due,
@@ -1118,19 +1597,42 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			);
 			bumpStat(db, "total_skipped", 1);
 			enqueueReplacement(db, item.type);
+			// Give this instance a short grace to generate the replacement without
+			// another session surfacing a card in between.
+			setRuntimeState(db, {
+				active_item_id: null,
+				active_kind: null,
+				active_version: cur.active_version + 1,
+				next_check_at: new Date(now.getTime() + REPLACEMENT_GRACE_MS).toISOString(),
+				coordinator: myId,
+				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
+				generation_token: null,
+				generation_until: null,
+				last_activity: now.toISOString(),
+			});
+			applied = true;
 			db.exec("COMMIT");
 		} catch (err) {
-			db.exec("ROLLBACK");
+			try {
+				db.exec("ROLLBACK");
+			} catch {
+				/* already rolled back */
+			}
 			throw err;
 		}
+
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
-		updateWidget(ctx, FACES.party, [
-			`${FACES.party} 好，${item.text} 记作很熟的内容，正在补充同类型卡片…`,
-			statsLine(db),
-		]);
-		return item;
+		if (applied) {
+			recordRendered(getRuntimeState(db));
+			updateWidget(ctx, FACES.party, [
+				`${FACES.party} 好，${item.text} 记作很熟的内容，正在补充同类型卡片…`,
+				statsLine(db),
+			]);
+			return item;
+		}
+		return undefined;
 	}
 
 	async function generateReplacementAndInsert(
@@ -1154,6 +1656,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
 			return false;
 		}
+		const generationToken = claimGeneration();
+		if (!generationToken) return false;
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
@@ -1165,11 +1669,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			try {
 				decision = await generateReplacement(ctx, resolved, conversation, replacementKnownList(db), config, skipped);
 			} catch (err) {
-				if (
-					!resolved.fromSession &&
-					ctx.model &&
-					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)
-				) {
+				if (!resolved.fromSession && ctx.model &&
+					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)) {
 					if (sessionGeneration !== generation || !db) return false;
 					decision = await generateReplacement(
 						ctx,
@@ -1185,47 +1686,67 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			}
 			if (sessionGeneration !== generation || !db) return false;
 			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 			if (!decision.ready) {
 				lastRejectedReplacementKey = rejectionKey;
 				updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
 				if (config.verbose && decision.reason) ctx.ui.notify(`暂不补卡：${decision.reason}`, "info");
 				return false;
 			}
+
 			const item = decision.item;
-			const duplicate = db.prepare(
-				"SELECT COUNT(*) AS n FROM items WHERE type = ? AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)",
-			).get(item.type, item.text, item.meaning) as { n: number };
-			if (Number(duplicate.n) > 0) {
+			const now = new Date();
+			let inserted: ItemRow | undefined;
+			let duplicate = false;
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const state = getRuntimeState(db);
+				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== type) {
+					db.exec("ROLLBACK");
+					return false;
+				}
+				const dup = db.prepare(
+					"SELECT COUNT(*) AS n FROM items WHERE type = ? AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)",
+				).get(item.type, item.text, item.meaning) as { n: number };
+				if (Number(dup.n) > 0) {
+					duplicate = true;
+					db.exec("ROLLBACK");
+				} else {
+					const id = insertItem(db, item.type, item.text, item.phonetic || null, item.meaning, item.example || null, item.example_cn || null, now, {
+						levels: item.levels,
+						levels_cn: item.levels_cn,
+						chunks: item.chunks,
+						keyWords: item.keyWords,
+					});
+					insertCompanionWords(db, item.keyWords, now);
+					bumpStat(db, "total_learned", 1);
+					touchStreak(db, now);
+					if (!consumeReplacement(db, type)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
+					markShown(db, id);
+					setRuntimeState(db, {
+						active_item_id: id,
+						active_kind: "teach",
+						active_version: state.active_version + 1,
+						next_check_at: now.toISOString(),
+						generation_token: null,
+						generation_until: null,
+					});
+					inserted = db.prepare("SELECT * FROM items WHERE id = ?").get(id) as ItemRow | undefined;
+					if (!inserted) throw new Error("REPLACEMENT_INSERT_FAILED");
+					db.exec("COMMIT");
+				}
+			} catch (err) {
+				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+				throw err;
+			}
+			if (duplicate) {
 				lastRejectedReplacementKey = rejectionKey;
 				updateWidget(ctx, FACES.idle, ["模型给出了重复内容，等话题变化后再补卡…", statsLine(db)]);
 				return false;
 			}
-			const now = new Date();
-			const currentDb = db;
-			let inserted: ItemRow | undefined;
-			currentDb.exec("BEGIN IMMEDIATE");
-			try {
-				const id = insertItem(currentDb, item.type, item.text, item.phonetic || null, item.meaning, item.example || null, item.example_cn || null, now, {
-					levels: item.levels,
-					levels_cn: item.levels_cn,
-					chunks: item.chunks,
-					keyWords: item.keyWords,
-				});
-				insertCompanionWords(currentDb, item.keyWords, now);
-				bumpStat(currentDb, "total_learned", 1);
-				touchStreak(currentDb, now);
-				if (!consumeReplacement(currentDb, type)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
-				markShown(currentDb, id);
-				inserted = currentDb.prepare("SELECT * FROM items WHERE id = ?").get(id) as unknown as ItemRow | undefined;
-				if (!inserted) throw new Error("REPLACEMENT_INSERT_FAILED");
-				currentDb.exec("COMMIT");
-			} catch (err) {
-				currentDb.exec("ROLLBACK");
-				throw err;
-			}
 			lastRejectedReplacementKey = "";
-			pendingItemId = inserted.id;
-			showItem(ctx, inserted, false);
+			if (!inserted) return false;
+			showItem(ctx, inserted);
 			if (config.verbose) ctx.ui.notify(`已补充 ${TYPE_LABELS[type]}：${item.text}`, "info");
 			return true;
 		} catch (err) {
@@ -1235,6 +1756,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (db && !isCtxStale(ctx)) updateWidget(ctx, FACES.error, [`补卡失败：${lastError}`, statsLine(db)]);
 			return false;
 		} finally {
+			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) pendingLLMCall = false;
 		}
 	}
@@ -1243,36 +1765,58 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const generation = sessionGeneration;
 		if (isCtxStale(ctx)) return;
 		if (!db) return;
-		// An Anki-style card stays active until the user rates or skips it.
-		// Never let the turn timer replace the pending card with another due item.
-		if (pendingItemId != null) return;
 		const now = new Date();
+		const state0 = getRuntimeState(db);
+		// A global card is active: render it and never swap it for another.
+		if (state0.active_item_id != null) {
+			renderGlobalCard(ctx);
+			return;
+		}
 
-		// A skipped card reserves one same-type replacement, even past the daily limit.
+		// Respect the global pacing window so one session's rating cannot let
+		// another session surface a different card ahead of the interval.
+		if (!pacingReady(state0, now)) {
+			updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			return;
+		}
+
+		// A skipped card reserves one same-type replacement (priority over
+		// surfacing when a session is actively generating it).
 		const replacementType = pendingReplacementTypes(db)[0];
 		let replacementWaiting = false;
 		if (replacementType) {
 			if (await generateReplacementAndInsert(ctx, replacementType)) return;
 			if (sessionGeneration !== generation || !db) return;
+			const state = getRuntimeState(db);
+			const generationBusy = Boolean(
+				state.generation_token && state.generation_until &&
+				Date.now() < new Date(state.generation_until).getTime()
+			);
+			if (generationBusy) {
+				updateWidget(ctx, FACES.idle, [statsLine(db)]);
+				return;
+			}
+			// Generation is waiting for better context; keep the FIFO obligation but
+			// allow an already-due card to surface.
+			resetPacing(db);
 			replacementWaiting = true;
 		}
 
-		// 1. Due item first: show a review card (or the first showing of a new item)
-		const due = getDueItem(db, now);
+		// 1. Due item first: select + mark + activate in one transaction.
+		const due = claimDueItem(new Date());
 		if (due) {
-			if (due.shown === 0) {
-				markShown(db, due.id);
-				touchStreak(db, now);
-			}
-			pendingItemId = due.id;
-			showItem(ctx, due, due.shown === 1);
+			if (!showItem(ctx, due)) renderGlobalCard(ctx);
+			return;
+		}
+		if (getRuntimeState(db).active_item_id != null) {
+			renderGlobalCard(ctx);
 			return;
 		}
 		if (replacementWaiting) return;
 
-		// 2. Otherwise teach new items (LLM), up to the daily limit
+		// 2. Otherwise teach new items (LLM), up to the daily limit, single-owner.
 		if (countTodayNew(db, now) < config.dailyNewLimit) {
-			if (pendingLLMCall) return; // an in-flight generation covers this tick
+			if (pendingLLMCall) return;
 			await generateAndInsert(ctx, now);
 			return;
 		}
@@ -1281,7 +1825,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 	}
 
-	async function generateAndInsert(ctx: ExtensionContext, now: Date) {
+	async function generateAndInsert(ctx: ExtensionContext, _now: Date) {
 		const conversation = buildConversation(ctx.sessionManager.getBranch());
 		if (!conversation.trim()) {
 			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
@@ -1291,6 +1835,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 			return;
 		}
+		const generationToken = claimGeneration();
+		if (!generationToken) return;
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
@@ -1303,14 +1849,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				decision = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
-				// Fallback: when the chosen model is unreachable (missing auth,
-				// network or provider errors), retry once with the current session
-				// model — it is authenticated and known to work.
-				if (
-					!resolved.fromSession &&
-					ctx.model &&
-					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)
-				) {
+				if (!resolved.fromSession && ctx.model &&
+					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)) {
 					const fallback: ResolvedModel = {
 						provider: ctx.model.provider,
 						model: ctx.model.id,
@@ -1323,42 +1863,68 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					throw err;
 				}
 			}
-
-			// The session or conversation may have changed while the timer's LLM call was in flight.
-			// Discard stale output; the next timer check will evaluate the newer context.
-			if (sessionGeneration !== generation || buildConversation(ctx.sessionManager.getBranch()) !== conversation) return;
-
+			if (sessionGeneration !== generation || !db ||
+				buildConversation(ctx.sessionManager.getBranch()) !== conversation) return;
+			if (!ownsGeneration(getRuntimeState(db), generationToken)) return;
 			if (!decision.ready) {
 				lastRejectedConversation = conversation;
-				if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+				updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 				if (config.verbose && decision.reason) ctx.ui.notify(`暂不备课：${decision.reason}`, "info");
 				return;
 			}
-			lastRejectedConversation = "";
+
 			const lesson = decision;
-			if (!db) return;
-			for (const it of lesson.items) {
-				insertItem(db, it.type, it.text, it.phonetic || null, it.meaning, it.example || null, it.example_cn || null, now, {
-					levels: it.levels,
-					levels_cn: it.levels_cn,
-					chunks: it.chunks,
-					keyWords: it.keyWords,
+			const insertedAt = new Date();
+			let insertedFirst: ItemRow | undefined;
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const state = getRuntimeState(db);
+				if (!ownsGeneration(state, generationToken, insertedAt) ||
+					state.active_item_id != null ||
+					countTodayNew(db, insertedAt) >= config.dailyNewLimit ||
+					pendingReplacementTypes(db).length > 0 ||
+					getDueItem(db, insertedAt)) {
+					db.exec("ROLLBACK");
+					return;
+				}
+				let firstId: number | undefined;
+				for (const it of lesson.items) {
+					const id = insertItem(db, it.type, it.text, it.phonetic || null, it.meaning, it.example || null, it.example_cn || null, insertedAt, {
+						levels: it.levels,
+						levels_cn: it.levels_cn,
+						chunks: it.chunks,
+						keyWords: it.keyWords,
+					});
+					firstId ??= id;
+					insertCompanionWords(db, it.keyWords, insertedAt);
+				}
+				if (firstId == null) throw new Error("LESSON_INSERT_FAILED");
+				bumpStat(db, "total_learned", lesson.items.length);
+				touchStreak(db, insertedAt);
+				markShown(db, firstId);
+				setRuntimeState(db, {
+					active_item_id: firstId,
+					active_kind: "teach",
+					active_version: state.active_version + 1,
+					next_check_at: insertedAt.toISOString(),
+					generation_token: null,
+					generation_until: null,
 				});
-				insertCompanionWords(db, it.keyWords, now);
+				insertedFirst = db.prepare("SELECT * FROM items WHERE id = ?").get(firstId) as ItemRow | undefined;
+				db.exec("COMMIT");
+			} catch (err) {
+				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+				throw err;
 			}
-			bumpStat(db, "total_learned", lesson.items.length);
-			touchStreak(db, now);
-			const first = getDueItem(db, now);
-			if (first) {
-				markShown(db, first.id);
-				const shown = { ...first, shown: 1 };
-				pendingItemId = first.id;
-				pendingFlipped = false;
-				pendingIsReview = false;
-				const topicLine = lesson.topic ? `${FACES.teach} 今日主题：${lesson.topic}` : FACES.teach;
-				const lines = [topicLine, ...renderCard(shown, false, FACES.teach, false)];
-				lines.push(statsLine(db));
-				updateWidget(ctx, FACES.teach, lines);
+			lastRejectedConversation = "";
+			if (!insertedFirst) return;
+			showItem(ctx, insertedFirst);
+			if (lesson.topic && db) {
+				updateWidget(ctx, FACES.teach, [
+					`${FACES.teach} 今日主题：${lesson.topic}`,
+					...renderCard(insertedFirst, false, FACES.teach, false),
+					statsLine(db),
+				]);
 			}
 			if (config.verbose) {
 				ctx.ui.notify(`备好课啦：${lesson.topic || "主题"}，共 ${lesson.items.length} 个学习项`, "info");
@@ -1369,7 +1935,136 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
 			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`]);
 		} finally {
+			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) pendingLLMCall = false;
+		}
+	}
+
+	async function runSkipAction(ctx: ExtensionContext): Promise<void> {
+		if (!db) {
+			ctx.ui.notify("当前没有可跳过的卡片", "info");
+			return;
+		}
+		const queueWasEmpty = pendingReplacementTypes(db).length === 0;
+		let skipped: ItemRow | undefined;
+		try {
+			skipped = skipPending(ctx);
+		} catch (err) {
+			ctx.ui.notify(`标记失败：${(err as Error).message}`, "error");
+			return;
+		}
+		if (!skipped || !db) {
+			ctx.ui.notify("当前没有可跳过的卡片", "info");
+			return;
+		}
+		const nextType = pendingReplacementTypes(db)[0];
+		const source = queueWasEmpty && nextType === skipped.type ? skipped : undefined;
+		const generation = sessionGeneration;
+		const inserted = nextType ? await generateReplacementAndInsert(ctx, nextType, source) : false;
+		if (sessionGeneration !== generation) return;
+		if (!inserted && db) {
+			// Generation failed or was waiting for info: lower the pacing window so
+			// the next tick can surface a due card instead of stalling on the grace gap.
+			resetPacing(db);
+			scheduleTimer();
+		}
+	}
+
+	function currentPendingCard(): ItemRow | undefined {
+		if (!db) return undefined;
+		return activeItem(db);
+	}
+
+	async function openReviewPanel(ctx: ExtensionContext): Promise<void> {
+		hydratePending(ctx);
+		if (reviewPanelOpen) {
+			ctx.ui.notify("复习面板已打开", "info");
+			return;
+		}
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("复习面板仅在 TUI 模式可用；请改用 /kaomoji:flip|good|again|skip", "warning");
+			return;
+		}
+		if (!db) {
+			ctx.ui.notify("学习数据库不可用，无法打开复习面板", "warning");
+			return;
+		}
+		if (!currentPendingCard()) {
+			ctx.ui.notify("当前没有待复习的卡片", "info");
+			return;
+		}
+
+		reviewPanelOpen = true;
+		try {
+			await ctx.ui.custom<undefined>((tui, theme, _keybindings, done) => {
+				let closed = false;
+				const close = () => {
+					if (closed) return;
+					closed = true;
+					closeReviewPanel = undefined;
+					reviewPanelOpen = false;
+					done(undefined);
+				};
+				closeReviewPanel = close;
+
+				const rate = (rating: Rating) => {
+					if (!ratePending(ctx, rating)) {
+						close();
+						return;
+					}
+					if (pendingItemId != null) {
+						tui.requestRender();
+						return;
+					}
+					close();
+					scheduleTimer();
+				};
+
+				return {
+					render(width: number): string[] {
+						const safeWidth = Math.max(1, width);
+						const item = currentPendingCard();
+						const face = pendingIsReview ? FACES.review : FACES.teach;
+						const lines = [theme.fg("accent", "─ 英语复习 ─")];
+						if (item) {
+							lines.push(...renderCard(item, pendingIsReview, face, pendingFlipped).filter((line) => !line.startsWith("💬")));
+						} else {
+							lines.push(theme.fg("dim", "当前没有待复习的卡片"));
+						}
+						if (db) lines.push(statsLine(db));
+						lines.push("", theme.fg("dim", "Space 翻面 · G Good(记得) · A Again(忘了) · S Skip(已会) · Esc 关闭"));
+						return lines
+							.flatMap((line) => wrapTextWithAnsi(line, safeWidth))
+							.map((line) => truncateToWidth(line, safeWidth));
+					},
+					handleInput(data: string): void {
+						if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+							close();
+							return;
+						}
+						if (matchesKey(data, Key.space)) {
+							if (flipPending(ctx)) tui.requestRender();
+							return;
+						}
+						if (matchesKey(data, "g") || matchesKey(data, Key.shift("g"))) {
+							rate(Rating.Good);
+							return;
+						}
+						if (matchesKey(data, "a") || matchesKey(data, Key.shift("a"))) {
+							rate(Rating.Again);
+							return;
+						}
+						if (matchesKey(data, "s") || matchesKey(data, Key.shift("s"))) {
+							close();
+							void runSkipAction(ctx);
+						}
+					},
+					invalidate(): void {},
+				};
+			});
+		} finally {
+			reviewPanelOpen = false;
+			closeReviewPanel = undefined;
 		}
 	}
 
@@ -1552,38 +2247,36 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("kaomoji:skip", {
 		description: "Mark the shown card as known and generate a same-type replacement",
 		handler: async (_args, ctx) => {
-			if (!db) {
-				ctx.ui.notify("当前没有可跳过的卡片", "info");
-				return;
-			}
-			const queueWasEmpty = pendingReplacementTypes(db).length === 0;
-			let skipped: ItemRow | undefined;
-			try {
-				skipped = skipPending(ctx);
-			} catch (err) {
-				ctx.ui.notify(`标记失败：${(err as Error).message}`, "error");
-				return;
-			}
-			if (!skipped || !db) {
-				ctx.ui.notify("当前没有可跳过的卡片", "info");
-				return;
-			}
-			const nextType = pendingReplacementTypes(db)[0];
-			const source = queueWasEmpty && nextType === skipped.type ? skipped : undefined;
-			const generation = sessionGeneration;
-			const inserted = nextType ? await generateReplacementAndInsert(ctx, nextType, source) : false;
-			if (sessionGeneration !== generation) return;
-			if (!inserted) scheduleTimer();
+			await runSkipAction(ctx);
 		},
+	});
+
+	// Pi calls the macOS Option modifier "Alt" in shortcut key IDs.
+	pi.registerShortcut(Key.ctrlAlt("k"), {
+		description: "Open kaomoji review panel (Space flip, G good, A again, S skip, Esc close)",
+		handler: (ctx) => openReviewPanel(ctx),
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionGeneration++;
 		stopTimer();
+		lastDataVersion = null;
+		localVersion = -1;
+		releaseCoordinator();
 		closeDb();
 		config = loadConfig(ctx.cwd);
 		resetState();
 		latestCtx = ctx;
+		// Establish my coordinator identity for the shared generation lease.
+		try {
+			sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+		} catch {
+			sessionId = "";
+		}
+		myId = myCoordinatorId(sessionId, instanceToken);
+		pendingItemId = null;
+		pendingFlipped = false;
+		pendingIsReview = false;
 		try {
 			db = openDb();
 		} catch (err) {
@@ -1591,19 +2284,44 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			db = null;
 		}
 		resolveModel(ctx);
-		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+		if (db) {
+			ensureCoordinator(new Date(), true);
+			// Rebuild the active global card so this session converges immediately.
+			if (activeItem(db)) {
+				renderGlobalCard(ctx);
+			} else if (localVersion < 0) {
+				updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			}
+			startPolling();
+		}
 		scheduleTimer();
 	});
 
 	pi.on("session_shutdown", async () => {
 		sessionGeneration++;
 		stopTimer();
+		stopPolling();
+		releaseCoordinator();
+		closeReviewPanel?.();
+		closeReviewPanel = undefined;
+		reviewPanelOpen = false;
 		latestCtx = undefined;
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
 		pendingLLMCall = false;
+		sessionId = "";
+		myId = "";
+		lastCoordinatorRenewal = 0;
+		lastDataVersion = null;
+		localVersion = -1;
 		closeDb();
+	});
+
+	// Real user activity makes this the most-recent coordinator; injected input does not.
+	pi.on("input", (event, _ctx) => {
+		if (event.source !== "extension") ensureCoordinator(new Date(), true);
+		return { action: "continue" };
 	});
 
 }

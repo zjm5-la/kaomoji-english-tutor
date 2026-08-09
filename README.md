@@ -12,7 +12,7 @@
 (=^･ω･^=) 单词：overfitting /ˌəʊ.vəˈfɪt.ɪŋ/
   释义：过拟合
   例：Dropout can help reduce overfitting in neural networks.（Dropout 可以帮助减少神经网络中的过拟合。）
-📚 已学 12 · 今日复习 3 · 连续学习 5 天
+📚 已学 12 · 今日新增 2 · 今日复习 3 · 连续学习 5 天
 ```
 
 ### 机制
@@ -21,8 +21,10 @@
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句
 - **渐进长句**：同一张句子卡按 L1 主干 → L2 扩展 → L3 完整长句训练，配有逐级翻译、意群切分和独立生词卡
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；只有明确的 Good/Again/Skip 才修改调度，展示卡片不会自动评分
-- **卡片交互**：`/kaomoji:flip` 正反面切换；`/kaomoji:good` 记得；`/kaomoji:again` 忘了；`/kaomoji:skip` 标记很熟并立即补充一张同类型卡片（补卡不占每日新卡上限）。命令不进入会话历史
+- **复习交互**：卡片继续常驻编辑器下方 Widget；按 `Control+Option+K`（`⌃⌥K`）打开键盘复习面板，使用 `Space` 翻面、`G` 记得、`A` 忘了、`S` 标记很熟并尝试补充同类型卡片、`Esc` 关闭且不改变学习状态
+- **卡片命令（兼容/备用）**：`/kaomoji:flip`、`/kaomoji:good`、`/kaomoji:again`、`/kaomoji:skip` 与面板共用同一逻辑，也可用于非 TUI 环境；命令不进入会话历史
 - **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
+- **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；任一会话完成评分后，其他会话会自动同步，翻面和面板开关仍各自独立
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
 
 ### 安装
@@ -41,17 +43,19 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 
 ### 命令
 
+默认使用 `Control+Option+K`（`⌃⌥K`）打开复习面板；卡片命令保留为兼容/备用，配置命令保持不变。
+
 | 命令 | 说明 |
 | --------- | ------------- |
 | `/kaomoji:model` | 交互式选择备课模型（仅列出已登录/已配置密钥的模型，按推荐优先级排序） |
 | `/kaomoji:model <编号>` | 按列表编号直接选择 |
 | `/kaomoji:model <provider/model>` | 直接指定模型（如 `deepseek/deepseek-v4-flash`） |
 | `/kaomoji:thinking <等级>` | 设置备课思考等级：`off` 到 `max` |
-| `/kaomoji:interval <分钟|off>` | 设置自动检查间隔，或关闭自动检查 |
-| `/kaomoji:flip` | 在问题面和答案面之间切换 |
-| `/kaomoji:good` | 评分为记得；长句训练中升级 |
-| `/kaomoji:again` | 评分为忘了；长句训练中退级，L1 时进入 FSRS Again |
-| `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并立即补充同类型卡片 |
+| `/kaomoji:interval <分钟\|off>` | 设置自动检查间隔，或关闭自动检查 |
+| `/kaomoji:flip` | （兼容/备用）在问题面和答案面之间切换 |
+| `/kaomoji:good` | （兼容/备用）评分为记得；长句训练中升级 |
+| `/kaomoji:again` | （兼容/备用）评分为忘了；长句训练中退级，L1 时进入 FSRS Again |
+| `/kaomoji:skip` | （兼容/备用）标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
 
 设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。如果项目配置包含同名字段，reload 后仍以项目配置为准。
 
@@ -104,8 +108,10 @@ A kaomoji pet that lives in a widget below the editor and teaches you English ba
 - **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence
 - **Progressive sentences**: one sentence card advances from L1 core clause to L2 expansion and L3 full sentence, with per-level translations, chunks, and companion word cards
 - **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); only explicit Good/Again/Skip actions change scheduling—displaying a card never rates it
-- **Card interaction**: `/kaomoji:flip` toggles front/back, `/kaomoji:good` remembers, `/kaomoji:again` forgets, and `/kaomoji:skip` marks content as well known and immediately creates a same-type replacement (replacements bypass the daily new-item cap)
+- **Review interaction**: cards remain visible in the widget; press `Control+Option+K` (`⌃⌥K`) on macOS to open the keyboard review panel, then use `Space` to flip, `G` for Good, `A` for Again, `S` to mark the card known and attempt a same-type replacement, or `Esc` to close without changing learning state
+- **Card commands (compatibility/fallback)**: `/kaomoji:flip`, `/kaomoji:good`, `/kaomoji:again`, and `/kaomoji:skip` use the same logic as the panel and remain available outside TUI mode; commands do not enter session history
 - **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
+- **Multi-session consistency**: concurrent Pi sessions share one current card; rating it in any session automatically synchronizes the others, while flip and panel-open state remain local
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`
 
 ### Install
@@ -124,17 +130,19 @@ Or add to `settings.json`:
 
 ### Commands
 
+Use `Control+Option+K` (`⌃⌥K`) on macOS for the review panel by default. Card commands remain as compatibility/fallback; configuration commands are unchanged.
+
 | Command | Description |
 | --------- | ------------- |
 | `/kaomoji:model` | Interactively pick the lesson model (only authenticated providers, sorted by preference) |
 | `/kaomoji:model <number>` | Pick by list number |
 | `/kaomoji:model <provider/model>` | Set explicitly (e.g. `deepseek/deepseek-v4-flash`) |
 | `/kaomoji:thinking <level>` | Set lesson reasoning level (`off` through `max`) |
-| `/kaomoji:interval <minutes|off>` | Set or disable automatic checks |
-| `/kaomoji:flip` | Toggle question and answer sides |
-| `/kaomoji:good` | Remember; advances progressive sentences |
-| `/kaomoji:again` | Forget; steps progressive sentences back, or schedules FSRS Again at L1 |
-| `/kaomoji:skip` | Mark as well known, return after at least 365 days, and add a same-type replacement |
+| `/kaomoji:interval <minutes\|off>` | Set or disable automatic checks |
+| `/kaomoji:flip` | (compat/fallback) Toggle question and answer sides |
+| `/kaomoji:good` | (compat/fallback) Remember; advances progressive sentences |
+| `/kaomoji:again` | (compat/fallback) Forget; steps progressive sentences back, or schedules FSRS Again at L1 |
+| `/kaomoji:skip` | (compat/fallback) Mark as well known, return after at least 365 days, and attempt a same-type replacement |
 
 Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`. If project config defines the same field, the project value wins after reload.
 
