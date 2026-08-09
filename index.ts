@@ -6,7 +6,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { FSRS, Rating, Card } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // -- Configuration --------------------------------------------------------
 
@@ -959,7 +959,13 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 			}
 			lines.push(`  翻译：${levelsCn?.[level] ?? item.meaning}`);
 		}
-		lines.push(`💬 ⌃⌥K 打开复习面板`);
+		if (level === 0) {
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 稍后重学`);
+		} else if (level < levels.length - 1) {
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 退到 L${level}`);
+		} else {
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 退到 L${level}`);
+		}
 		return lines;
 	}
 
@@ -973,7 +979,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 		}
-		lines.push(`💬 ⌃⌥K 打开复习面板`);
+		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
@@ -982,7 +988,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 				lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 			}
 		}
-		lines.push(`💬 ⌃⌥K 打开复习面板`);
+		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:skip 已会`);
 	}
 	return lines;
 }
@@ -1002,8 +1008,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let latestCtx: ExtensionContext | undefined;
-	let reviewPanelOpen = false;
-	let closeReviewPanel: (() => void) | undefined;
 	/** Per-runtime identity; distinct even when two processes open the same logical session. */
 	const instanceToken = randomUUID();
 	/** Current session id, for the coordinator lease identity. */
@@ -1262,9 +1266,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				if (lastDataVersion === null || version !== lastDataVersion) {
 					lastDataVersion = version;
 					const previousActive = pendingItemId;
-					const changed = renderGlobalCard(latestCtx);
+					renderGlobalCard(latestCtx);
 					const state = getRuntimeState(db);
-					if (reviewPanelOpen && changed) closeReviewPanel?.();
 					if (state.active_item_id != null) {
 						stopTimer();
 					} else if (previousActive != null && config.intervalMinutes > 0) {
@@ -1416,8 +1419,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (pendingItemId == null || !db) return false;
 		const state = getRuntimeState(db);
 		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
-			const changed = renderGlobalCard(ctx);
-			if (reviewPanelOpen && changed) closeReviewPanel?.();
+			renderGlobalCard(ctx);
 			return true;
 		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
@@ -1970,104 +1972,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function currentPendingCard(): ItemRow | undefined {
-		if (!db) return undefined;
-		return activeItem(db);
-	}
-
-	async function openReviewPanel(ctx: ExtensionContext): Promise<void> {
-		hydratePending(ctx);
-		if (reviewPanelOpen) {
-			ctx.ui.notify("复习面板已打开", "info");
-			return;
-		}
-		if (ctx.mode !== "tui") {
-			ctx.ui.notify("复习面板仅在 TUI 模式可用；请改用 /kaomoji:flip|good|again|skip", "warning");
-			return;
-		}
-		if (!db) {
-			ctx.ui.notify("学习数据库不可用，无法打开复习面板", "warning");
-			return;
-		}
-		if (!currentPendingCard()) {
-			ctx.ui.notify("当前没有待复习的卡片", "info");
-			return;
-		}
-
-		reviewPanelOpen = true;
-		try {
-			await ctx.ui.custom<undefined>((tui, theme, _keybindings, done) => {
-				let closed = false;
-				const close = () => {
-					if (closed) return;
-					closed = true;
-					closeReviewPanel = undefined;
-					reviewPanelOpen = false;
-					done(undefined);
-				};
-				closeReviewPanel = close;
-
-				const rate = (rating: Rating) => {
-					if (!ratePending(ctx, rating)) {
-						close();
-						return;
-					}
-					if (pendingItemId != null) {
-						tui.requestRender();
-						return;
-					}
-					close();
-					scheduleTimer();
-				};
-
-				return {
-					render(width: number): string[] {
-						const safeWidth = Math.max(1, width);
-						const item = currentPendingCard();
-						const face = pendingIsReview ? FACES.review : FACES.teach;
-						const lines = [theme.fg("accent", "─ 英语复习 ─")];
-						if (item) {
-							lines.push(...renderCard(item, pendingIsReview, face, pendingFlipped).filter((line) => !line.startsWith("💬")));
-						} else {
-							lines.push(theme.fg("dim", "当前没有待复习的卡片"));
-						}
-						if (db) lines.push(statsLine(db));
-						lines.push("", theme.fg("dim", "Space 翻面 · G Good(记得) · A Again(忘了) · S Skip(已会) · Esc 关闭"));
-						return lines
-							.flatMap((line) => wrapTextWithAnsi(line, safeWidth))
-							.map((line) => truncateToWidth(line, safeWidth));
-					},
-					handleInput(data: string): void {
-						if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-							close();
-							return;
-						}
-						if (matchesKey(data, Key.space)) {
-							if (flipPending(ctx)) tui.requestRender();
-							return;
-						}
-						if (matchesKey(data, "g") || matchesKey(data, Key.shift("g"))) {
-							rate(Rating.Good);
-							return;
-						}
-						if (matchesKey(data, "a") || matchesKey(data, Key.shift("a"))) {
-							rate(Rating.Again);
-							return;
-						}
-						if (matchesKey(data, "s") || matchesKey(data, Key.shift("s"))) {
-							close();
-							void runSkipAction(ctx);
-						}
-					},
-					invalidate(): void {},
-				};
-			});
-		} finally {
-			reviewPanelOpen = false;
-			closeReviewPanel = undefined;
-		}
-	}
-
 	// -- Commands ---------------------------------------------------------
 
 	/** Authenticated, selectable models (ordered by auto-detect priority). */
@@ -2251,12 +2155,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Pi calls the macOS Option modifier "Alt" in shortcut key IDs.
-	pi.registerShortcut(Key.ctrlAlt("k"), {
-		description: "Open kaomoji review panel (Space flip, G good, A again, S skip, Esc close)",
-		handler: (ctx) => openReviewPanel(ctx),
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
 		sessionGeneration++;
 		stopTimer();
@@ -2302,9 +2200,6 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		stopTimer();
 		stopPolling();
 		releaseCoordinator();
-		closeReviewPanel?.();
-		closeReviewPanel = undefined;
-		reviewPanelOpen = false;
 		latestCtx = undefined;
 		pendingItemId = null;
 		pendingFlipped = false;

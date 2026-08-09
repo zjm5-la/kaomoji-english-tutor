@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { visibleWidth } from "@earendil-works/pi-tui";
 
 const agentDir = mkdtempSync(join(tmpdir(), "kaomoji-tutor-test-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -84,7 +83,6 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 	const commands: Record<string, any> = {};
 	const shortcuts: Record<string, any> = {};
 	let widget: string[] = [];
-	const customState: { calls: number; doneCalls: number; options?: any; panel?: any } = { calls: 0, doneCalls: 0 };
 	const pi: any = {
 		getSessionName: () => "",
 		setSessionName: () => {},
@@ -102,25 +100,6 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 			setWidget: (_key: string, lines: string[] | undefined) => { widget = lines ?? []; },
 			notify: () => {},
 			theme: { fg: (_token: string, text: string) => text },
-			custom: (factory: any, options?: any) => {
-				customState.calls++;
-				customState.options = options;
-				return new Promise((resolve) => {
-					let done = false;
-					const finish = (result: any) => {
-						if (done) return;
-						done = true;
-						customState.doneCalls++;
-						resolve(result);
-					};
-					customState.panel = factory(
-						{ requestRender: () => {} },
-						{ fg: (_token: string, text: string) => text },
-						{},
-						finish,
-					);
-				});
-			},
 		},
 		sessionManager: {
 			getSessionId: () => logicalSessionId,
@@ -130,7 +109,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 	};
 	await (extension as any)(pi);
 	await handlers.session_start({ reason: "startup" }, ctx);
-	return { handlers, commands, shortcuts, ctx, widget: () => widget, customState };
+	return { handlers, commands, shortcuts, ctx, widget: () => widget };
 }
 
 function openTestDb() {
@@ -172,6 +151,8 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /timer/);
 		assert.match(harness.widget().join(" "), /今日新增 1/);
+		assert.match(harness.widget().join(" "), /\/kaomoji:flip/);
+		assert.equal(harness.shortcuts["ctrl+alt+k"], undefined);
 		assert.equal(fake.active().length, 0);
 		const check = openTestDb();
 		const shown = check.prepare("SELECT shown,reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -313,139 +294,6 @@ test("stale replacement completion cannot mutate a new session", { concurrency: 
 });
 
 
-test("Control+Option+K registers and guards unavailable panel contexts", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		const harness = await createHarness();
-		const shortcut = harness.shortcuts["ctrl+alt+k"];
-		assert.equal(typeof shortcut?.handler, "function");
-		await shortcut.handler(harness.ctx);
-		assert.equal(harness.customState.calls, 0);
-
-		const db = openTestDb();
-		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','timer','定时器',?,?)")
-			.run(new Date().toISOString(), new Date(0).toISOString());
-		db.close();
-		await fake.fire();
-		harness.ctx.mode = "rpc";
-		await shortcut.handler(harness.ctx);
-		assert.equal(harness.customState.calls, 0);
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-	} finally {
-		fake.restore();
-	}
-});
-
-test("review panel flips and handles Kitty Good/Again while preserving sentence state", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		const harness = await createHarness();
-		const db = openTestDb();
-		insertSentence(db);
-		db.close();
-		await fake.fire();
-		const panelPromise = harness.shortcuts["ctrl+alt+k"].handler(harness.ctx);
-		const panel = harness.customState.panel;
-		assert.equal(harness.customState.options?.overlay, undefined);
-		assert.ok(panel.render(8).every((line: string) => visibleWidth(line) <= 8));
-		panel.handleInput(" ");
-		assert.match(panel.render(120).join(" "), /翻译/);
-
-		panel.handleInput("\x1b[103u");
-		panel.handleInput("\x1b[97u");
-		let check = openTestDb();
-		const row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
-		check.close();
-		assert.deepEqual({ ...row }, { progress: 0, reviews: 0, fsrs_state: "" });
-		assert.equal(harness.customState.doneCalls, 0);
-
-		panel.handleInput("\x1b");
-		await panelPromise;
-		assert.equal(fake.active().length, 0);
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-	} finally {
-		fake.restore();
-	}
-});
-
-test("review panel clears failed opens, suppresses duplicates, and resumes after Good", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		const harness = await createHarness();
-		const db = openTestDb();
-		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','timer','定时器',?,?)")
-			.run(new Date().toISOString(), new Date(0).toISOString());
-		db.close();
-		await fake.fire();
-		const shortcut = harness.shortcuts["ctrl+alt+k"];
-		const custom = harness.ctx.ui.custom;
-		harness.ctx.ui.custom = () => Promise.reject(new Error("custom failed"));
-		await assert.rejects(shortcut.handler(harness.ctx), /custom failed/);
-		harness.ctx.ui.custom = custom;
-
-		const panelPromise = shortcut.handler(harness.ctx);
-		await shortcut.handler(harness.ctx);
-		assert.equal(harness.customState.calls, 1);
-		harness.customState.panel.handleInput("\x1b[103u");
-		await panelPromise;
-		assert.equal(harness.customState.doneCalls, 1);
-		assert.equal(fake.active().length, 1);
-		const check = openTestDb();
-		const row = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
-		check.close();
-		assert.equal(row.reviews, 1);
-		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-	} finally {
-		fake.restore();
-	}
-});
-
-test("review panel Skip closes, masters the card, and preserves replacement work", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		const harness = await createHarness();
-		const db = openTestDb();
-		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','timer','定时器',?,?)")
-			.run(new Date().toISOString(), new Date(0).toISOString());
-		db.close();
-		await fake.fire();
-		const panelPromise = harness.shortcuts["ctrl+alt+k"].handler(harness.ctx);
-		harness.customState.panel.handleInput("\x1b[115u");
-		await panelPromise;
-		await fake.flush();
-		const check = openTestDb();
-		const item = check.prepare("SELECT status FROM items WHERE id=1").get() as any;
-		const queue = check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any;
-		check.close();
-		assert.equal(item.status, "mastered");
-		assert.deepEqual(JSON.parse(queue.value), ["word"]);
-		assert.doesNotMatch(harness.widget().join(" "), /已会/);
-		assert.equal(fake.active().length, 1);
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-	} finally {
-		fake.restore();
-	}
-});
-
-test("review panel shutdown resolves an open panel", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		const harness = await createHarness();
-		const db = openTestDb();
-		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','timer','定时器',?,?)")
-			.run(new Date().toISOString(), new Date(0).toISOString());
-		db.close();
-		await fake.fire();
-		const panelPromise = harness.shortcuts["ctrl+alt+k"].handler(harness.ctx);
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-		await panelPromise;
-		assert.equal(harness.customState.doneCalls, 1);
-	} finally {
-		fake.restore();
-	}
-});
-
 // -- Multi-session consistency ------------------------------------------
 
 function insertDueWord(db: DatabaseSync, text: string, meaning: string) {
@@ -551,6 +399,8 @@ test("session B auto-refreshes when session A rates the shared card", { concurre
 		// B's poll notices the data_version change and drops the pending card.
 		await fake.firePoll();
 		assert.doesNotMatch(b.widget().join(" "), /timer/);
+		assert.equal(fake.active().length, 2);
+		assert.ok(fake.active().every((timer) => timer.delay > 500_000));
 
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
@@ -628,33 +478,6 @@ test("stale cross-session sentence and Skip actions apply exactly once", { concu
 		assert.equal(skipped, 1);
 		await c.handlers.session_shutdown({ reason: "quit" }, c.ctx);
 		await d.handlers.session_shutdown({ reason: "quit" }, d.ctx);
-	} finally {
-		fake.restore();
-	}
-});
-
-test("external rating closes a stale review panel", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	try {
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
-		const a = await makeSession({ sessionId: "panel-a" });
-		const b = await makeSession({ sessionId: "panel-b" });
-		const db = openTestDb();
-		insertDueWord(db, "shared", "共享");
-		db.close();
-		await fake.fire();
-		await fake.fire();
-		const panelPromise = b.shortcuts["ctrl+alt+k"].handler(b.ctx);
-		assert.equal(b.customState.doneCalls, 0);
-		await a.commands["kaomoji:good"].handler("", a.ctx);
-		await fake.firePoll();
-		await panelPromise;
-		assert.equal(b.customState.doneCalls, 1);
-		assert.doesNotMatch(b.widget().join(" "), /shared/);
-		assert.equal(fake.active().length, 2);
-		assert.ok(fake.active().every((timer) => timer.delay > 500_000));
-		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
-		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 	} finally {
 		fake.restore();
 	}
