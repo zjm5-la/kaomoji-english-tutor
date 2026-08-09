@@ -960,11 +960,11 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 			lines.push(`  翻译：${levelsCn?.[level] ?? item.meaning}`);
 		}
 		if (level === 0) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 稍后重学`);
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 忘了（下次从 L1）`);
 		} else if (level < levels.length - 1) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 退到 L${level}`);
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 忘了（下次从 L1）`);
 		} else {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 退到 L${level}`);
+			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 忘了（下次从 L1）`);
 		}
 		return lines;
 	}
@@ -1469,13 +1469,11 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			return true;
 		}
 
-		// Sentence in progressive training: update progress and slot version in one transaction.
+		// Good advances progressive sentence levels. Any Again immediately rates the whole card.
 		if (item.type === "sentence" && levels && levels.length > 1) {
 			const nextProgress = rating === Rating.Good && item.progress < levels.length - 1
 				? item.progress + 1
-				: rating === Rating.Again && item.progress > 0
-					? item.progress - 1
-					: null;
+				: null;
 			if (nextProgress != null) {
 				let applied = false;
 				try {
@@ -1511,7 +1509,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				pendingIsReview = false;
 				return true;
 			}
-			// Full level + Good hands over to FSRS; bottom-level Again relearns via FSRS.
+			// Full-level Good and any Again hand over to FSRS.
 		}
 
 		// Full rating: one-shot, atomic, applies at most once globally.
@@ -1522,6 +1520,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			db.exec("BEGIN IMMEDIATE");
 			const cur = getRuntimeState(db);
 			if (cur.active_item_id === item.id && cur.active_version === stateAtStart.active_version) {
+				if (item.type === "sentence" && rating === Rating.Again) {
+					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
+				}
 				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);

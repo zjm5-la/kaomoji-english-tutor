@@ -168,28 +168,52 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 	}
 });
 
-test("progressive Good/Again transitions touch FSRS only at boundaries", { concurrency: false }, async () => {
+test("progressive sentence Good touches FSRS only after the full level", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		for (const action of ["good", "again", "good"] as const) {
+		for (const action of ["good", "good"] as const) {
 			await harness.commands[`kaomoji:${action}`].handler("", harness.ctx);
 		}
 		let check = openTestDb();
 		let row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		check.close();
-		assert.deepEqual({ ...row }, { progress: 1, reviews: 0, fsrs_state: "" });
-		for (const action of ["good", "good"] as const) {
-			await harness.commands[`kaomoji:${action}`].handler("", harness.ctx);
-		}
+		assert.deepEqual({ ...row }, { progress: 2, reviews: 0, fsrs_state: "" });
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		check.close();
 		assert.equal(row.progress, 2);
 		assert.equal(row.reviews, 1);
 		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("one Again rates a progressive sentence and resets it to L1", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /L3\/3/);
+
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+
+		const check = openTestDb();
+		const row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const runtime = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(row.progress, 0);
+		assert.equal(row.reviews, 1);
+		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
+		assert.equal(runtime.active_item_id, null);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
