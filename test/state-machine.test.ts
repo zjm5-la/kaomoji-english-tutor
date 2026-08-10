@@ -829,4 +829,49 @@ test("revision loop recovers a lesson after an initial critic rejection", { conc
 	}
 });
 
+test("active recall: a correct answer is judged and recorded", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','hello','你好',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /hello/);
+		await harness.commands["kaomoji:answer"].handler("hello", harness.ctx);
+		assert.match(harness.widget().join(" "), /答对了/);
+		const check = openTestDb();
+		const att = check.prepare("SELECT verdict, kind, answer_text FROM attempts WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(att.verdict, "correct");
+		assert.equal(att.kind, "recall");
+		assert.equal(att.answer_text, "hello");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("active recall: a wrong answer reveals the correct text and records incorrect", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','world','世界',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("word", harness.ctx);
+		assert.match(harness.widget().join(" "), /答案是：world/);
+		const check = openTestDb();
+		const att = check.prepare("SELECT verdict FROM attempts WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(att.verdict, "incorrect");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

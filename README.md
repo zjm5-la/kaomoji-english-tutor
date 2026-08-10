@@ -50,6 +50,8 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:thinking <等级>` | 设置备课思考等级：`off` 到 `max` |
 | `/kaomoji:interval <分钟\|off>` | 设置自动检查间隔，或关闭自动检查 |
 | `/kaomoji:flip` | 在问题面和答案面之间切换 |
+| `/kaomoji:answer <英文>` | 默写练习：看中文写出英文，系统判定对错并记录 |
+| `/kaomoji:hint` | 显示当前词卡的首字母提示 |
 | `/kaomoji:good` | 评分为记得；长句训练中升级 |
 | `/kaomoji:again` | 评分为忘了；长句在任意 L1/L2/L3 阶段一次进入 FSRS Again，下次从 L1 开始 |
 | `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
@@ -134,6 +136,8 @@ Or add to `settings.json`:
 | `/kaomoji:thinking <level>` | Set lesson reasoning level (`off` through `max`) |
 | `/kaomoji:interval <minutes\|off>` | Set or disable automatic checks |
 | `/kaomoji:flip` | Toggle question and answer sides |
+| `/kaomoji:answer <english>` | Active recall: type the English for the shown meaning; judged and recorded locally |
+| `/kaomoji:hint` | Show a first-letter hint for the active word/phrase card |
 | `/kaomoji:good` | Remember; advances progressive sentences |
 | `/kaomoji:again` | Forget; one press schedules FSRS Again from any sentence level, resetting the next attempt to L1 |
 | `/kaomoji:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |

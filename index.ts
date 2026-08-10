@@ -1331,7 +1331,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 		}
-		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
+		lines.push(`💬 /kaomoji:answer 默写 · /kaomoji:hint 提示 · /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
@@ -1795,6 +1795,63 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const lines = renderCard(item, pendingIsReview, face, pendingFlipped);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
+		return true;
+	}
+
+	/** Active-recall answer for word/phrase cards. Empty text shows the prompt; non-empty is judged. */
+	function answerPending(ctx: ExtensionContext, rawText: string): boolean {
+		hydratePending(ctx);
+		if (pendingItemId == null || !db) return false;
+		const state = getRuntimeState(db);
+		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
+			renderGlobalCard(ctx);
+			return true;
+		}
+		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
+		if (!item) return true;
+		if (item.type === "sentence") {
+			ctx.ui.notify("句子卡用渐进训练，无需默写", "info");
+			return false;
+		}
+		const text = rawText.trim();
+		if (!text) {
+			updateWidget(ctx, FACES.review, [
+				`${FACES.review} ✍️ 请写出「${item.meaning}」的英文`,
+				"用 /kaomoji:answer <你的答案>，或 /kaomoji:hint 看提示，或 /kaomoji:flip 看答案",
+				statsLine(db),
+			]);
+			return true;
+		}
+		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+		const correct = norm(text) === norm(item.text);
+		const now = new Date();
+		try {
+			db.prepare(
+				"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, started_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+			).run(
+				randomUUID(), item.id, randomUUID(), `recall:${item.id}:${randomUUID()}`,
+				state.active_version, state.active_version, "recall", text, "none",
+				"evaluated", correct ? "correct" : "incorrect", now.toISOString(), now.toISOString(),
+			);
+		} catch (err) {
+			console.error(`[kaomoji-english-tutor] attempt record failed: ${err}`);
+		}
+		pendingFlipped = true;
+		const lines = renderCard(item, true, FACES.review, true);
+		lines.unshift(correct ? "✓ 答对了！" : `✗ 答案是：${item.text}`);
+		lines.push("💬 /kaomoji:good 记得 · /kaomoji:again 忘了");
+		updateWidget(ctx, correct ? FACES.review : FACES.error, lines);
+		return true;
+	}
+
+	/** Show a first-letter hint for the active word/phrase card. */
+	function hintPending(ctx: ExtensionContext): boolean {
+		hydratePending(ctx);
+		if (pendingItemId == null || !db) return false;
+		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
+		if (!item || item.type === "sentence") return false;
+		const hint = item.text.split(/\s+/).map((w) => w[0] + "_".repeat(Math.max(0, w.length - 1))).join(" ");
+		ctx.ui.notify(`提示：${hint}`, "info");
 		return true;
 	}
 
@@ -2547,6 +2604,23 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		description: "Mark the shown card as known and generate a same-type replacement",
 		handler: async (_args, ctx) => {
 			await runSkipAction(ctx);
+		},
+	});
+
+	pi.registerCommand("kaomoji:answer", {
+		description: "Submit an English answer for the active word/phrase card (active recall)",
+		handler: async (args, ctx) => {
+			const text = String(args ?? "").trim();
+			if (!answerPending(ctx, text) && !text) {
+				ctx.ui.notify("用法：/kaomoji:answer <你的英文答案>（无参数显示题目）", "info");
+			}
+		},
+	});
+
+	pi.registerCommand("kaomoji:hint", {
+		description: "Show a first-letter hint for the active word/phrase card",
+		handler: async (_args, ctx) => {
+			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
 		},
 	});
 
