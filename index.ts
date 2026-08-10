@@ -427,6 +427,16 @@ function touchStreak(db: DatabaseSync, now: Date) {
 	setStat(db, "last_active_date", today);
 }
 
+/** Mastery stage progression + demotion (deterministic, §6.2). */
+const MASTERY_STAGES = ["exposure", "recognition", "controlled_recall", "production", "transfer"] as const;
+const MASTERY_PROMOTE_THRESHOLDS = [1, 2, 2, 2]; // unassisted Good count needed to leave each stage
+function computeMasteryStage(prevStage: string, unassistedGood: number, isAgain: boolean): string {
+	let idx = Math.max(0, MASTERY_STAGES.indexOf(prevStage as never));
+	if (isAgain) return MASTERY_STAGES[Math.max(0, idx - 1)];
+	while (idx < MASTERY_STAGES.length - 1 && unassistedGood >= MASTERY_PROMOTE_THRESHOLDS[idx]) idx++;
+	return MASTERY_STAGES[idx];
+}
+
 /** Deterministic content fingerprint for exact dedup: type + normalized text + normalized meaning. */
 function contentFingerprint(type: string, text: string, meaning: string): string {
 	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
@@ -2035,14 +2045,18 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
 				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
-				// Milestone 3: track mastery evidence from explicit ratings.
-				const m = db.prepare("SELECT unassisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { unassisted_good: number; consecutive_again: number } | undefined;
+				// Milestone 3: track mastery evidence and advance/demote the stage from explicit ratings.
+				const m = db.prepare("SELECT stage, unassisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { stage: string; unassisted_good: number; consecutive_again: number } | undefined;
+				const prevStage = m?.stage ?? "exposure";
+				const newGood = rating === Rating.Good ? Number(m?.unassisted_good ?? 0) + 1 : 0;
+				const newAgain = rating === Rating.Again ? Number(m?.consecutive_again ?? 0) + 1 : 0;
+				const stage = computeMasteryStage(prevStage, newGood, rating === Rating.Again);
 				if (m) {
-					db.prepare("UPDATE mastery_state SET unassisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
-						.run(rating === Rating.Good ? Number(m.unassisted_good) + 1 : 0, rating === Rating.Again ? Number(m.consecutive_again) + 1 : 0, now.toISOString(), item.id);
+					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
+						.run(stage, newGood, newAgain, now.toISOString(), item.id);
 				} else {
-					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, 'exposure', ?, ?, 'recall', ?)")
-						.run(item.id, rating === Rating.Good ? 1 : 0, rating === Rating.Again ? 1 : 0, now.toISOString());
+					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, ?, ?, ?, 'recall', ?)")
+						.run(item.id, stage, newGood, newAgain, now.toISOString());
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);

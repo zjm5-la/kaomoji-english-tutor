@@ -947,10 +947,11 @@ test("mastery state tracks Good and Again evidence", { concurrency: false }, asy
 		await fake.fire();
 		await harness.commands["kaomoji:good"].handler("", harness.ctx);
 		check = openTestDb();
-		m = check.prepare("SELECT unassisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
+		m = check.prepare("SELECT stage, unassisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
 		assert.equal(m.unassisted_good, 1, "Good clears the streak and counts one unassisted success");
 		assert.equal(m.consecutive_again, 0, "Good resets consecutive Again");
+		assert.equal(m.stage, "recognition", "one Good promotes exposure -> recognition");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
