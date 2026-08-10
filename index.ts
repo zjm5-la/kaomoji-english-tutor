@@ -2399,8 +2399,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			deferPacing();
 			return;
 		}
+		logGenStatus("entered_generate");
 		const generationToken = claimGeneration();
-		if (!generationToken) return;
+		if (!generationToken) { logGenStatus("no_gen_token"); deferPacing(); return; }
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
@@ -2409,6 +2410,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		try {
 			const resolved = resolveModel(ctx);
 			if (!resolved) throw new Error("NO_MODEL");
+			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
 				decision = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
@@ -2829,6 +2831,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		resolveModel(ctx);
 		if (db) {
 			ensureCoordinator(new Date(), true);
+			setStat(db, "pet_alive", new Date().toISOString());
+			setStat(db, "pet_config_model", `${config.provider}/${config.model}`);
 			touchClient(db, myId);
 			reapExpiredJobs(db, new Date());
 			// Rebuild the active global card so this session converges immediately.
