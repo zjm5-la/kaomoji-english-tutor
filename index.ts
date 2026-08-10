@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -132,7 +132,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 2;
+const SCHEMA_TARGET_VERSION = 3;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -282,6 +282,25 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 			"WHERE shown = 1 AND introduced_at IS NULL",
 		);
 	},
+	// v3: content fingerprint dedup — backfill canonical items and add a unique partial index.
+	(db: DatabaseSync) => {
+		const rows = db.prepare("SELECT id, type, text, meaning FROM items WHERE content_fingerprint IS NULL ORDER BY id ASC")
+			.all() as { id: number; type: string; text: string; meaning: string }[];
+		const seen = new Map<string, number>();
+		const setFp = db.prepare("UPDATE items SET content_fingerprint = ? WHERE id = ?");
+		const markDup = db.prepare("UPDATE items SET content_fingerprint = NULL, legacy_duplicate_of = ? WHERE id = ?");
+		for (const r of rows) {
+			const fp = contentFingerprint(r.type, r.text, r.meaning);
+			const canonical = seen.get(fp);
+			if (canonical != null) {
+				markDup.run(canonical, r.id);
+			} else {
+				seen.set(fp, r.id);
+				setFp.run(fp, r.id);
+			}
+		}
+		db.exec("CREATE UNIQUE INDEX IF NOT EXISTS items_content_fingerprint_uq ON items(content_fingerprint) WHERE content_fingerprint IS NOT NULL");
+	},
 ];
 
 function runMigrations(db: DatabaseSync): void {
@@ -407,6 +426,14 @@ function touchStreak(db: DatabaseSync, now: Date) {
 	setStat(db, "last_active_date", today);
 }
 
+/** Deterministic content fingerprint for exact dedup: type + normalized text + normalized meaning. */
+function contentFingerprint(type: string, text: string, meaning: string): string {
+	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+	return createHash("sha256")
+		.update(`${type}\u0000${norm(text)}\u0000${norm(meaning)}`, "utf8")
+		.digest("hex");
+}
+
 function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
 	return db
 		.prepare("SELECT * FROM items WHERE due_at <= ? ORDER BY due_at ASC, id ASC LIMIT 1")
@@ -425,7 +452,7 @@ function insertItem(
 	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"] },
 ): number {
 	const result = db.prepare(
-		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	).run(
 		type,
 		text,
@@ -439,6 +466,7 @@ function insertItem(
 		extra?.levels_cn ? JSON.stringify(extra.levels_cn) : null,
 		extra?.chunks ? JSON.stringify(extra.chunks) : null,
 		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
+		contentFingerprint(type, text, meaning),
 	);
 	return Number(result.lastInsertRowid);
 }
@@ -447,10 +475,9 @@ function insertItem(
 function insertCompanionWords(db: DatabaseSync, keyWords: GeneratedItem["keyWords"], now: Date) {
 	for (const kw of keyWords ?? []) {
 		if (!kw?.text || !kw?.meaning) continue;
-		const dup = db
-			.prepare("SELECT COUNT(*) AS n FROM items WHERE type = 'word' AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)")
-			.get(kw.text, kw.meaning) as { n: number };
-		if (Number(dup.n) > 0) continue;
+		const dup = db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?")
+			.get(contentFingerprint("word", kw.text, kw.meaning));
+		if (dup) continue;
 		insertItem(db, "word", kw.text, kw.phonetic || null, kw.meaning, null, null, now);
 	}
 }
@@ -1924,10 +1951,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					db.exec("ROLLBACK");
 					return false;
 				}
-				const dup = db.prepare(
-					"SELECT COUNT(*) AS n FROM items WHERE type = ? AND lower(trim(text)) = lower(trim(?)) AND trim(meaning) = trim(?)",
-				).get(item.type, item.text, item.meaning) as { n: number };
-				if (Number(dup.n) > 0) {
+				const dupFp = contentFingerprint(item.type, item.text, item.meaning);
+				const dup = db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(dupFp);
+				if (dup) {
 					duplicate = true;
 					db.exec("ROLLBACK");
 				} else {
@@ -2105,6 +2131,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					getDueItem(db, insertedAt)) {
 					db.exec("ROLLBACK");
 					return;
+				}
+				// Reject the whole batch if any item duplicates an existing canonical item.
+				for (const it of lesson.items) {
+					const fp = contentFingerprint(it.type, it.text, it.meaning);
+					if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fp)) {
+						db.exec("ROLLBACK");
+						return;
+					}
 				}
 				let firstId: number | undefined;
 				for (const it of lesson.items) {

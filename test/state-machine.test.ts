@@ -626,15 +626,17 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const versions = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as any[]).map((r) => r.version);
 			const tableNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
 			const itemCols = (db.prepare("PRAGMA table_info(items)").all() as any[]).map((r) => r.name);
+			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 2, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2]);
+			assert.deepEqual({ ...meta }, { schema_version: 3, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
 			for (const c of ["lesson_id","lexical_sense_id","role","content_fingerprint","content_version","introduced_at","introduction_kind","introduction_accuracy","content_status","legacy_duplicate_of","fsrs_status","fsrs_error","fsrs_corrupt_at"]) {
 				assert.ok(itemCols.includes(c), `items.${c} exists`);
 			}
+			assert.ok(idxNames.includes("items_content_fingerprint_uq"), "fingerprint unique index exists");
 		};
 		checkSchema();
 		// A second session reopens the same DB: the migration must not re-run.
@@ -701,6 +703,48 @@ test("planned new-card quota blocks extra new cards at display", { concurrency: 
 		assert.equal(state.active_item_id, null, "no active card surfaced over quota");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
+		fake.restore();
+	}
+});
+
+test("content fingerprint unique index rejects exact duplicates", { concurrency: false }, async () => {
+	const harness = await createHarness();
+	try {
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='items_content_fingerprint_uq'").get() as any;
+		assert.ok(idx, "fingerprint unique index exists");
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,content_fingerprint) VALUES('word','x','意',?,?,?)").run(now, now, "FP1");
+		assert.throws(() =>
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,content_fingerprint) VALUES('word','x2','意',?,?,?)").run(now, now, "FP1"),
+			/duplicate|constraint/i,
+		);
+		// Distinct fingerprint succeeds.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,content_fingerprint) VALUES('word','y','意二',?,?,?)").run(now, now, "FP2");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		// no fake timers used
+	}
+});
+
+test("generated lesson items carry unique content fingerprints", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-fp-faux" });
+	try {
+		registration.setResponses([fauxAssistantMessage(lessonResponse("fingerprint"))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "fp-a" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const fps = (db.prepare("SELECT content_fingerprint FROM items WHERE content_fingerprint IS NOT NULL").all() as any[]).map((r) => r.content_fingerprint);
+		db.close();
+		assert.ok(fps.length > 0, "lesson items stamped with fingerprint");
+		assert.equal(new Set(fps).size, fps.length, "fingerprints are unique");
+	} finally {
+		registration.unregister();
 		fake.restore();
 	}
 });
