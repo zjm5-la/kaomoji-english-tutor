@@ -838,7 +838,7 @@ test("active recall: a correct answer is judged and recorded", { concurrency: fa
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /hello/);
+		assert.match(harness.widget().join(" "), /你好/, "review front shows the Chinese meaning, not the English answer");
 		await harness.commands["kaomoji:answer"].handler("hello", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/);
 		const check = openTestDb();

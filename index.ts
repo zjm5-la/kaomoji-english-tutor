@@ -1146,9 +1146,10 @@ async function evaluateAttempt(
 		`学生写了：${answer}`,
 		"判断学生的答案，只输出 JSON：",
 		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
-		"- correct: 完全正确，或仅大小写/标点/多余空格差异",
-		"- partial: 拼写小错、单复数、时态、词形变化，但明显是想写这个词",
-		"- incorrect: 完全不同的词、空白或无法识别",
+		"- 学生必须用英文作答；写的不是英文（如中文翻译）一律 incorrect",
+		"- correct: 英文与目标完全一致，或仅大小写/标点/多余空格差异",
+		"- partial: 英文有拼写小错、单复数、时态、词形变化，但明显是想写这个词",
+		"- incorrect: 完全不同的词、空白、非英文或无法识别",
 	].join("\n");
 	let response;
 	try {
@@ -1403,7 +1404,7 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 			lines.push(`  第 ${item.reviews + 1} 次复习`);
 		} else {
-			lines.push(`${face} 复习时间到：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
+			lines.push(`${face} 复习时间到：✍️ 默写「${item.meaning}」的英文`);
 		}
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
