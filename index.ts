@@ -2369,16 +2369,27 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 	}
 
+	function logGenStatus(status: string) {
+		if (db) setStat(db, "last_gen_status", status.slice(0, 200));
+	}
+	function deferPacing() {
+		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.max(1, config.intervalMinutes) * 60_000).toISOString() });
+	}
+
 	async function generateAndInsert(ctx: ExtensionContext, _now: Date) {
 		const conversation = manualTeachTopic || buildConversation(ctx.sessionManager.getBranch());
 		const isManual = manualTeachTopic !== "";
 		manualTeachTopic = "";
 		if (!conversation.trim()) {
 			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			logGenStatus("empty_conversation");
+			deferPacing();
 			return;
 		}
 		if (!isManual && conversation === lastRejectedConversation) {
 			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+			logGenStatus("cached_rejection");
+			deferPacing();
 			return;
 		}
 		const generationToken = claimGeneration();
@@ -2415,6 +2426,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (!decision.ready) {
 				lastRejectedConversation = conversation;
 				updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+				logGenStatus(`not_ready: ${decision.reason || ""}`);
+				deferPacing();
 				if (config.verbose && decision.reason) ctx.ui.notify(`暂不备课：${decision.reason}`, "info");
 				return;
 			}
@@ -2438,6 +2451,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (!verdict.pass) {
 				lastRejectedConversation = conversation;
 				updateWidget(ctx, FACES.idle, ["内容质量未达标，稍后再试…", statsLine(db)]);
+				logGenStatus(`critic_rejected: ${verdict.summary || ""}`);
+				deferPacing();
 				if (config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
 				return;
 			}
@@ -2492,6 +2507,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				throw err;
 			}
 			lastRejectedConversation = "";
+			logGenStatus(`ok: ${lesson.topic || ""}`);
 			if (!insertedFirst) return;
 			showItem(ctx, insertedFirst);
 			if (lesson.topic && db) {
@@ -2508,7 +2524,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (sessionGeneration !== generation) return;
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
-			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`]);
+				if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`]);
+				logGenStatus(`error: ${lastError}`);
+				deferPacing();
 		} finally {
 			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) pendingLLMCall = false;
