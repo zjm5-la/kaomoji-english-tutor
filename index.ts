@@ -1105,6 +1105,64 @@ async function critiqueLesson(
 	}
 }
 
+interface AnswerEvaluation {
+	verdict: "correct" | "partial" | "incorrect";
+	feedback: string;
+}
+
+/** LLM evaluation for a near-miss answer. Fail-closed to incorrect when unavailable. */
+async function evaluateAttempt(
+	ctx: ExtensionContext,
+	item: ItemRow,
+	answer: string,
+	resolved: { provider: string; model: string } | undefined,
+): Promise<AnswerEvaluation> {
+	const failClosed = (feedback = ""): AnswerEvaluation => ({ verdict: "incorrect", feedback });
+	if (!resolved) return failClosed();
+	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
+	if (!model) return failClosed();
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey) return failClosed();
+	const requestAuth = { apiKey: auth.apiKey, headers: auth.headers as Record<string, string> | undefined };
+	const prompt = [
+		"你是英语导师。学生看到中文释义要写出对应的英文。",
+		`目标：${item.text}（${item.meaning}）`,
+		`学生写了：${answer}`,
+		"判断学生的答案，只输出 JSON：",
+		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
+		"- correct: 完全正确，或仅大小写/标点/多余空格差异",
+		"- partial: 拼写小错、单复数、时态、词形变化，但明显是想写这个词",
+		"- incorrect: 完全不同的词、空白或无法识别",
+	].join("\n");
+	let response;
+	try {
+		response = await completeSimple(model, {
+			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
+			messages: [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }],
+		}, { apiKey: requestAuth.apiKey, headers: requestAuth.headers, maxTokens: 200 });
+	} catch {
+		return failClosed();
+	}
+	if (response.stopReason === "error") return failClosed();
+	const text = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join(" ")
+		.trim();
+	if (!text) return failClosed();
+	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	const start = cleaned.indexOf("{");
+	const end = cleaned.lastIndexOf("}");
+	if (start < 0 || end <= start) return failClosed();
+	try {
+		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { verdict?: unknown; feedback?: unknown };
+		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
+		return { verdict, feedback: typeof parsed.feedback === "string" ? parsed.feedback : "" };
+	} catch {
+		return failClosed();
+	}
+}
+
 async function generateReplacement(
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
@@ -1798,8 +1856,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
-	/** Active-recall answer for word/phrase cards. Empty text shows the prompt; non-empty is judged. */
-	function answerPending(ctx: ExtensionContext, rawText: string): boolean {
+	/** Active-recall answer for word/phrase cards. Empty text shows the prompt; non-empty is judged (exact match first, LLM evaluation on near-miss). */
+	async function answerPending(ctx: ExtensionContext, rawText: string): Promise<boolean> {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
 		const state = getRuntimeState(db);
@@ -1823,24 +1881,37 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			return true;
 		}
 		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-		const correct = norm(text) === norm(item.text);
+		const exact = norm(text) === norm(item.text);
+		let verdict: "correct" | "partial" | "incorrect" = exact ? "correct" : "incorrect";
+		let feedback = "";
+		if (!exact) {
+			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx));
+			verdict = result.verdict;
+			feedback = result.feedback;
+		}
 		const now = new Date();
 		try {
 			db.prepare(
-				"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, started_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+				"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, feedback_json, started_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 			).run(
 				randomUUID(), item.id, randomUUID(), `recall:${item.id}:${randomUUID()}`,
 				state.active_version, state.active_version, "recall", text, "none",
-				"evaluated", correct ? "correct" : "incorrect", now.toISOString(), now.toISOString(),
+				"evaluated", verdict, feedback ? JSON.stringify({ feedback }) : null, now.toISOString(), now.toISOString(),
 			);
 		} catch (err) {
 			console.error(`[kaomoji-english-tutor] attempt record failed: ${err}`);
 		}
 		pendingFlipped = true;
 		const lines = renderCard(item, true, FACES.review, true);
-		lines.unshift(correct ? "✓ 答对了！" : `✗ 答案是：${item.text}`);
+		if (verdict === "correct") {
+			lines.unshift("✓ 答对了！");
+		} else if (verdict === "partial") {
+			lines.unshift(`△ 差一点：${feedback || "有小问题"}（正确：${item.text}）`);
+		} else {
+			lines.unshift(`✗ 答案是：${item.text}`);
+		}
 		lines.push("💬 /kaomoji:good 记得 · /kaomoji:again 忘了");
-		updateWidget(ctx, correct ? FACES.review : FACES.error, lines);
+		updateWidget(ctx, verdict === "incorrect" ? FACES.error : FACES.review, lines);
 		return true;
 	}
 
@@ -2611,7 +2682,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		description: "Submit an English answer for the active word/phrase card (active recall)",
 		handler: async (args, ctx) => {
 			const text = String(args ?? "").trim();
-			if (!answerPending(ctx, text) && !text) {
+			const ok = await answerPending(ctx, text);
+			if (!ok && !text) {
 				ctx.ui.notify("用法：/kaomoji:answer <你的英文答案>（无参数显示题目）", "info");
 			}
 		},

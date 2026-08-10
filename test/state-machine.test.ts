@@ -874,4 +874,33 @@ test("active recall: a wrong answer reveals the correct text and records incorre
 	}
 });
 
+test("LLM evaluation marks a near-miss answer as partial with feedback", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-eval-faux" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ verdict: "partial", feedback: "少了复数 s" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "eval-a" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','apples','苹果',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("apple", harness.ctx);
+		assert.match(harness.widget().join(" "), /差一点/);
+		const check = openTestDb();
+		const att = check.prepare("SELECT verdict, feedback_json FROM attempts WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(att.verdict, "partial");
+		assert.match(att.feedback_json, /少了复数/);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
