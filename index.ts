@@ -1426,6 +1426,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let resolvedModelName = "";
 	let lastError = "";
 	let pendingLLMCall = false;
+	let pendingLLMCallAt = 0;
 	let lastRejectedConversation = "";
 	let manualTeachTopic = "";
 	let lastRejectedReplacementKey = "";
@@ -2360,7 +2361,13 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 		// 2. Otherwise teach new items (LLM), up to the daily limit, single-owner.
 		if (countTodayNew(db, now) < config.dailyNewLimit) {
-			if (pendingLLMCall) return;
+			if (pendingLLMCall) {
+				// If a previous LLM call hung and never reached its finally, force-reset
+				// after a timeout so generation is not permanently blocked.
+				if (Date.now() - pendingLLMCallAt < 180_000) return;
+				pendingLLMCall = false;
+				if (db) setStat(db, "last_gen_status", "hung_llm_reset");
+			}
 			await generateAndInsert(ctx, now);
 			return;
 		}
@@ -2397,6 +2404,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
+		pendingLLMCallAt = Date.now();
 		if (db) updateWidget(ctx, FACES.teach, ["备课中，喵…"]);
 		try {
 			const resolved = resolveModel(ctx);
