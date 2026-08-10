@@ -53,6 +53,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:answer <英文>` | 默写练习：看中文写出英文，系统判定对错并记录 |
 | `/kaomoji:hint` | 显示当前词卡的首字母提示 |
 | `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率 |
+| `/kaomoji:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
 | `/kaomoji:good` | 评分为记得；长句训练中升级 |
 | `/kaomoji:again` | 评分为忘了；长句在任意 L1/L2/L3 阶段一次进入 FSRS Again，下次从 L1 开始 |
 | `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
@@ -140,6 +141,7 @@ Or add to `settings.json`:
 | `/kaomoji:answer <english>` | Active recall: type the English for the shown meaning; judged and recorded locally |
 | `/kaomoji:hint` | Show a first-letter hint for the active word/phrase card |
 | `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, and answer accuracy |
+| `/kaomoji:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
 | `/kaomoji:good` | Remember; advances progressive sentences |
 | `/kaomoji:again` | Forget; one press schedules FSRS Again from any sentence level, resetting the next attempt to L1 |
 | `/kaomoji:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |

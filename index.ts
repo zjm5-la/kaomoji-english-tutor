@@ -1426,6 +1426,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let lastError = "";
 	let pendingLLMCall = false;
 	let lastRejectedConversation = "";
+	let manualTeachTopic = "";
 	let lastRejectedReplacementKey = "";
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2368,12 +2369,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	}
 
 	async function generateAndInsert(ctx: ExtensionContext, _now: Date) {
-		const conversation = buildConversation(ctx.sessionManager.getBranch());
+		const conversation = manualTeachTopic || buildConversation(ctx.sessionManager.getBranch());
+		const isManual = manualTeachTopic !== "";
+		manualTeachTopic = "";
 		if (!conversation.trim()) {
 			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 			return;
 		}
-		if (conversation === lastRejectedConversation) {
+		if (!isManual && conversation === lastRejectedConversation) {
 			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 			return;
 		}
@@ -2739,6 +2742,20 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		description: "Show a first-letter hint for the active word/phrase card",
 		handler: async (_args, ctx) => {
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
+		},
+	});
+
+	pi.registerCommand("kaomoji:teach", {
+		description: "Prepare a lesson on a specific topic now (bypasses readiness detection)",
+		handler: async (args, ctx) => {
+			const topic = String(args ?? "").trim();
+			if (!topic) {
+				ctx.ui.notify("用法：/kaomoji:teach <话题>（例如 /kaomoji:teach async programming）", "info");
+				return;
+			}
+			manualTeachTopic = topic;
+			ctx.ui.notify(`将围绕「${topic}」备课`, "info");
+			scheduleTimer(0);
 		},
 	});
 
