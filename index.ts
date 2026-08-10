@@ -2035,6 +2035,15 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
 				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
+				// Milestone 3: track mastery evidence from explicit ratings.
+				const m = db.prepare("SELECT unassisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { unassisted_good: number; consecutive_again: number } | undefined;
+				if (m) {
+					db.prepare("UPDATE mastery_state SET unassisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
+						.run(rating === Rating.Good ? Number(m.unassisted_good) + 1 : 0, rating === Rating.Again ? Number(m.consecutive_again) + 1 : 0, now.toISOString(), item.id);
+				} else {
+					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, 'exposure', ?, ?, 'recall', ?)")
+						.run(item.id, rating === Rating.Good ? 1 : 0, rating === Rating.Again ? 1 : 0, now.toISOString());
+				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
 				setRuntimeState(db, {

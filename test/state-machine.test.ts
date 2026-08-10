@@ -925,4 +925,36 @@ test("recall exercise template is persisted when a card is answered", { concurre
 	}
 });
 
+test("mastery state tracks Good and Again evidence", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','dog','狗',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		let check = openTestDb();
+		let m = check.prepare("SELECT unassisted_good, consecutive_again, stage FROM mastery_state WHERE item_id = 1").get() as any;
+		check.close();
+		assert.deepEqual({ ...m }, { unassisted_good: 0, consecutive_again: 1, stage: "exposure" });
+		// Re-due the card, then rate Good.
+		const db2 = openTestDb();
+		db2.prepare("UPDATE items SET due_at = ? WHERE id = 1").run(new Date(0).toISOString());
+		db2.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
+		db2.close();
+		await fake.fire();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		check = openTestDb();
+		m = check.prepare("SELECT unassisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(m.unassisted_good, 1, "Good clears the streak and counts one unassisted success");
+		assert.equal(m.consecutive_again, 0, "Good resets consecutive Again");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
