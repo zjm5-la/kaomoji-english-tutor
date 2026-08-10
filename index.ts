@@ -2399,9 +2399,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			deferPacing();
 			return;
 		}
-		logGenStatus("entered_generate");
 		const generationToken = claimGeneration();
-		if (!generationToken) { logGenStatus("no_gen_token"); deferPacing(); return; }
+		if (!generationToken) return;
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
