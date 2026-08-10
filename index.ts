@@ -2786,7 +2786,13 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			}
 			manualTeachTopic = topic;
 			ctx.ui.notify(`将围绕「${topic}」备课`, "info");
-			scheduleTimer(0);
+			if (pendingLLMCall) {
+				ctx.ui.notify("上一轮备课还在进行中，请稍候", "info");
+				return;
+			}
+			void generateAndInsert(ctx, new Date())
+				.catch((err) => console.error(`[kaomoji-english-tutor] teach failed: ${err}`))
+				.finally(() => scheduleTimer());
 		},
 	});
 
