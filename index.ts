@@ -884,12 +884,16 @@ interface ResolvedModel {
 	fromSession: boolean;
 }
 
+/** Max critic-driven revision rounds before a lesson is discarded. */
+const MAX_LESSON_REVISIONS = 2;
+
 async function generateLesson(
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
 	conversation: string,
 	known: string[],
 	config: PetConfig,
+	feedback?: CritiqueIssue[],
 ): Promise<LessonDecision> {
 	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
 	if (!model) {
@@ -921,6 +925,7 @@ async function generateLesson(
 		"学习项要求：",
 		"- 内容要真实常用，宁简单不冷僻，适合中级学习者",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
+		"- 教学项必须关联：word 的 text 必须自然出现在 sentence 的 text 中；phrase 尽量出现在 sentence 中，形成一个统一的教学单元",
 		"- sentence 的 text 必须是真正的长句：至少 15 个单词，包含从句或插入成分；禁止用简单句或短句充数",
 		"- 长句结构要多样化：定语从句、状语从句、宾语从句、插入语、分词短语、同位语等轮换使用，避免总是使用 which 定语从句",
 		"- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（2-3 个生词）",
@@ -929,6 +934,10 @@ async function generateLesson(
 		"- 只输出 JSON，不要任何其他文字：",
 		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
+		...(feedback && feedback.length
+			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
+				...feedback.map((i) => `- [${i.severity}] ${i.category}: ${i.description}`)]
+			: []),
 		"",
 		"<conversation>",
 		conversation,
@@ -2232,11 +2241,22 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const lesson = decision;
+			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			const verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
+			let verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			// Revision loop: address critic feedback before giving up.
+			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && !verdict.pass; attempt++) {
+				const revised = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config, verdict.issues);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+				if (!revised.ready) break;
+				lesson = revised;
+				verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			}
 			if (!verdict.pass) {
 				lastRejectedConversation = conversation;
 				updateWidget(ctx, FACES.idle, ["内容质量未达标，稍后再试…", statsLine(db)]);

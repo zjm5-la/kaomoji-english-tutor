@@ -801,4 +801,32 @@ test("quality gate rejects lessons the critic flags and commits nothing", { conc
 	}
 });
 
+test("revision loop recovers a lesson after an initial critic rejection", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-rev-faux" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("rev-v1")),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "不自然" }], summary: "需修订" })),
+			fauxAssistantMessage(lessonResponse("rev-fixed")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "rev-a" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const state = db.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		db.close();
+		assert.equal(registration.state.callCount, 4, "generate + critique + revise generate + revise critique");
+		assert.ok(count > 0, "revised lesson committed after the critic approved it");
+		assert.equal(state.active_item_id, 1, "revised lesson activated");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
