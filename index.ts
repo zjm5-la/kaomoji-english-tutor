@@ -132,7 +132,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 1;
+const SCHEMA_TARGET_VERSION = 2;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -274,6 +274,13 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 				last_seen TEXT NOT NULL
 			);
 		`);
+	},
+	// v2: backfill introduced_at for items shown before quota tracking (protocol 1 baseline).
+	(db: DatabaseSync) => {
+		db.exec(
+			"UPDATE items SET introduced_at = learned_at, introduction_kind = 'legacy', introduction_accuracy = 'approximate' " +
+			"WHERE shown = 1 AND introduced_at IS NULL",
+		);
 	},
 ];
 
@@ -462,10 +469,10 @@ function advanceReview(db: DatabaseSync, id: number, fsrsState: string, dueAt: s
 }
 
 function countTodayNew(db: DatabaseSync, now: Date): number {
-	const row = db
-		.prepare("SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND learned_at >= ?")
-		.get(localDayStartISO(now)) as { n: number };
-	return Number(row.n);
+		const row = db
+				.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind = 'planned' AND introduced_at >= ?")
+				.get(localDayStartISO(now)) as { n: number };
+		return Number(row.n);
 }
 
 function countTodayReviews(db: DatabaseSync, now: Date): number {
@@ -1556,14 +1563,28 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				db.exec("ROLLBACK");
 				return undefined;
 			}
-			const due = getDueItem(db, now);
+			// Review cards take priority over queued-new cards.
+			let due = db.prepare("SELECT * FROM items WHERE due_at <= ? AND shown = 1 ORDER BY due_at ASC, id ASC LIMIT 1")
+				.get(now.toISOString()) as ItemRow | undefined;
+			let isReview = true;
+			if (!due) {
+				// Enforce the planned first-display quota (0 = unlimited, for compatibility).
+				if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
+					db.exec("ROLLBACK");
+					return undefined;
+				}
+				due = db.prepare("SELECT * FROM items WHERE due_at <= ? AND shown = 0 ORDER BY due_at ASC, id ASC LIMIT 1")
+					.get(now.toISOString()) as ItemRow | undefined;
+				isReview = false;
+			}
 			if (!due) {
 				db.exec("ROLLBACK");
 				return undefined;
 			}
-			const isReview = due.shown === 1;
 			if (!isReview) {
 				markShown(db, due.id);
+				db.prepare("UPDATE items SET introduced_at = ?, introduction_kind = 'planned' WHERE id = ?")
+					.run(now.toISOString(), due.id);
 				touchStreak(db, now);
 			}
 			setRuntimeState(db, {

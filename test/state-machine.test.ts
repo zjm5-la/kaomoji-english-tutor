@@ -627,8 +627,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const tableNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
 			const itemCols = (db.prepare("PRAGMA table_info(items)").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 1, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1]);
+			assert.deepEqual({ ...meta }, { schema_version: 2, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -646,6 +646,59 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 		assert.ok(client, "second session registered a client heartbeat");
 		assert.equal(client.protocol_version, 1);
 		assert.ok(client.last_seen);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("introduced_at is stamped when a new card is first displayed", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ sessionId: "quota-stamp" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','first','意',?,?)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=NULL, next_check_at=? WHERE id=1")
+			.run(new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const row = check.prepare("SELECT shown,introduced_at,introduction_kind FROM items WHERE id=1").get() as any;
+		check.close();
+		assert.equal(row.shown, 1);
+		assert.equal(row.introduction_kind, "planned");
+		assert.ok(row.introduced_at, "introduced_at stamped at first display");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("planned new-card quota blocks extra new cards at display", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const harness = await makeSession({ sessionId: "quota-block" });
+		const db = openTestDb();
+		// Card 1: already introduced today and scheduled into the future (quota used).
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at,introduction_kind) VALUES('word','first','意',?,?,1,?,'planned')")
+			.run(new Date().toISOString(), "2099-01-01T00:00:00.000Z", new Date().toISOString());
+		// Card 2: a queued-new card due now.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','second','意二',?,?)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=NULL, next_check_at=? WHERE id=1")
+			.run(new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const item2 = check.prepare("SELECT shown,introduced_at,introduction_kind FROM items WHERE id=2").get() as any;
+		const state = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(item2.shown, 0, "queued-new card not claimed over quota");
+		assert.equal(item2.introduced_at, null, "queued-new card not stamped over quota");
+		assert.equal(state.active_item_id, null, "no active card surfaced over quota");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
