@@ -958,4 +958,23 @@ test("mastery state tracks Good and Again evidence", { concurrency: false }, asy
 	}
 });
 
+test("consecutive Again triggers a reinforcement hint", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const now = new Date().toISOString();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,example,example_cn,learned_at,due_at,shown) VALUES('word','run','跑','He runs fast.','他跑得快。',?,?,1)")
+			.run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, updated_at) VALUES (1, 'recognition', 0, 1, ?)").run(now);
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /反复忘了/);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

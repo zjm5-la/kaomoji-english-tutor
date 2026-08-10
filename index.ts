@@ -2097,10 +2097,13 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				statsLine(db),
 			]);
 		} else {
-			updateWidget(ctx, FACES.error, [
-				`${FACES.error} 没关系，待会儿再考你一次 ${item.text}`,
-				statsLine(db),
-			]);
+			const lines = [`${FACES.error} 没关系，待会儿再考你一次 ${item.text}`];
+			const mastery = db.prepare("SELECT consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { consecutive_again: number } | undefined;
+			if (Number(mastery?.consecutive_again ?? 0) >= 2) {
+				lines.push(`💪 反复忘了，仔细看：${item.example || item.text}${item.example_cn ? `（${item.example_cn}）` : ""}`);
+			}
+			lines.push(statsLine(db));
+			updateWidget(ctx, FACES.error, lines);
 		}
 		return true;
 	}
