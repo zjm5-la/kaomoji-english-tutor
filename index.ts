@@ -1501,8 +1501,13 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const generation = sessionGeneration;
 		if (!ctx || isCtxStale(ctx) || config.intervalMinutes <= 0) return;
 		if (pendingLLMCall) {
-			scheduleTimer(Math.min(30_000, intervalMs()));
-			return;
+			if (Date.now() - pendingLLMCallAt >= 180_000) {
+				pendingLLMCall = false;
+				if (db) setStat(db, "last_gen_status", "hung_llm_reset");
+			} else {
+				scheduleTimer(Math.min(30_000, intervalMs()));
+				return;
+			}
 		}
 		try {
 			await petTick(ctx);
@@ -2403,7 +2408,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const generationToken = claimGeneration();
-		if (!generationToken) return;
+		if (!generationToken) { logGenStatus("no_gen_token"); return; }
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
