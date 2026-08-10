@@ -1341,8 +1341,11 @@ function statsLine(db: DatabaseSync): string {
 	const now = new Date();
 	const todayNew = countTodayNew(db, now);
 	const todayReviews = countTodayReviews(db, now);
+	const reinforce = Number(
+		(db.prepare("SELECT COUNT(*) AS n FROM mastery_state WHERE consecutive_again >= 2").get() as { n: number }).n,
+	);
 	const streak = Number(getStat(db, "streak_days") ?? 0);
-	return `📚 已学 ${total} · 今日新增 ${todayNew} · 今日复习 ${todayReviews} · 连续学习 ${streak} 天`;
+	return `📚 已学 ${total} · 今日新增 ${todayNew} · 今日复习 ${todayReviews} · 需强化 ${reinforce} · 连续学习 ${streak} 天`;
 }
 
 /** Parse a JSON column safely. */
@@ -2736,6 +2739,20 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		description: "Show a first-letter hint for the active word/phrase card",
 		handler: async (_args, ctx) => {
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
+		},
+	});
+
+	pi.registerCommand("kaomoji:stats", {
+		description: "Show detailed learning statistics (mastery stages, reinforcement, answer accuracy)",
+		handler: async (_args, ctx) => {
+			if (!db) return;
+			const stages = db.prepare("SELECT stage, COUNT(*) AS n FROM mastery_state GROUP BY stage ORDER BY stage").all() as { stage: string; n: number }[];
+			const reinforce = Number((db.prepare("SELECT COUNT(*) AS n FROM mastery_state WHERE consecutive_again >= 2").get() as { n: number }).n);
+			const attempts = Number((db.prepare("SELECT COUNT(*) AS n FROM attempts").get() as { n: number }).n);
+			const correct = Number((db.prepare("SELECT COUNT(*) AS n FROM attempts WHERE verdict = 'correct'").get() as { n: number }).n);
+			const rate = attempts > 0 ? Math.round((correct / attempts) * 100) : 0;
+			const stageLine = stages.length ? stages.map((s) => `${s.stage}:${s.n}`).join(" · ") : "暂无";
+			ctx.ui.notify(`掌握阶段：${stageLine}；需强化：${reinforce}；答题 ${attempts} 次，正确率 ${rate}%`, "info");
 		},
 	});
 

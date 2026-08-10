@@ -977,4 +977,16 @@ test("consecutive Again triggers a reinforcement hint", { concurrency: false }, 
 	}
 });
 
+test("kaomoji:stats reports mastery distribution and accuracy without error", { concurrency: false }, async () => {
+	const harness = await createHarness();
+	try {
+		assert.equal(typeof harness.commands["kaomoji:stats"], "object");
+		// Exercises the full query path on an empty DB (no rows → "暂无", 0 attempts).
+		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		// no fake timers
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
