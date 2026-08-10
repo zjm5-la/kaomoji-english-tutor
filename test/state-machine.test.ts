@@ -8,7 +8,7 @@ import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-a
 
 const agentDir = mkdtempSync(join(tmpdir(), "kaomoji-tutor-test-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-const { default: extension } = await import("../index.ts");
+const { default: extension, contentFingerprint } = await import("../index.ts");
 let sessionSeq = 0;
 
 interface FakeTimer {
@@ -986,6 +986,136 @@ test("kaomoji:stats reports mastery distribution and accuracy without error", { 
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		// no fake timers
+	}
+});
+
+test("schema_meta records completed migration version", { concurrency: false }, async () => {
+	const harness = await createHarness();
+	const db = openTestDb();
+	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
+	db.close();
+	assert.equal(meta.schema_version, 3, "schema migrated to v3");
+	assert.equal(meta.migration_state, "complete");
+	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+});
+
+test("mastery stage promotes to controlled_recall after a second Good", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const now = new Date().toISOString();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','deploy','部署',?,?,1)")
+			.run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'recognition',1,0,?)").run(now);
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		const ck = openTestDb();
+		const m = ck.prepare("SELECT stage, unassisted_good FROM mastery_state WHERE item_id=1").get() as any;
+		ck.close();
+		assert.equal(m.stage, "controlled_recall", "second Good promotes recognition -> controlled_recall");
+		assert.equal(m.unassisted_good, 2);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("mastery stage demotes one level on Again", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const now = new Date().toISOString();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','deploy','部署',?,?,1)")
+			.run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'controlled_recall',2,0,?)").run(now);
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		const ck = openTestDb();
+		const m = ck.prepare("SELECT stage, consecutive_again FROM mastery_state WHERE item_id=1").get() as any;
+		ck.close();
+		assert.equal(m.stage, "recognition", "Again demotes controlled_recall -> recognition");
+		assert.equal(m.consecutive_again, 1);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("statsLine shows reinforcement count for struggling cards", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'exposure',0,2,?)").run(new Date().toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /需强化 1/, "statsLine reflects one card needing reinforcement");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("lesson generation stamps content_fingerprint and lexical_sense_id", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-fp" });
+	try {
+		registration.setResponses([fauxAssistantMessage(lessonResponse())]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const s = await makeSession({ model, modelRegistry: registry, sessionId: "fp" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const items = db.prepare("SELECT type, content_fingerprint, lexical_sense_id FROM items ORDER BY id").all() as any[];
+		const senses = (db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as any).n;
+		db.close();
+		assert.ok(items.length >= 3, "lesson inserted its three items");
+		for (const it of items) assert.ok(it.content_fingerprint, `${it.type} has content_fingerprint`);
+		const word = items.find((i) => i.type === "word");
+		const phrase = items.find((i) => i.type === "phrase");
+		const sentence = items.find((i) => i.type === "sentence");
+		assert.ok(word.lexical_sense_id, "word linked to a lexical sense");
+		assert.ok(phrase.lexical_sense_id, "phrase linked to a lexical sense");
+		assert.ok(!sentence.lexical_sense_id, "sentence has no lexical sense");
+		assert.ok(senses >= 2, "word + phrase each created a sense");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("duplicate content fingerprint is rejected at commit", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-dup" });
+	try {
+		registration.setResponses([fauxAssistantMessage(lessonResponse())]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const s = await makeSession({ model, modelRegistry: registry, sessionId: "dup" });
+		// Pre-insert the exact word the lesson will generate, with a future due date
+		// so claimDueItem does not surface it before generation runs.
+		const db0 = openTestDb();
+		const fp = contentFingerprint("word", "coordinate", "协调");
+		db0.prepare(
+			"INSERT INTO items(type,text,meaning,learned_at,due_at,shown,content_fingerprint,introduction_kind) VALUES('word','coordinate','协调',?,?,1,?,'legacy')",
+		).run(new Date().toISOString(), new Date(Date.now() + 3600_000).toISOString(), fp);
+		db0.close();
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = (db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n;
+		db.close();
+		assert.equal(count, 1, "duplicate lesson rejected, only the pre-existing item remains");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
 	}
 });
 

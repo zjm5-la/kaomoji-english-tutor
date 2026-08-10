@@ -433,12 +433,15 @@ const MASTERY_PROMOTE_THRESHOLDS = [1, 2, 2, 2]; // unassisted Good count needed
 function computeMasteryStage(prevStage: string, unassistedGood: number, isAgain: boolean): string {
 	let idx = Math.max(0, MASTERY_STAGES.indexOf(prevStage as never));
 	if (isAgain) return MASTERY_STAGES[Math.max(0, idx - 1)];
-	while (idx < MASTERY_STAGES.length - 1 && unassistedGood >= MASTERY_PROMOTE_THRESHOLDS[idx]) idx++;
+	// Promote at most one stage per rating: reaching the threshold advances a single level.
+	if (idx < MASTERY_STAGES.length - 1 && unassistedGood >= MASTERY_PROMOTE_THRESHOLDS[idx]) {
+		return MASTERY_STAGES[idx + 1];
+	}
 	return MASTERY_STAGES[idx];
 }
 
 /** Deterministic content fingerprint for exact dedup: type + normalized text + normalized meaning. */
-function contentFingerprint(type: string, text: string, meaning: string): string {
+export function contentFingerprint(type: string, text: string, meaning: string): string {
 	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
 	return createHash("sha256")
 		.update(`${type}\u0000${norm(text)}\u0000${norm(meaning)}`, "utf8")
