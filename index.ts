@@ -95,6 +95,222 @@ interface ItemRow {
 	chunks: string | null;
 	key_words: string | null;
 	progress: number;
+	// Adaptive columns (inert in protocol 1; written by later milestones)
+	lesson_id?: number | null;
+	lexical_sense_id?: number | null;
+	role?: string | null;
+	content_fingerprint?: string | null;
+	content_version?: number;
+	introduced_at?: string | null;
+	introduction_kind?: string | null;
+	introduction_accuracy?: string;
+	content_status?: string;
+	legacy_duplicate_of?: number | null;
+	fsrs_status?: string;
+	fsrs_error?: string | null;
+	fsrs_corrupt_at?: string | null;
+}
+
+/** Add a column only when missing; replaces the old try/catch ALTER pattern. */
+function addColumnIfMissing(db: DatabaseSync, table: string, columnDef: string): void {
+	const name = columnDef.trim().split(/\s+/)[0];
+	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+	if (!cols.some((c) => c.name === name)) {
+		db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+	}
+}
+
+/** Record this client's protocol version + heartbeat (protocol 1). */
+function touchClient(db: DatabaseSync, clientId: string): void {
+	db.prepare(
+		"INSERT INTO runtime_clients (client_id, protocol_version, last_seen) VALUES (?, 1, ?) ON CONFLICT(client_id) DO UPDATE SET last_seen = excluded.last_seen, protocol_version = excluded.protocol_version",
+	).run(clientId, new Date().toISOString());
+}
+
+/**
+ * Versioned, idempotent schema migrations. Each step runs inside its own short
+ * transaction and is recorded in `schema_migrations`, so completion no longer
+ * depends on swallowing ALTER errors.
+ */
+const SCHEMA_TARGET_VERSION = 1;
+const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
+	// v1: adaptive tutor compatibility schema (protocol 1).
+	// All structures are empty and unused at runtime; existing behavior is unchanged.
+	(db: DatabaseSync) => {
+		// Legacy column upgrades (previously guarded by try/catch ALTER).
+		for (const col of [
+			"status TEXT NOT NULL DEFAULT 'learning'",
+			"levels TEXT", "levels_cn TEXT", "chunks TEXT", "key_words TEXT",
+			"progress INTEGER NOT NULL DEFAULT 0",
+		]) addColumnIfMissing(db, "items", col);
+		for (const col of ["generation_token TEXT", "generation_until TEXT"]) {
+			addColumnIfMissing(db, "runtime_state", col);
+		}
+
+		// Adaptive items columns (written by later milestones; inert in protocol 1).
+		for (const col of [
+			"lesson_id INTEGER", "lexical_sense_id INTEGER", "role TEXT",
+			"content_fingerprint TEXT", "content_version INTEGER NOT NULL DEFAULT 1",
+			"introduced_at TEXT", "introduction_kind TEXT",
+			"introduction_accuracy TEXT NOT NULL DEFAULT 'exact'",
+			"content_status TEXT NOT NULL DEFAULT 'approved'",
+			"legacy_duplicate_of INTEGER", "fsrs_status TEXT NOT NULL DEFAULT 'ok'",
+			"fsrs_error TEXT", "fsrs_corrupt_at TEXT",
+		]) addColumnIfMissing(db, "items", col);
+
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS lessons (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				mode TEXT NOT NULL, topic TEXT, objective TEXT NOT NULL,
+				context_hash TEXT NOT NULL, snapshot_version INTEGER NOT NULL,
+				plan_json TEXT NOT NULL, quality_json TEXT NOT NULL,
+				status TEXT NOT NULL, created_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS lexical_senses (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				kind TEXT NOT NULL CHECK (kind IN ('word','phrase')),
+				surface TEXT NOT NULL, normalized_surface TEXT NOT NULL,
+				part_of_speech TEXT, meaning_zh TEXT NOT NULL,
+				normalized_meaning TEXT NOT NULL, usage_note TEXT,
+				sense_fingerprint TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS lexical_senses_surface_idx
+				on lexical_senses(kind, normalized_surface);
+			CREATE TABLE IF NOT EXISTS lexical_surface_versions (
+				kind TEXT NOT NULL, normalized_surface TEXT NOT NULL,
+				version INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (kind, normalized_surface)
+			);
+			CREATE TABLE IF NOT EXISTS supporting_materials (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				lesson_id INTEGER NOT NULL, kind TEXT NOT NULL,
+				content_json TEXT NOT NULL,
+				content_fingerprint TEXT NOT NULL UNIQUE,
+				status TEXT NOT NULL DEFAULT 'approved', created_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS exercises (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				item_id INTEGER NOT NULL, kind TEXT NOT NULL,
+				schema_version INTEGER NOT NULL, stage TEXT NOT NULL,
+				content_fingerprint TEXT NOT NULL UNIQUE,
+				prompt_json TEXT NOT NULL, answer_json TEXT NOT NULL,
+				hints_json TEXT NOT NULL, rubric_json TEXT NOT NULL,
+				quality_json TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'approved',
+				used_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS exercise_senses (
+				exercise_id INTEGER NOT NULL, lexical_sense_id INTEGER NOT NULL,
+				role TEXT NOT NULL CHECK (role IN ('target','contrast','accepted_alternative')),
+				PRIMARY KEY (exercise_id, lexical_sense_id, role)
+			);
+			CREATE TABLE IF NOT EXISTS content_catalog_state (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				version INTEGER NOT NULL DEFAULT 0
+			);
+			INSERT OR IGNORE INTO content_catalog_state (id, version) VALUES (1, 0);
+			CREATE TABLE IF NOT EXISTS attempts (
+				id TEXT PRIMARY KEY, item_id INTEGER NOT NULL, exercise_id INTEGER,
+				review_cycle_id TEXT NOT NULL, claim_key TEXT NOT NULL UNIQUE,
+				question_version INTEGER NOT NULL, evaluation_version INTEGER NOT NULL,
+				kind TEXT NOT NULL, answer_text TEXT, assistance_level TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('evaluating','evaluated','superseded','stale','abandoned','self_report')),
+				evaluation_owner TEXT, evaluation_token TEXT, evaluation_until TEXT,
+				verdict TEXT, error_tags_json TEXT, feedback_json TEXT,
+				explicit_rating TEXT, started_at TEXT NOT NULL,
+				completed_at TEXT, rated_at TEXT
+			);
+			CREATE TABLE IF NOT EXISTS mastery_state (
+				item_id INTEGER PRIMARY KEY, stage TEXT NOT NULL,
+				recognition_evidence INTEGER NOT NULL DEFAULT 0,
+				recall_evidence INTEGER NOT NULL DEFAULT 0,
+				use_evidence INTEGER NOT NULL DEFAULT 0,
+				transfer_evidence INTEGER NOT NULL DEFAULT 0,
+				unassisted_good INTEGER NOT NULL DEFAULT 0,
+				assisted_good INTEGER NOT NULL DEFAULT 0,
+				consecutive_again INTEGER NOT NULL DEFAULT 0,
+				contrast_pending INTEGER NOT NULL DEFAULT 0,
+				last_evidence_cycle_id TEXT,
+				error_profile_json TEXT NOT NULL DEFAULT '{}',
+				last_exercise_kind TEXT, updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS content_reports (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				item_id INTEGER, exercise_id INTEGER, reason TEXT NOT NULL,
+				content_version INTEGER NOT NULL, status TEXT NOT NULL,
+				review_job_id TEXT, resolution_json TEXT, created_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS fsrs_corruptions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				item_id INTEGER NOT NULL, raw_fsrs_state TEXT, error_code TEXT,
+				detected_at TEXT NOT NULL, resolution TEXT
+			);
+			CREATE TABLE IF NOT EXISTS tutor_jobs (
+				id TEXT PRIMARY KEY, purpose TEXT NOT NULL,
+				job_key TEXT NOT NULL UNIQUE, snapshot_hash TEXT NOT NULL,
+				pipeline_version INTEGER NOT NULL, phase TEXT NOT NULL,
+				status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
+				attempt_count INTEGER NOT NULL DEFAULT 0, next_run_at TEXT NOT NULL,
+				owner TEXT, lease_token TEXT, lease_until TEXT,
+				artifacts_json TEXT NOT NULL DEFAULT '{}', failure_json TEXT,
+				created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS tutor_job_artifacts (
+				job_id TEXT NOT NULL, job_version INTEGER NOT NULL, phase TEXT NOT NULL,
+				artifact_key TEXT NOT NULL, input_hash TEXT, status TEXT NOT NULL,
+				payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+				PRIMARY KEY (job_id, job_version, phase, artifact_key)
+			);
+			CREATE TABLE IF NOT EXISTS replacement_requests (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				source_item_id INTEGER, source_snapshot_json TEXT,
+				requested_type TEXT NOT NULL, status TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+				last_context_hash TEXT, created_at TEXT NOT NULL, completed_at TEXT
+			);
+			CREATE TABLE IF NOT EXISTS runtime_clients (
+				client_id TEXT PRIMARY KEY,
+				protocol_version INTEGER NOT NULL,
+				last_seen TEXT NOT NULL
+			);
+		`);
+	},
+];
+
+function runMigrations(db: DatabaseSync): void {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS schema_meta (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			schema_version INTEGER NOT NULL DEFAULT 0,
+			adaptive_protocol INTEGER NOT NULL DEFAULT 0,
+			migration_state TEXT NOT NULL DEFAULT 'pending'
+		);
+		INSERT OR IGNORE INTO schema_meta (id, schema_version, adaptive_protocol, migration_state)
+		VALUES (1, 0, 0, 'pending');
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+		);
+	`);
+	const applied = new Set(
+		(db.prepare("SELECT version FROM schema_migrations").all() as { version: number }[])
+			.map((r) => r.version),
+	);
+	for (let v = 1; v <= SCHEMA_TARGET_VERSION; v++) {
+		if (applied.has(v)) continue;
+		const step = SCHEMA_MIGRATIONS[v - 1];
+		if (!step) continue;
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			step(db);
+			db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+				.run(v, new Date().toISOString());
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			throw err;
+		}
+	}
+	db.exec(`UPDATE schema_meta SET schema_version = ${SCHEMA_TARGET_VERSION}, adaptive_protocol = 1, migration_state = 'complete' WHERE id = 1`);
 }
 
 function openDb(): DatabaseSync {
@@ -143,28 +359,7 @@ function openDb(): DatabaseSync {
 		);
 		INSERT OR IGNORE INTO runtime_state (id, active_version, next_check_at) VALUES (1, 0, '');
 	`);
-	for (const col of ["generation_token TEXT", "generation_until TEXT"]) {
-		try {
-			db.exec(`ALTER TABLE runtime_state ADD COLUMN ${col}`);
-		} catch {
-			// column already exists
-		}
-	}
-	// Upgrade older databases without the new columns
-	for (const col of [
-		"status TEXT NOT NULL DEFAULT 'learning'",
-		"levels TEXT",
-		"levels_cn TEXT",
-		"chunks TEXT",
-		"key_words TEXT",
-		"progress INTEGER NOT NULL DEFAULT 0",
-	]) {
-		try {
-			db.exec(`ALTER TABLE items ADD COLUMN ${col}`);
-		} catch {
-			// column already exists
-		}
-	}
+	runMigrations(db);
 	return db;
 }
 
@@ -2185,6 +2380,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		resolveModel(ctx);
 		if (db) {
 			ensureCoordinator(new Date(), true);
+			touchClient(db, myId);
 			// Rebuild the active global card so this session converges immediately.
 			if (activeItem(db)) {
 				renderGlobalCard(ctx);

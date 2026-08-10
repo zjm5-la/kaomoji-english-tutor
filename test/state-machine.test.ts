@@ -616,4 +616,40 @@ test("leadership change discards an in-flight stale lesson", { concurrency: fals
 
 
 
+test("schema migration is idempotent and registers adaptive protocol 1", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const checkSchema = () => {
+			const db = openTestDb();
+			const meta = db.prepare("SELECT schema_version, adaptive_protocol, migration_state FROM schema_meta WHERE id=1").get() as any;
+			const versions = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as any[]).map((r) => r.version);
+			const tableNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
+			const itemCols = (db.prepare("PRAGMA table_info(items)").all() as any[]).map((r) => r.name);
+			db.close();
+			assert.deepEqual({ ...meta }, { schema_version: 1, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1]);
+			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
+				assert.ok(tableNames.includes(t), `table ${t} exists`);
+			}
+			for (const c of ["lesson_id","lexical_sense_id","role","content_fingerprint","content_version","introduced_at","introduction_kind","introduction_accuracy","content_status","legacy_duplicate_of","fsrs_status","fsrs_error","fsrs_corrupt_at"]) {
+				assert.ok(itemCols.includes(c), `items.${c} exists`);
+			}
+		};
+		checkSchema();
+		// A second session reopens the same DB: the migration must not re-run.
+		await makeSession({ sessionId: "migration-idempotent" });
+		checkSchema();
+		const db = openTestDb();
+		const client = db.prepare("SELECT protocol_version, last_seen FROM runtime_clients WHERE client_id LIKE 'migration-idempotent%'").get() as any;
+		db.close();
+		assert.ok(client, "second session registered a client heartbeat");
+		assert.equal(client.protocol_version, 1);
+		assert.ok(client.last_seen);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
