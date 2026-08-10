@@ -903,4 +903,26 @@ test("LLM evaluation marks a near-miss answer as partial with feedback", { concu
 	}
 });
 
+test("recall exercise template is persisted when a card is answered", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','cat','猫',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("cat", harness.ctx);
+		const check = openTestDb();
+		const ex = check.prepare("SELECT kind, stage, content_fingerprint FROM exercises WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(ex.kind, "recall");
+		assert.equal(ex.stage, "recall");
+		assert.ok(ex.content_fingerprint, "exercise fingerprint stamped");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

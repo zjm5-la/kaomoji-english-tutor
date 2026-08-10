@@ -1901,6 +1901,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		} catch (err) {
 			console.error(`[kaomoji-english-tutor] attempt record failed: ${err}`);
 		}
+		ensureRecallExercise(item);
 		pendingFlipped = true;
 		const lines = renderCard(item, true, FACES.review, true);
 		if (verdict === "correct") {
@@ -1913,6 +1914,22 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		lines.push("💬 /kaomoji:good 记得 · /kaomoji:again 忘了");
 		updateWidget(ctx, verdict === "incorrect" ? FACES.error : FACES.review, lines);
 		return true;
+	}
+
+	/** Persist a recall exercise template for a word/phrase item (idempotent, groundwork for M3 multi-exercise). */
+	function ensureRecallExercise(item: ItemRow) {
+		if (!db) return;
+		const hint = item.text[0] + "_".repeat(Math.max(0, item.text.length - 1));
+		db.prepare(
+			"INSERT OR IGNORE INTO exercises (item_id, kind, schema_version, stage, content_fingerprint, prompt_json, answer_json, hints_json, rubric_json, quality_json, created_at) VALUES (?, 'recall', 1, 'recall', ?, ?, ?, ?, '{}', '{}', ?)",
+		).run(
+			item.id,
+			`recall:${item.id}`,
+			JSON.stringify({ meaning: item.meaning }),
+			JSON.stringify({ acceptedForms: [item.text] }),
+			JSON.stringify([hint]),
+			new Date().toISOString(),
+		);
 	}
 
 	/** Show a first-letter hint for the active word/phrase card. */
