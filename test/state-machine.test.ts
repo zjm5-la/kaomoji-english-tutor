@@ -1071,11 +1071,15 @@ test("lesson generation stamps content_fingerprint and lexical_sense_id", { conc
 		await fake.fire();
 		await fake.flush();
 		const db = openTestDb();
-		const items = db.prepare("SELECT type, content_fingerprint, lexical_sense_id FROM items ORDER BY id").all() as any[];
+		const items = db.prepare("SELECT type, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at FROM items ORDER BY id").all() as any[];
 		const senses = (db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as any).n;
 		db.close();
 		assert.ok(items.length >= 3, "lesson inserted its three items");
-		for (const it of items) assert.ok(it.content_fingerprint, `${it.type} has content_fingerprint`);
+		for (const it of items) {
+			assert.ok(it.content_fingerprint, `${it.type} has content_fingerprint`);
+			assert.equal(it.introduction_kind, "planned", `${it.type} stamped introduction_kind=planned`);
+			assert.ok(it.introduced_at, `${it.type} has introduced_at`);
+		}
 		const word = items.find((i) => i.type === "word");
 		const phrase = items.find((i) => i.type === "phrase");
 		const sentence = items.find((i) => i.type === "sentence");

@@ -488,8 +488,9 @@ function insertItem(
 	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"] },
 ): number {
 	const senseId = ensureLexicalSense(db, type, text, meaning, now);
+	const ts = now.toISOString();
 	const result = db.prepare(
-		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?)",
 	).run(
 		type,
 		text,
@@ -497,14 +498,15 @@ function insertItem(
 		meaning,
 		example,
 		example_cn,
-		now.toISOString(),
-		now.toISOString(),
+		ts,
+		ts,
 		extra?.levels ? JSON.stringify(extra.levels) : null,
 		extra?.levels_cn ? JSON.stringify(extra.levels_cn) : null,
 		extra?.chunks ? JSON.stringify(extra.chunks) : null,
 		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
 		contentFingerprint(type, text, meaning),
 		senseId,
+		ts,
 	);
 	return Number(result.lastInsertRowid);
 }
