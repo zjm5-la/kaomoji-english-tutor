@@ -1132,6 +1132,7 @@ async function evaluateAttempt(
 	item: ItemRow,
 	answer: string,
 	resolved: { provider: string; model: string } | undefined,
+	direction: "forward" | "reverse" = "forward",
 ): Promise<AnswerEvaluation> {
 	const failClosed = (feedback = ""): AnswerEvaluation => ({ verdict: "incorrect", feedback });
 	if (!resolved) return failClosed();
@@ -1140,16 +1141,19 @@ async function evaluateAttempt(
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) return failClosed();
 	const requestAuth = { apiKey: auth.apiKey, headers: auth.headers as Record<string, string> | undefined };
+	const isReverse = direction === "reverse";
+	const target = isReverse ? item.meaning : item.text;
+	const answerLang = isReverse ? "中文" : "英文";
 	const prompt = [
-		"你是英语导师。学生看到中文释义要写出对应的英文。",
-		`目标：${item.text}（${item.meaning}）`,
+		`你是英语导师。学生看到${isReverse ? "英文" : "中文"}要写出对应的${answerLang}。`,
+		`目标：${target}`,
 		`学生写了：${answer}`,
 		"判断学生的答案，只输出 JSON：",
 		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
-		"- 学生必须用英文作答；写的不是英文（如中文翻译）一律 incorrect",
-		"- correct: 英文与目标完全一致，或仅大小写/标点/多余空格差异",
-		"- partial: 英文有拼写小错、单复数、时态、词形变化，但明显是想写这个词",
-		"- incorrect: 完全不同的词、空白、非英文或无法识别",
+		`- 学生必须用${answerLang}作答；写错语言一律 incorrect`,
+		`- correct: ${answerLang}与目标完全一致，或仅大小写/标点/多余空格差异`,
+		`- partial: ${answerLang}有小错（拼写/近义/字形），但明显是想表达这个意思`,
+		"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
 	].join("\n");
 	let response;
 	try {
@@ -1366,7 +1370,7 @@ function parseJsonCol<T>(raw: string | null): T | undefined {
 }
 
 /** Render a teach/review card as widget lines (front = question, back = answer). */
-function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false): string[] {
+function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward"): string[] {
 	const label = TYPE_LABELS[item.type] ?? item.type;
 	const lines: string[] = [];
 
@@ -1403,6 +1407,8 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 		if (showAnswer) {
 			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 			lines.push(`  第 ${item.reviews + 1} 次复习`);
+		} else if (direction === "reverse") {
+			lines.push(`${face} 复习时间到：✍️ 写出「${item.text}」的中文释义`);
 		} else {
 			lines.push(`${face} 复习时间到：✍️ 默写「${item.meaning}」的英文`);
 		}
@@ -1457,6 +1463,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let pendingFlipped = false;
 	/** Whether the pending card is a review (vs first showing / training). */
 	let pendingIsReview = false;
+	let pendingDirection: "forward" | "reverse" = "forward";
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
 		try {
@@ -1662,7 +1669,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			pendingItemId = state.active_item_id;
 			pendingIsReview = isReview;
 			if (changed || pendingFlipped === false) pendingFlipped = false;
-			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped);
+			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped, pendingDirection);
 			lines.push(statsLine(db));
 			updateWidget(ctx, isReview ? FACES.review : FACES.teach, lines);
 			recordRendered(state);
@@ -1846,9 +1853,10 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingItemId = item.id;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
+		pendingDirection = isReview ? (Math.random() < 0.5 ? "forward" : "reverse") : "forward";
 		recordRendered(state);
 		const face = isReview ? FACES.review : FACES.teach;
-		const lines = renderCard(item, isReview, face, false);
+		const lines = renderCard(item, isReview, face, false, pendingDirection);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		if (config.verbose) {
@@ -1877,7 +1885,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (!item) return true;
 		pendingFlipped = !pendingFlipped;
 		const face = pendingIsReview ? FACES.review : FACES.teach;
-		const lines = renderCard(item, pendingIsReview, face, pendingFlipped);
+		const lines = renderCard(item, pendingIsReview, face, pendingFlipped, pendingDirection);
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		return true;
@@ -1900,19 +1908,23 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		}
 		const text = rawText.trim();
 		if (!text) {
+			const promptText = pendingDirection === "reverse"
+				? `✍️ 请写出「${item.text}」的中文释义`
+				: `✍️ 请写出「${item.meaning}」的英文`;
 			updateWidget(ctx, FACES.review, [
-				`${FACES.review} ✍️ 请写出「${item.meaning}」的英文`,
+				`${FACES.review} ${promptText}`,
 				"用 /kaomoji:answer <你的答案>，或 /kaomoji:hint 看提示，或 /kaomoji:flip 看答案",
 				statsLine(db),
 			]);
 			return true;
 		}
 		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-		const exact = norm(text) === norm(item.text);
+		const target = pendingDirection === "reverse" ? item.meaning : item.text;
+		const exact = norm(text) === norm(target);
 		let verdict: "correct" | "partial" | "incorrect" = exact ? "correct" : "incorrect";
 		let feedback = "";
 		if (!exact) {
-			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx));
+			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx), pendingDirection);
 			verdict = result.verdict;
 			feedback = result.feedback;
 		}
@@ -1929,17 +1941,14 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			console.error(`[kaomoji-english-tutor] attempt record failed: ${err}`);
 		}
 		ensureRecallExercise(item);
-		pendingFlipped = true;
-		const lines = renderCard(item, true, FACES.review, true);
-		if (verdict === "correct") {
-			lines.unshift("✓ 答对了！");
-		} else if (verdict === "partial") {
-			lines.unshift(`△ 差一点：${feedback || "有小问题"}（正确：${item.text}）`);
-		} else {
-			lines.unshift(`✗ 答案是：${item.text}`);
-		}
-		lines.push("💬 /kaomoji:good 记得 · /kaomoji:again 忘了");
-		updateWidget(ctx, verdict === "incorrect" ? FACES.error : FACES.review, lines);
+		// Auto-rate: correct -> Good, miss (partial/incorrect) -> Again.
+		const autoRating = verdict === "correct" ? Rating.Good : Rating.Again;
+		const recallNote = verdict === "correct"
+			? "✓ 答对了！"
+			: verdict === "partial"
+				? `△ 差一点：${feedback || "有小问题"}（正确：${target}）`
+				: `✗ 答案是：${target}`;
+		ratePending(ctx, autoRating, recallNote);
 		return true;
 	}
 
@@ -1983,7 +1992,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	}
 
 	/** Rate the pending review card; returns true once an action was taken (or a stale action was safely refreshed). */
-	function ratePending(ctx: ExtensionContext, rating: Rating): boolean {
+	function ratePending(ctx: ExtensionContext, rating: Rating, recallNote = ""): boolean {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
 
@@ -2110,11 +2119,12 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		recordRendered(getRuntimeState(db));
 		if (rating === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
+				...(recallNote ? [recallNote] : []),
 				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个词`,
 				statsLine(db),
 			]);
 		} else {
-			const lines = [`${FACES.error} 没关系，待会儿再考你一次 ${item.text}`];
+			const lines = [...(recallNote ? [recallNote] : []), `${FACES.error} 没关系，待会儿再考你一次 ${item.text}`];
 			const mastery = db.prepare("SELECT consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { consecutive_again: number } | undefined;
 			if (Number(mastery?.consecutive_again ?? 0) >= 2) {
 				lines.push(`💪 反复忘了，仔细看：${item.example || item.text}${item.example_cn ? `（${item.example_cn}）` : ""}`);

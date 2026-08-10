@@ -21,6 +21,8 @@ interface FakeTimer {
 function installFakeTimers() {
 	const realSetTimeout = globalThis.setTimeout;
 	const realClearTimeout = globalThis.clearTimeout;
+	const realRandom = Math.random;
+	Math.random = () => 0; // deterministic: review direction always "forward" unless a test overrides
 	let timers: FakeTimer[] = [];
 	(globalThis as any).setTimeout = (callback: () => void, delay = 0) => {
 		const timer: FakeTimer = { callback, delay, active: true, unref() {} };
@@ -58,6 +60,7 @@ function installFakeTimers() {
 		restore() {
 			(globalThis as any).setTimeout = realSetTimeout;
 			(globalThis as any).clearTimeout = realClearTimeout;
+			Math.random = realRandom;
 		},
 	};
 }
@@ -1196,6 +1199,30 @@ test("claimDueItem blocks new cards once dailyNewLimit is reached", { concurrenc
 		assert.equal(active.active_item_id, null, "no new card surfaced once quota is full");
 		assert.equal(shown.n, 0, "neither queued card was marked shown");
 		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("active recall: reverse direction asks for the Chinese meaning", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		Math.random = () => 1; // force reverse direction
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','hello','你好',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /写出「hello」的中文释义/, "reverse front shows English, asks for Chinese");
+		await harness.commands["kaomoji:answer"].handler("你好", harness.ctx);
+		assert.match(harness.widget().join(" "), /答对了/, "correct Chinese answer auto-rates Good");
+		const check = openTestDb();
+		const att = check.prepare("SELECT verdict, answer_text FROM attempts WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(att.verdict, "correct");
+		assert.equal(att.answer_text, "你好");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
 	}
