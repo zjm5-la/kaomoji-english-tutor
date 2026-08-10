@@ -1007,6 +1007,95 @@ async function generateLesson(
 	return { ready: true, topic: String(parsed.topic ?? ""), items };
 }
 
+interface CritiqueIssue {
+	severity: "blocker" | "minor";
+	category: string;
+	description: string;
+}
+
+interface CritiqueVerdict {
+	pass: boolean;
+	issues: CritiqueIssue[];
+	summary: string;
+}
+
+/**
+ * Independent quality gate. Fail-open on model/auth/runtime errors so a missing
+ * or broken critic never blocks lesson generation — it only adds a gate when it works.
+ */
+async function critiqueLesson(
+	ctx: ExtensionContext,
+	resolved: ResolvedModel,
+	lesson: { topic: string; items: GeneratedItem[] },
+	known: string[],
+	config: PetConfig,
+): Promise<CritiqueVerdict> {
+	const failOpen = (summary: string): CritiqueVerdict => ({ pass: true, issues: [], summary });
+	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
+	if (!model) return failOpen("critic model unavailable");
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey) return failOpen("critic unauthenticated");
+	const requestAuth = { apiKey: auth.apiKey, headers: auth.headers as Record<string, string> | undefined };
+
+	const outline = lesson.items.map((it) =>
+		it.type === "sentence"
+			? `sentence: "${it.text}" -> ${it.meaning} (levels: ${it.levels?.length ?? 0})`
+			: `${it.type}: "${it.text}" -> ${it.meaning}`,
+	).join("\n");
+
+	const prompt = [
+		"你是「英语小宠物」的内容审查员。审查下面备课是否适合中级学习者，只输出 JSON。",
+		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression","description":"..."}], "summary":"一句话"}',
+		"审查标准：",
+		"- 英语单词/词组/句子必须正确、自然",
+		"- 中文释义准确，不得机翻味",
+		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
+		"- 长句至少 15 词、含从句；levels 必须逐级递进、不得突变",
+		"- 不得为凑结构硬造不自然句子",
+		"- 只有明确问题才标 blocker；小瑕疵标 minor",
+		"",
+		`<lesson topic="${lesson.topic}">`,
+		outline,
+		"</lesson>",
+].join("\n");
+
+	const llmOptions: Record<string, unknown> = { apiKey: requestAuth.apiKey, headers: requestAuth.headers, maxTokens: 450 };
+	if (config.thinkingLevel) llmOptions.reasoning = config.thinkingLevel;
+
+	let response;
+	try {
+		response = await completeSimple(model, {
+			systemPrompt: "你是英语教学内容审查员，只输出 JSON。",
+			messages: [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }],
+		}, llmOptions as any);
+	} catch {
+		return failOpen("critic call failed");
+	}
+	if (response.stopReason === "error") return failOpen(response.errorMessage || "critic error");
+
+	const text = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join(" ")
+		.trim();
+	if (!text) return failOpen("critic empty response");
+
+	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	const start = cleaned.indexOf("{");
+	const end = cleaned.lastIndexOf("}");
+	if (start < 0 || end <= start) return failOpen("critic bad json");
+	try {
+		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { pass?: unknown; issues?: unknown; summary?: unknown };
+		return {
+			pass: parsed.pass === true,
+			issues: Array.isArray(parsed.issues) ? (parsed.issues as CritiqueIssue[]).slice(0, 20) : [],
+			summary: typeof parsed.summary === "string" ? parsed.summary : "",
+		};
+	} catch {
+		return failOpen("critic unparseable");
+	}
+}
+
 async function generateReplacement(
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
@@ -2144,6 +2233,16 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			}
 
 			const lesson = decision;
+			// Quality gate: an independent critic must approve the generated content.
+			const verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
+			if (sessionGeneration !== generation) return;
+			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			if (!verdict.pass) {
+				lastRejectedConversation = conversation;
+				updateWidget(ctx, FACES.idle, ["内容质量未达标，稍后再试…", statsLine(db)]);
+				if (config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
+				return;
+			}
 			const insertedAt = new Date();
 			let insertedFirst: ItemRow | undefined;
 			db.exec("BEGIN IMMEDIATE");

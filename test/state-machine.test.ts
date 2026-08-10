@@ -564,7 +564,7 @@ test("single coordinator commits one lesson batch", { concurrency: false }, asyn
 		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
 		const state = db.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
 		db.close();
-		assert.equal(registration.state.callCount, 1);
+		assert.equal(registration.state.callCount, 2);
 		assert.equal(count, 5);
 		assert.equal(state.active_item_id, 1);
 		assert.equal(state.active_kind, "teach");
@@ -769,6 +769,32 @@ test("word/phrase items link to a lexical sense; sentences do not", { concurrenc
 		assert.equal(sentence.lexical_sense_id, null, "sentence has no sense");
 		assert.ok(Number(senses.n) >= 2, "distinct senses created");
 		assert.equal(Number(senses.n), distinctFps, "sense fingerprints are unique");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("quality gate rejects lessons the critic flags and commits nothing", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-gate-faux" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("gated")),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "句子不自然" }], summary: "不自然" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "gate-a" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const state = db.prepare("SELECT active_item_id, generation_token FROM runtime_state WHERE id=1").get() as any;
+		db.close();
+		assert.equal(count, 0, "no items committed when the critic rejects");
+		assert.equal(state.active_item_id, null, "no active card after rejection");
+		assert.equal(state.generation_token, null, "generation lease released after rejection");
 	} finally {
 		registration.unregister();
 		fake.restore();
