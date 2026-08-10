@@ -1500,7 +1500,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const ctx = latestCtx;
 		const generation = sessionGeneration;
 		if (!ctx || isCtxStale(ctx) || config.intervalMinutes <= 0) return;
-		if ((typeof ctx.isIdle === "function" && !ctx.isIdle()) || pendingLLMCall) {
+		if (pendingLLMCall) {
 			scheduleTimer(Math.min(30_000, intervalMs()));
 			return;
 		}
