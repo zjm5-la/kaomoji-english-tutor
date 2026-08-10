@@ -749,4 +749,30 @@ test("generated lesson items carry unique content fingerprints", { concurrency: 
 	}
 });
 
+test("word/phrase items link to a lexical sense; sentences do not", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-sense-faux" });
+	try {
+		registration.setResponses([fauxAssistantMessage(lessonResponse("senses"))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "sense-a" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const linked = db.prepare("SELECT COUNT(*) AS n FROM items WHERE type IN ('word','phrase') AND lexical_sense_id IS NOT NULL").get() as any;
+		const sentence = db.prepare("SELECT lexical_sense_id FROM items WHERE type='sentence'").get() as any;
+		const senses = db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as any;
+		const distinctFps = (db.prepare("SELECT COUNT(*) AS n FROM (SELECT DISTINCT sense_fingerprint FROM lexical_senses)").get() as any).n;
+		db.close();
+		assert.ok(Number(linked.n) >= 2, "word/phrase items linked to senses");
+		assert.equal(sentence.lexical_sense_id, null, "sentence has no sense");
+		assert.ok(Number(senses.n) >= 2, "distinct senses created");
+		assert.equal(Number(senses.n), distinctFps, "sense fingerprints are unique");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

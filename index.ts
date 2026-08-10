@@ -434,6 +434,28 @@ function contentFingerprint(type: string, text: string, meaning: string): string
 		.digest("hex");
 }
 
+/** Sense fingerprint: kind + normalized surface + part of speech + normalized meaning. */
+function senseFingerprint(kind: "word" | "phrase", surface: string, pos: string | null, meaning: string): string {
+	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+	return createHash("sha256")
+		.update(`${kind}\u0000${norm(surface)}\u0000${pos ?? ""}\u0000${norm(meaning)}`, "utf8")
+		.digest("hex");
+}
+
+/** Find or create a lexical_sense for a word/phrase item; sentences have no sense. */
+function ensureLexicalSense(db: DatabaseSync, type: string, text: string, meaning: string, now: Date): number | null {
+	if (type !== "word" && type !== "phrase") return null;
+	const kind = type as "word" | "phrase";
+	const fp = senseFingerprint(kind, text, null, meaning);
+	const existing = db.prepare("SELECT id FROM lexical_senses WHERE sense_fingerprint = ?").get(fp) as { id: number } | undefined;
+	if (existing) return existing.id;
+	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+	const result = db.prepare(
+		"INSERT INTO lexical_senses (kind, surface, normalized_surface, part_of_speech, meaning_zh, normalized_meaning, sense_fingerprint, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+	).run(kind, text, norm(text), meaning, norm(meaning), fp, now.toISOString());
+	return Number(result.lastInsertRowid);
+}
+
 function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
 	return db
 		.prepare("SELECT * FROM items WHERE due_at <= ? ORDER BY due_at ASC, id ASC LIMIT 1")
@@ -451,8 +473,9 @@ function insertItem(
 	now: Date,
 	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"] },
 ): number {
+	const senseId = ensureLexicalSense(db, type, text, meaning, now);
 	const result = db.prepare(
-		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	).run(
 		type,
 		text,
@@ -467,6 +490,7 @@ function insertItem(
 		extra?.chunks ? JSON.stringify(extra.chunks) : null,
 		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
 		contentFingerprint(type, text, meaning),
+		senseId,
 	);
 	return Number(result.lastInsertRowid);
 }
