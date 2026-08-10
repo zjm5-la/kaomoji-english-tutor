@@ -1119,4 +1119,82 @@ test("duplicate content fingerprint is rejected at commit", { concurrency: false
 	}
 });
 
+test("critic rejection prevents insertion", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-critic" });
+	const criticFail = JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "fact", description: "incorrect meaning" }], summary: "factual error" });
+	const notReady = JSON.stringify({ ready: false, reason: "cannot fix without more context" });
+	registration.setResponses([
+		fauxAssistantMessage(lessonResponse()),	// initial generation: ready
+		fauxAssistantMessage(criticFail),			// critic: reject
+		fauxAssistantMessage(notReady),				// revision generation: gives up -> break loop
+	]);
+	const { model, registry } = fauxModelRegistry(registration);
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const s = await makeSession({ model, modelRegistry: registry, sessionId: "critic" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = (db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n;
+		db.close();
+		assert.equal(count, 0, "critic rejection blocked the lesson from being inserted");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("claimDueItem surfaces a new card within the dailyNewLimit quota", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 2 });
+		const s = await makeSession({ sessionId: "quota" });
+		const today = new Date().toISOString();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind,introduced_at) VALUES('word','alpha','阿尔法',?,?,0,'planned',?)")
+			.run(today, new Date(0).toISOString(), today);
+		db.close();
+		await fake.fire();
+		assert.match(s.widget().join(" "), /alpha/, "new card surfaced within quota");
+		const ck = openTestDb();
+		const active = ck.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const item = ck.prepare("SELECT shown FROM items WHERE id=1").get() as any;
+		ck.close();
+		assert.equal(active.active_item_id, 1);
+		assert.equal(item.shown, 1, "surfaced card marked shown");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("claimDueItem blocks new cards once dailyNewLimit is reached", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const s = await makeSession({ sessionId: "quota-full" });
+		const today = new Date().toISOString();
+		const db = openTestDb();
+		// One planned card already counts against the quota of 1.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind,introduced_at) VALUES('word','beta','贝塔',?,?,0,'planned',?)")
+			.run(today, new Date(0).toISOString(), today);
+		// A second queued new card should not be surfaced.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind,introduced_at) VALUES('word','gamma','伽马',?,?,0,'planned',?)")
+			.run(today, new Date(0).toISOString(), today);
+		db.close();
+		await fake.fire();
+		const ck = openTestDb();
+		const active = ck.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const shown = ck.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1").get() as any;
+		ck.close();
+		assert.equal(active.active_item_id, null, "no new card surfaced once quota is full");
+		assert.equal(shown.n, 0, "neither queued card was marked shown");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
