@@ -11,6 +11,7 @@
   },
   "files": [
     "index.ts",
+    "jobs.ts",
     "README.md"
   ],
   "pi": {

@@ -7,6 +7,7 @@ import { FSRS, Rating, Card } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { reapExpiredJobs } from "./jobs.ts";
 
 // -- Configuration --------------------------------------------------------
 
@@ -2460,6 +2461,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (db) {
 			ensureCoordinator(new Date(), true);
 			touchClient(db, myId);
+			reapExpiredJobs(db, new Date());
 			// Rebuild the active global card so this session converges immediately.
 			if (activeItem(db)) {
 				renderGlobalCard(ctx);
