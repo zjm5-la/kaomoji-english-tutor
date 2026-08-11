@@ -134,7 +134,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 4;
+const SCHEMA_TARGET_VERSION = 5;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -307,6 +307,16 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	(db: DatabaseSync) => {
 		addColumnIfMissing(db, "runtime_state", "active_direction TEXT NOT NULL DEFAULT 'forward'");
 	},
+	// v5: persist progressive sentence-output cycles across sessions/reloads.
+	(db: DatabaseSync) => {
+		for (const col of [
+			"active_review_cycle_id TEXT",
+			"active_exercise_id INTEGER",
+			"active_cycle_outcome TEXT",
+			"active_retry_count INTEGER NOT NULL DEFAULT 0",
+			"active_assistance_level TEXT NOT NULL DEFAULT 'none'",
+		]) addColumnIfMissing(db, "runtime_state", col);
+	},
 ];
 
 function runMigrations(db: DatabaseSync): void {
@@ -389,6 +399,11 @@ function openDb(): DatabaseSync {
 			active_kind TEXT,
 			active_direction TEXT NOT NULL DEFAULT 'forward',
 			active_version INTEGER NOT NULL DEFAULT 0,
+			active_review_cycle_id TEXT,
+			active_exercise_id INTEGER,
+			active_cycle_outcome TEXT,
+			active_retry_count INTEGER NOT NULL DEFAULT 0,
+			active_assistance_level TEXT NOT NULL DEFAULT 'none',
 			next_check_at TEXT NOT NULL,
 			coordinator TEXT,
 			coordinator_until TEXT,
@@ -637,6 +652,11 @@ interface PendingAttempt {
 	startedAt: string;
 	verdict: "correct" | "partial" | "incorrect";
 	feedback: string;
+	reviewCycleId?: string;
+	exerciseId?: number;
+	kind?: string;
+	errorTags?: string[];
+	correctedAnswer?: string;
 }
 
 interface RuntimeState {
@@ -644,6 +664,11 @@ interface RuntimeState {
 	active_kind: "review" | "teach" | null;
 	active_direction: RecallDirection;
 	active_version: number;
+	active_review_cycle_id: string | null;
+	active_exercise_id: number | null;
+	active_cycle_outcome: "clean" | "again" | null;
+	active_retry_count: number;
+	active_assistance_level: AssistanceLevel;
 	next_check_at: string;
 	coordinator: string | null;
 	coordinator_until: string | null;
@@ -659,6 +684,11 @@ function defaultRuntimeState(): RuntimeState {
 		active_kind: null,
 		active_direction: "forward",
 		active_version: 0,
+		active_review_cycle_id: null,
+		active_exercise_id: null,
+		active_cycle_outcome: null,
+		active_retry_count: 0,
+		active_assistance_level: "none",
 		next_check_at: new Date(0).toISOString(),
 		coordinator: null,
 		coordinator_until: null,
@@ -680,6 +710,11 @@ function getRuntimeState(db: DatabaseSync): RuntimeState {
 		active_kind: row.active_kind as RuntimeState["active_kind"],
 		active_direction: row.active_direction === "reverse" ? "reverse" : "forward",
 		active_version: Number(row.active_version ?? 0),
+		active_review_cycle_id: row.active_review_cycle_id,
+		active_exercise_id: row.active_exercise_id == null ? null : Number(row.active_exercise_id),
+		active_cycle_outcome: row.active_cycle_outcome === "again" ? "again" : row.active_cycle_outcome === "clean" ? "clean" : null,
+		active_retry_count: Number(row.active_retry_count ?? 0),
+		active_assistance_level: row.active_assistance_level === "revealed" ? "revealed" : row.active_assistance_level === "hint" ? "hint" : "none",
 		next_check_at: row.next_check_at ?? "",
 		coordinator: row.coordinator,
 		coordinator_until: row.coordinator_until,
@@ -694,6 +729,11 @@ const RUNTIME_COLUMNS = new Set<keyof RuntimeState>([
 	"active_kind",
 	"active_direction",
 	"active_version",
+	"active_review_cycle_id",
+	"active_exercise_id",
+	"active_cycle_outcome",
+	"active_retry_count",
+	"active_assistance_level",
 	"next_check_at",
 	"coordinator",
 	"coordinator_until",
@@ -708,6 +748,28 @@ function setRuntimeState(db: DatabaseSync, patch: Partial<RuntimeState>) {
 	if (!entries.length) return;
 	const assignments = entries.map(([key]) => `${key} = ?`).join(", ");
 	db.prepare(`UPDATE runtime_state SET ${assignments} WHERE id = 1`).run(...entries.map(([, value]) => value));
+}
+
+const EMPTY_SENTENCE_CYCLE: Pick<RuntimeState,
+	"active_review_cycle_id" | "active_exercise_id" | "active_cycle_outcome" | "active_retry_count" | "active_assistance_level"
+> = {
+	active_review_cycle_id: null,
+	active_exercise_id: null,
+	active_cycle_outcome: null,
+	active_retry_count: 0,
+	active_assistance_level: "none",
+};
+
+/** Lazily attach an authoritative sentence-output cycle to the global card slot. */
+function ensureSentenceCycle(db: DatabaseSync, item: ItemRow, state: RuntimeState): RuntimeState {
+	if (item.type !== "sentence" || state.active_item_id !== item.id) return state;
+	const exercise = sentenceExercise(item);
+	if (!exercise) return state;
+	const exerciseId = ensureSentenceExercise(db, item, exercise);
+	db.prepare(
+		"UPDATE runtime_state SET active_direction = 'forward', active_review_cycle_id = COALESCE(active_review_cycle_id, ?), active_exercise_id = ?, active_cycle_outcome = COALESCE(active_cycle_outcome, 'clean'), active_retry_count = COALESCE(active_retry_count, 0), active_assistance_level = COALESCE(active_assistance_level, 'none') WHERE id = 1 AND active_item_id = ? AND active_version = ?",
+	).run(randomUUID(), exerciseId, item.id, state.active_version);
+	return getRuntimeState(db);
 }
 
 /** True when the global pacing window (next_check_at) has elapsed. */
@@ -1150,6 +1212,95 @@ async function evaluateAttempt(
 	}
 }
 
+interface SentenceEvaluation extends AnswerEvaluation {
+	available: boolean;
+	errorTags: string[];
+	correctedAnswer: string;
+}
+
+/** Semantic sentence-output evaluation. Provider failures leave the card pending with zero writes. */
+async function evaluateSentenceAttempt(
+	llm: PiSdkLlmClient,
+	ctx: ExtensionContext,
+	exercise: SentenceExerciseView,
+	answer: string,
+	resolved: { provider: string; model: string } | undefined,
+): Promise<SentenceEvaluation> {
+	const unavailable = (): SentenceEvaluation => ({
+		available: false,
+		verdict: "incorrect",
+		feedback: "",
+		errorTags: [],
+		correctedAnswer: "",
+	});
+	const normalize = (value: string) => value
+		.toLowerCase()
+		.replace(/[’]/g, "'")
+		.replace(/[^a-z0-9']+/g, " ")
+		.trim()
+		.replace(/\s+/g, " ");
+	const normalizedAnswer = normalize(answer);
+	if (
+		normalizedAnswer === normalize(exercise.expected) ||
+		(exercise.kind === "sentence_cloze" && normalizedAnswer === normalize(exercise.reference))
+	) {
+		return { available: true, verdict: "correct", feedback: "", errorTags: [], correctedAnswer: exercise.reference };
+	}
+	if (!resolved) return unavailable();
+	const task = exercise.kind === "sentence_cloze"
+		? [
+			"这是单词填空。学生可以只写缺失词，也可以写完整句子。",
+			`缺失词：${exercise.expected}`,
+			`填空句：${exercise.cloze}`,
+		]
+		: [
+			"这是开放式中文到英文产出。不要要求与参考句逐字相同。",
+			`中文意图：${exercise.chinese}`,
+			`参考表达：${exercise.reference}`,
+			...(exercise.focusExpression ? [`建议目标表达：${exercise.focusExpression}`] : []),
+		];
+	const prompt = [
+		"你是严格但鼓励性的英语写作导师。评价学生英文，只输出 JSON。",
+		...task,
+		`学生答案：${answer}`,
+		'输出：{"verdict":"correct|partial|incorrect","feedback":"一个最小中文修正","errorTags":["grammar|collocation|meaning|missing_target|word_order|spelling"],"correctedAnswer":"自然修正版"}',
+		"correct：语义满足中文意图且英文自然；自然变体应接受。",
+		"partial：意图基本正确，仅有一个或少量可修正问题。",
+		"incorrect：核心意思错误、无法理解、写成中文，或填空目标明显错误。",
+		"feedback 只指出当前最关键的一个问题，不要长篇讲解。",
+	].join("\n");
+	let text: string;
+	try {
+		text = await llm.complete(ctx, resolved, {
+			systemPrompt: "你是英语输出评价员，只输出严格 JSON。",
+			prompt,
+			maxTokens: 350,
+		});
+	} catch {
+		return unavailable();
+	}
+	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	const start = cleaned.indexOf("{");
+	const end = cleaned.lastIndexOf("}");
+	if (start < 0 || end <= start) return unavailable();
+	try {
+		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
+		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
+		const errorTags = Array.isArray(parsed.errorTags)
+			? parsed.errorTags.filter((tag): tag is string => typeof tag === "string").slice(0, 5)
+			: [];
+		return {
+			available: true,
+			verdict,
+			feedback: typeof parsed.feedback === "string" ? parsed.feedback : "",
+			errorTags,
+			correctedAnswer: typeof parsed.correctedAnswer === "string" ? parsed.correctedAnswer : exercise.reference,
+		};
+	} catch {
+		return unavailable();
+	}
+}
+
 async function generateReplacement(
 	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
@@ -1292,37 +1443,140 @@ function parseJsonCol<T>(raw: string | null): T | undefined {
 	}
 }
 
+interface SentenceExerciseView {
+	level: number;
+	kind: "sentence_cloze" | "sentence_production";
+	chinese: string;
+	reference: string;
+	expected: string;
+	focusExpression?: string;
+	cloze?: string;
+	hint: string;
+}
+
+const SENTENCE_STOP_WORDS = new Set([
+	"a", "an", "and", "are", "as", "at", "be", "because", "been", "before", "but", "by", "for", "from",
+	"has", "have", "he", "her", "his", "i", "in", "is", "it", "its", "of", "on", "or", "our", "she", "so",
+	"that", "the", "their", "them", "they", "this", "to", "was", "we", "were", "will", "with", "you", "your",
+]);
+
+function sentenceExercise(item: ItemRow, requestedLevel = item.progress): SentenceExerciseView | undefined {
+	const levels = parseJsonCol<string[]>(item.levels);
+	if (!levels?.length) return undefined;
+	const level = Math.max(0, Math.min(requestedLevel, levels.length - 1));
+	const reference = levels[level].trim();
+	const levelsCn = parseJsonCol<string[]>(item.levels_cn);
+	const chinese = levelsCn?.[level]?.trim() || item.meaning;
+	const words = [...reference.matchAll(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g)];
+	const keyWords = parseJsonCol<{ text: string; meaning: string }[]>(item.key_words) ?? [];
+	let focusMatch = words.find((match) => keyWords.some((key) => {
+		const word = match[0].toLowerCase();
+		const keyWord = key.text.toLowerCase();
+		return word === keyWord || word.startsWith(keyWord) || keyWord.startsWith(word);
+	}));
+	focusMatch ??= words
+		.filter((match) => !SENTENCE_STOP_WORDS.has(match[0].toLowerCase()))
+		.sort((a, b) => b[0].length - a[0].length)[0];
+	const focusExpression = focusMatch?.[0];
+	const firstLetterHint = (text: string) => text
+		.split(/(\s+)/)
+		.map((part) => /^[A-Za-z]/.test(part) ? part[0] + "_".repeat(Math.max(0, part.replace(/[^A-Za-z]/g, "").length - 1)) : part)
+		.join("");
+	if (level === 0 && focusMatch?.index != null) {
+		const start = focusMatch.index;
+		const cloze = reference.slice(0, start) + "____" + reference.slice(start + focusMatch[0].length);
+		return {
+			level,
+			kind: "sentence_cloze",
+			chinese,
+			reference,
+			expected: focusMatch[0],
+			focusExpression,
+			cloze,
+			hint: firstLetterHint(focusMatch[0]),
+		};
+	}
+	return {
+		level,
+		kind: "sentence_production",
+		chinese,
+		reference,
+		expected: reference,
+		focusExpression,
+		hint: firstLetterHint(reference),
+	};
+}
+
+function ensureSentenceExercise(db: DatabaseSync, item: ItemRow, exercise: SentenceExerciseView): number {
+	const fingerprint = createHash("sha256")
+		.update(`sentence-output\0${item.id}\0${item.content_version ?? 1}\0${exercise.level}\0${exercise.reference}`)
+		.digest("hex");
+	db.prepare(
+		"INSERT OR IGNORE INTO exercises (item_id, kind, schema_version, stage, content_fingerprint, prompt_json, answer_json, hints_json, rubric_json, quality_json, created_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, '{}', ?)",
+	).run(
+		item.id,
+		exercise.kind,
+		"L" + (exercise.level + 1),
+		fingerprint,
+		JSON.stringify({ chinese: exercise.chinese, cloze: exercise.cloze, focusExpression: exercise.focusExpression }),
+		JSON.stringify({ reference: exercise.reference, expected: exercise.expected }),
+		JSON.stringify([exercise.hint]),
+		JSON.stringify({ semanticMatch: exercise.kind === "sentence_production", requireNaturalEnglish: true }),
+		new Date().toISOString(),
+	);
+	const row = db.prepare("SELECT id FROM exercises WHERE content_fingerprint = ?").get(fingerprint) as { id: number };
+	return Number(row.id);
+}
+
+function insertEvaluatedAttempt(
+	db: DatabaseSync,
+	attempt: PendingAttempt,
+	explicitRating: "good" | "again" | null,
+	now: Date,
+): void {
+	const reviewCycleId = attempt.reviewCycleId ?? randomUUID();
+	const kind = attempt.kind ?? "recall";
+	const claimKey = attempt.reviewCycleId
+		? `${kind}:${reviewCycleId}:${attempt.version}`
+		: `recall:${attempt.itemId}:${randomUUID()}`;
+	const feedback = attempt.feedback || attempt.correctedAnswer
+		? JSON.stringify({ feedback: attempt.feedback, correctedAnswer: attempt.correctedAnswer })
+		: null;
+	db.prepare(
+		"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, error_tags_json, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+	).run(
+		randomUUID(), attempt.itemId, attempt.exerciseId ?? null, reviewCycleId, claimKey,
+		attempt.version, attempt.version, kind, attempt.answerText, attempt.assistanceLevel,
+		"evaluated", attempt.verdict, attempt.errorTags?.length ? JSON.stringify(attempt.errorTags) : null,
+		feedback, explicitRating, attempt.startedAt, now.toISOString(), explicitRating ? now.toISOString() : null,
+	);
+}
+
 /** Render a teach/review card as widget lines (front = question, back = answer). */
 function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward"): string[] {
 	const label = TYPE_LABELS[item.type] ?? item.type;
 	const lines: string[] = [];
 
-	// Sentence cards: progressive reading training
+	// Sentence cards use progressive written production rather than self-reported reading.
 	const levels = parseJsonCol<string[]>(item.levels);
 	if (item.type === "sentence" && levels && levels.length > 1) {
-		const level = Math.min(item.progress, levels.length - 1);
-		const levelsCn = parseJsonCol<string[]>(item.levels_cn);
+		const exercise = sentenceExercise(item);
+		if (!exercise) return lines;
 		const chunks = parseJsonCol<string[]>(item.chunks);
-		const keyWords = parseJsonCol<{ text: string; phonetic?: string; meaning: string }[]>(item.key_words);
-		lines.push(`${face} 句子训练（L${level + 1}/${levels.length}）：`);
-		lines.push(`  ${levels[level]}`);
-		// Front of a sentence card keeps the word hints (reading aid) but hides the translation
-		if (keyWords?.length) {
-			lines.push(`  📖 生词速查：${keyWords.map((k) => `${k.text} ${k.meaning}`).join(" · ")}`);
+		lines.push(`${face} 句子输出（L${exercise.level + 1}/${levels.length}）：`);
+		lines.push(`  中文：${exercise.chinese}`);
+		if (exercise.kind === "sentence_cloze") {
+			lines.push(`  填空：${exercise.cloze}`);
+			lines.push("  只需写出缺失的英文词，也可以写完整句子。");
+		} else {
+			lines.push("  请写出自然英文，不要求与参考句逐字一致。");
+			if (exercise.focusExpression) lines.push(`  尽量使用：${exercise.focusExpression}`);
 		}
 		if (showAnswer) {
-			if (level === levels.length - 1 && chunks?.length) {
-				lines.push(`  意群：${chunks.join(" / ")}`);
-			}
-			lines.push(`  翻译：${levelsCn?.[level] ?? item.meaning}`);
+			lines.push(`  参考：${exercise.reference}`);
+			if (exercise.level === levels.length - 1 && chunks?.length) lines.push(`  意群：${chunks.join(" / ")}`);
 		}
-		if (level === 0) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L2 · /kaomoji:again 忘了（下次从 L1）`);
-		} else if (level < levels.length - 1) {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 升到 L${level + 2} · /kaomoji:again 忘了（下次从 L1）`);
-		} else {
-			lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:good 完成并进入复习 · /kaomoji:again 忘了（下次从 L1）`);
-		}
+		lines.push("💬 /kaomoji:answer <英文> · /kaomoji:hint · /kaomoji:flip · /kaomoji:again");
 		return lines;
 	}
 
@@ -1595,17 +1849,18 @@ export default function kaomojiEnglishTutorExtension(
 	 */
 	function renderGlobalCard(ctx: ExtensionContext): boolean {
 		if (!db) return false;
-		const state = getRuntimeState(db);
-		const changed = state.active_version !== localVersion;
+		let state = getRuntimeState(db);
 		const item = activeItem(db);
+		if (item?.type === "sentence") state = ensureSentenceCycle(db, item, state);
+		const changed = state.active_version !== localVersion;
 		if (item && state.active_kind) {
 			const isReview = state.active_kind === "review";
 			pendingItemId = state.active_item_id;
 			pendingIsReview = isReview;
 			pendingDirection = state.active_direction;
 			if (changed) {
-				pendingFlipped = false;
-				pendingAssistance = "none";
+				pendingFlipped = item.type === "sentence" && state.active_assistance_level === "revealed";
+				pendingAssistance = item.type === "sentence" ? state.active_assistance_level : "none";
 			}
 			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped, pendingDirection);
 			lines.push(statsLine(db));
@@ -1779,12 +2034,13 @@ export default function kaomojiEnglishTutorExtension(
 					.run(now.toISOString(), due.id);
 				touchStreak(db, now);
 			}
-			const direction: RecallDirection = isReview && Math.random() >= 0.5 ? "reverse" : "forward";
+			const direction: RecallDirection = due.type !== "sentence" && isReview && Math.random() >= 0.5 ? "reverse" : "forward";
 			setRuntimeState(db, {
 				active_item_id: due.id,
 				active_kind: isReview ? "review" : "teach",
 				active_direction: direction,
 				active_version: state.active_version + 1,
+				...EMPTY_SENTENCE_CYCLE,
 				next_check_at: now.toISOString(),
 			});
 			db.exec("COMMIT");
@@ -1799,14 +2055,15 @@ export default function kaomojiEnglishTutorExtension(
 	/** Render an item only when it is still the authoritative global card. */
 	function showItem(ctx: ExtensionContext, item: ItemRow): boolean {
 		if (!db) return false;
-		const state = getRuntimeState(db);
+		let state = getRuntimeState(db);
 		if (state.active_item_id !== item.id || !state.active_kind) return false;
+		if (item.type === "sentence") state = ensureSentenceCycle(db, item, state);
 		const isReview = state.active_kind === "review";
 		pendingItemId = item.id;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
 		pendingDirection = state.active_direction;
-		pendingAssistance = "none";
+		pendingAssistance = item.type === "sentence" ? state.active_assistance_level : "none";
 		recordRendered(state);
 		const face = isReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, isReview, face, false, pendingDirection);
@@ -1829,15 +2086,24 @@ export default function kaomojiEnglishTutorExtension(
 	function flipPending(ctx: ExtensionContext): boolean {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
-		const state = getRuntimeState(db);
+		let state = getRuntimeState(db);
 		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
 			renderGlobalCard(ctx);
 			return true;
 		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
+		if (item.type === "sentence") state = ensureSentenceCycle(db, item, state);
 		pendingFlipped = !pendingFlipped;
-		if (pendingFlipped) pendingAssistance = "revealed";
+		if (pendingFlipped) {
+			pendingAssistance = "revealed";
+			if (item.type === "sentence") {
+				db.prepare("UPDATE runtime_state SET active_cycle_outcome = 'again', active_assistance_level = 'revealed', active_version = active_version + 1 WHERE id = 1 AND active_item_id = ? AND active_version = ?")
+					.run(item.id, state.active_version);
+				state = getRuntimeState(db);
+				recordRendered(state);
+			}
+		}
 		const face = pendingIsReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, pendingIsReview, face, pendingFlipped, pendingDirection);
 		lines.push(statsLine(db));
@@ -1845,7 +2111,119 @@ export default function kaomojiEnglishTutorExtension(
 		return true;
 	}
 
-	/** Active-recall answer for word/phrase cards. Empty text shows the prompt; non-empty is judged (exact match first, LLM evaluation on near-miss). */
+	/** Record a sentence miss without scheduling FSRS; the same level remains active for corrective output. */
+	function recordSentenceMiss(
+		ctx: ExtensionContext,
+		item: ItemRow,
+		attempt: PendingAttempt,
+		exercise: SentenceExerciseView,
+	): boolean {
+		if (!db || attempt.sessionGeneration !== sessionGeneration || !attempt.reviewCycleId) return true;
+		let applied = false;
+		let retryCount = 0;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			const current = db.prepare("SELECT progress FROM items WHERE id = ?").get(item.id) as { progress: number } | undefined;
+			if (
+				cur.active_item_id === item.id &&
+				cur.active_version === attempt.version &&
+				cur.active_review_cycle_id === attempt.reviewCycleId &&
+				cur.active_exercise_id === attempt.exerciseId &&
+				current?.progress === exercise.level
+			) {
+				insertEvaluatedAttempt(db, attempt, null, new Date());
+				retryCount = cur.active_retry_count + 1;
+				setRuntimeState(db, {
+					active_cycle_outcome: "again",
+					active_retry_count: retryCount,
+					active_assistance_level: retryCount >= 2 ? "revealed" : "hint",
+					active_version: cur.active_version + 1,
+				});
+				applied = true;
+			}
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[kaomoji-english-tutor] Sentence-attempt CAS failed: ${err}`);
+		}
+		if (!applied) {
+			renderGlobalCard(ctx);
+			return true;
+		}
+		const state = getRuntimeState(db);
+		const refreshed = db.prepare("SELECT * FROM items WHERE id = ?").get(item.id) as unknown as ItemRow;
+		pendingItemId = item.id;
+		pendingFlipped = retryCount >= 2;
+		pendingIsReview = state.active_kind === "review";
+		pendingDirection = "forward";
+		pendingAssistance = state.active_assistance_level;
+		recordRendered(state);
+		const lines = [
+			attempt.verdict === "partial"
+				? `△ 差一点：${attempt.feedback || "有一个小问题"}`
+				: `✗ 再试一次：${attempt.feedback || "意思或表达还不对"}`,
+		];
+		if (retryCount === 1) lines.push(`提示：${exercise.hint}`);
+		if (retryCount >= 2) lines.push(`参考：${attempt.correctedAnswer || exercise.reference}`);
+		lines.push(...renderCard(refreshed, pendingIsReview, FACES.error, pendingFlipped));
+		lines.push(statsLine(db));
+		updateWidget(ctx, FACES.error, lines);
+		return true;
+	}
+
+	/** Written sentence output with semantic evaluation and corrective retry. */
+	async function answerSentencePending(ctx: ExtensionContext, item: ItemRow, rawText: string, initialState: RuntimeState): Promise<boolean> {
+		if (!db) return false;
+		const state = ensureSentenceCycle(db, item, initialState);
+		const exercise = sentenceExercise(item);
+		if (!exercise || !state.active_review_cycle_id || state.active_exercise_id == null) return false;
+		const text = rawText.trim();
+		if (!text) {
+			const face = state.active_kind === "review" ? FACES.review : FACES.teach;
+			const lines = renderCard(item, state.active_kind === "review", face, false);
+			lines.push(statsLine(db));
+			updateWidget(ctx, face, lines);
+			return true;
+		}
+		const attemptBase = {
+			itemId: item.id,
+			version: state.active_version,
+			direction: "forward" as const,
+			sessionGeneration,
+			answerText: text,
+			assistanceLevel: state.active_assistance_level,
+			startedAt: new Date().toISOString(),
+			reviewCycleId: state.active_review_cycle_id,
+			exerciseId: state.active_exercise_id,
+			kind: exercise.kind,
+		};
+		const result = await evaluateSentenceAttempt(llm, ctx, exercise, text, resolveModel(ctx));
+		if (attemptBase.sessionGeneration !== sessionGeneration) return true;
+		if (!result.available) {
+			ctx.ui.notify("暂时无法可靠判断这个句子；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
+			return true;
+		}
+		const attempt: PendingAttempt = {
+			...attemptBase,
+			verdict: result.verdict,
+			feedback: result.feedback,
+			errorTags: result.errorTags,
+			correctedAnswer: result.correctedAnswer,
+		};
+		if (result.verdict !== "correct") return recordSentenceMiss(ctx, item, attempt, exercise);
+		const levels = parseJsonCol<string[]>(item.levels) ?? [];
+		const finalLevel = exercise.level >= levels.length - 1;
+		const cleanRecall = state.active_cycle_outcome === "clean" && state.active_retry_count === 0 && state.active_assistance_level === "none";
+		const rating = finalLevel && !cleanRecall ? Rating.Again : Rating.Good;
+		const note = finalLevel
+			? cleanRecall ? "✓ 独立写对了！" : "✓ 已改对；首次回忆有辅助或错误，本轮按 Again 调度。"
+			: `✓ L${exercise.level + 1} 写对了，进入 L${exercise.level + 2}。`;
+		ratePending(ctx, rating, note, attempt);
+		return true;
+	}
+
+	/** Active-recall answer for all cards. Exact matches stay local; semantic variants use the SDK evaluator. */
 	async function answerPending(ctx: ExtensionContext, rawText: string): Promise<boolean> {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
@@ -1860,10 +2238,7 @@ export default function kaomojiEnglishTutorExtension(
 		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
-		if (item.type === "sentence") {
-			ctx.ui.notify("句子卡用渐进训练，无需默写", "info");
-			return false;
-		}
+		if (item.type === "sentence") return answerSentencePending(ctx, item, rawText, state);
 		const text = rawText.trim();
 		if (!text) {
 			const promptText = pendingDirection === "reverse"
@@ -1926,17 +2301,29 @@ export default function kaomojiEnglishTutorExtension(
 		);
 	}
 
-	/** Show a direction-aware first-character hint for the active word/phrase card. */
+	/** Show a direction-aware hint and persist sentence assistance globally. */
 	function hintPending(ctx: ExtensionContext): boolean {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
-		const state = getRuntimeState(db);
+		let state = getRuntimeState(db);
 		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
 			renderGlobalCard(ctx);
 			return true;
 		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
-		if (!item || item.type === "sentence") return false;
+		if (!item) return false;
+		if (item.type === "sentence") {
+			state = ensureSentenceCycle(db, item, state);
+			const exercise = sentenceExercise(item);
+			if (!exercise) return false;
+			db.prepare("UPDATE runtime_state SET active_cycle_outcome = 'again', active_assistance_level = CASE WHEN active_assistance_level = 'revealed' THEN 'revealed' ELSE 'hint' END, active_version = active_version + 1 WHERE id = 1 AND active_item_id = ? AND active_version = ?")
+				.run(item.id, state.active_version);
+			state = getRuntimeState(db);
+			pendingAssistance = state.active_assistance_level;
+			recordRendered(state);
+			ctx.ui.notify(`提示：${exercise.hint}`, "info");
+			return true;
+		}
 		const hint = pendingDirection === "reverse"
 			? item.meaning.split(/([，,；;、/\s]+)/).map((part) => {
 				if (!part || /^[，,；;、/\s]+$/.test(part)) return part;
@@ -1954,13 +2341,17 @@ export default function kaomojiEnglishTutorExtension(
 	/** Show the sentence card at a given level (0-based). */
 	function showSentenceLevel(ctx: ExtensionContext, item: ItemRow, level: number) {
 		const shown = { ...item, progress: level } as ItemRow;
+		let state = getRuntimeState(db!);
+		state = ensureSentenceCycle(db!, shown, state);
 		pendingFlipped = false;
-		pendingIsReview = false;
+		pendingIsReview = state.active_kind === "review";
 		pendingDirection = "forward";
-		pendingAssistance = "none";
-		const lines = renderCard(shown, false, FACES.teach, false);
+		pendingAssistance = state.active_assistance_level;
+		recordRendered(state);
+		const face = pendingIsReview ? FACES.review : FACES.teach;
+		const lines = renderCard(shown, pendingIsReview, face, false);
 		lines.push(statsLine(db!));
-		updateWidget(ctx, FACES.teach, lines);
+		updateWidget(ctx, face, lines);
 	}
 
 	/** Rate the pending review card; returns true once an action was taken (or a stale action was safely refreshed). */
@@ -1973,7 +2364,7 @@ export default function kaomojiEnglishTutorExtension(
 		if (expectedItemId == null) return false;
 		const expectedVersion = attempt?.version ?? localVersion;
 		const expectedDirection = attempt?.direction ?? pendingDirection;
-		const assistanceLevel = attempt?.assistanceLevel ?? pendingAssistance;
+		let assistanceLevel = attempt?.assistanceLevel ?? pendingAssistance;
 
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(expectedItemId) as ItemRow | undefined;
 		if (!item || item.shown === 0) {
@@ -1987,7 +2378,11 @@ export default function kaomojiEnglishTutorExtension(
 
 		const now = new Date();
 		const levels = parseJsonCol<string[]>(item.levels);
-		const stateAtStart = getRuntimeState(db);
+		let stateAtStart = getRuntimeState(db);
+		if (item.type === "sentence") {
+			stateAtStart = ensureSentenceCycle(db, item, stateAtStart);
+			assistanceLevel = attempt?.assistanceLevel ?? stateAtStart.active_assistance_level;
+		}
 		// Bind the rating to the exact item/version/direction observed before any LLM await.
 		if (
 			stateAtStart.active_item_id !== item.id ||
@@ -2003,7 +2398,13 @@ export default function kaomojiEnglishTutorExtension(
 			return true;
 		}
 
-		// Good advances progressive sentence levels. Any Again immediately rates the whole card.
+		// A sentence Good must come from an evaluated written answer; manual Again remains an escape hatch.
+		if (item.type === "sentence" && rating === Rating.Good && !attempt) {
+			ctx.ui.notify("句子卡请先用 /kaomoji:answer <英文> 完成输出；也可以用 /kaomoji:again 结束本轮", "info");
+			return true;
+		}
+
+		// A correct written answer advances progressive levels. Manual Again rates the whole card immediately.
 		if (item.type === "sentence" && levels && levels.length > 1) {
 			const nextProgress = rating === Rating.Good && item.progress < levels.length - 1
 				? item.progress + 1
@@ -2018,13 +2419,24 @@ export default function kaomojiEnglishTutorExtension(
 						cur.active_item_id === item.id &&
 						cur.active_version === expectedVersion &&
 						cur.active_direction === expectedDirection &&
-						current?.progress === item.progress
+						current?.progress === item.progress &&
+						(!attempt || (
+							cur.active_review_cycle_id === attempt.reviewCycleId &&
+							cur.active_exercise_id === attempt.exerciseId
+						))
 					) {
+						if (attempt) insertEvaluatedAttempt(db, attempt, null, now);
 						db.prepare("UPDATE items SET progress = ?, due_at = ? WHERE id = ?").run(nextProgress, now.toISOString(), item.id);
+						const nextItem = { ...item, progress: nextProgress } as ItemRow;
+						const nextExercise = sentenceExercise(nextItem);
+						const nextExerciseId = nextExercise ? ensureSentenceExercise(db, nextItem, nextExercise) : null;
 						setRuntimeState(db, {
-							active_kind: "teach",
+							active_kind: cur.active_kind,
 							active_direction: "forward",
 							active_version: cur.active_version + 1,
+							active_exercise_id: nextExerciseId,
+							active_retry_count: 0,
+							active_assistance_level: "none",
 							next_check_at: now.toISOString(),
 						});
 						applied = true;
@@ -2048,7 +2460,6 @@ export default function kaomojiEnglishTutorExtension(
 				const refreshed = db.prepare("SELECT * FROM items WHERE id = ?").get(item.id) as unknown as ItemRow;
 				showSentenceLevel(ctx, refreshed, nextProgress);
 				pendingItemId = item.id;
-				pendingIsReview = false;
 				return true;
 			}
 			// Full-level Good and any Again hand over to FSRS.
@@ -2064,21 +2475,32 @@ export default function kaomojiEnglishTutorExtension(
 			if (
 				cur.active_item_id === item.id &&
 				cur.active_version === expectedVersion &&
-				cur.active_direction === expectedDirection
+				cur.active_direction === expectedDirection &&
+				(!attempt || item.type !== "sentence" || (
+					cur.active_review_cycle_id === attempt.reviewCycleId &&
+					cur.active_exercise_id === attempt.exerciseId
+				))
 			) {
 				if (item.type === "sentence" && rating === Rating.Again) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
 				if (attempt) {
-					ensureRecallExercise(item);
-					db.prepare(
-						"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-					).run(
-						randomUUID(), item.id, randomUUID(), "recall:" + item.id + ":" + randomUUID(),
-						expectedVersion, expectedVersion, "recall", attempt.answerText, attempt.assistanceLevel,
-						"evaluated", attempt.verdict, attempt.feedback ? JSON.stringify({ feedback: attempt.feedback }) : null,
-						rating === Rating.Good ? "good" : "again", attempt.startedAt, now.toISOString(), now.toISOString(),
-					);
+					if (item.type !== "sentence") ensureRecallExercise(item);
+					insertEvaluatedAttempt(db, attempt, rating === Rating.Good ? "good" : "again", now);
+				} else if (item.type === "sentence" && cur.active_review_cycle_id) {
+					const linked = db.prepare(
+						"UPDATE attempts SET explicit_rating = 'again', rated_at = ? WHERE id = (SELECT id FROM attempts WHERE review_cycle_id = ? AND explicit_rating IS NULL ORDER BY completed_at DESC, id DESC LIMIT 1)",
+					).run(now.toISOString(), cur.active_review_cycle_id);
+					if (Number(linked.changes) === 0) {
+						db.prepare(
+							"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, assistance_level, status, explicit_rating, started_at, completed_at, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sentence_self_report', ?, 'self_report', 'again', ?, ?, ?)",
+						).run(
+							randomUUID(), item.id, cur.active_exercise_id, cur.active_review_cycle_id,
+							"sentence_self_report:" + cur.active_review_cycle_id + ":" + expectedVersion,
+							expectedVersion, expectedVersion, cur.active_assistance_level,
+							now.toISOString(), now.toISOString(), now.toISOString(),
+						);
+					}
 				}
 				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
 				// Assisted Good still advances FSRS, but cannot create unassisted mastery evidence.
@@ -2095,12 +2517,13 @@ export default function kaomojiEnglishTutorExtension(
 				const stage = rating === Rating.Good && assisted
 					? prevStage
 					: computeMasteryStage(prevStage, newGood, rating === Rating.Again);
+				const exerciseKind = attempt?.kind ?? (item.type === "sentence" ? "sentence_self_report" : "recall");
 				if (m) {
-					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, assisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
-						.run(stage, newGood, newAssistedGood, newAgain, now.toISOString(), item.id);
+					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, assisted_good = ?, consecutive_again = ?, last_exercise_kind = ?, updated_at = ? WHERE item_id = ?")
+						.run(stage, newGood, newAssistedGood, newAgain, exerciseKind, now.toISOString(), item.id);
 				} else {
-					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, assisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, ?, ?, ?, ?, 'recall', ?)")
-						.run(item.id, stage, newGood, newAssistedGood, newAgain, now.toISOString());
+					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, assisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+						.run(item.id, stage, newGood, newAssistedGood, newAgain, exerciseKind, now.toISOString());
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
@@ -2113,6 +2536,7 @@ export default function kaomojiEnglishTutorExtension(
 					active_kind: null,
 					active_direction: "forward",
 					active_version: cur.active_version + 1,
+					...EMPTY_SENTENCE_CYCLE,
 					next_check_at: nextCheck,
 					coordinator: cur.coordinator,
 					coordinator_until: cur.coordinator_until,
@@ -2201,6 +2625,7 @@ export default function kaomojiEnglishTutorExtension(
 				active_kind: null,
 				active_direction: "forward",
 				active_version: cur.active_version + 1,
+				...EMPTY_SENTENCE_CYCLE,
 				next_check_at: new Date(now.getTime() + REPLACEMENT_GRACE_MS).toISOString(),
 				coordinator: myId,
 				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
@@ -2328,6 +2753,7 @@ export default function kaomojiEnglishTutorExtension(
 						active_kind: "teach",
 						active_direction: "forward",
 						active_version: state.active_version + 1,
+						...EMPTY_SENTENCE_CYCLE,
 						next_check_at: now.toISOString(),
 						generation_token: null,
 						generation_until: null,
@@ -2562,6 +2988,7 @@ export default function kaomojiEnglishTutorExtension(
 					active_kind: "teach",
 					active_direction: "forward",
 					active_version: state.active_version + 1,
+					...EMPTY_SENTENCE_CYCLE,
 					next_check_at: insertedAt.toISOString(),
 					generation_token: null,
 					generation_until: null,
@@ -2784,7 +3211,7 @@ export default function kaomojiEnglishTutorExtension(
 	});
 
 	pi.registerCommand("kaomoji:good", {
-		description: "Rate the pending review card as remembered (FSRS Good)",
+		description: "Rate a word/phrase as remembered; sentences require /kaomoji:answer",
 		handler: async (_args, ctx) => {
 			if (!ratePending(ctx, Rating.Good)) {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
@@ -2809,7 +3236,7 @@ export default function kaomojiEnglishTutorExtension(
 	});
 
 	pi.registerCommand("kaomoji:answer", {
-		description: "Submit an English or Chinese answer for bidirectional active recall",
+		description: "Submit bidirectional recall or progressive written sentence output",
 		handler: async (args, ctx) => {
 			const text = String(args ?? "").trim();
 			const ok = await answerPending(ctx, text);
@@ -2820,7 +3247,7 @@ export default function kaomojiEnglishTutorExtension(
 	});
 
 	pi.registerCommand("kaomoji:hint", {
-		description: "Show an English or Chinese initial-character hint for the current recall direction",
+		description: "Show a recall hint or the current sentence level's initial-letter hint",
 		handler: async (_args, ctx) => {
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
 		},

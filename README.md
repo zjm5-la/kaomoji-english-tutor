@@ -6,7 +6,7 @@
 
 ## 中文说明
 
-一只用颜文字当形象的英语小宠物，住在 pi 编辑器下方的 widget 里。它默默看着你的会话，根据你当前的工作主题教你英语——不用任何命令，一切自动发生。
+一只用颜文字当形象的英语小宠物，住在 pi 编辑器下方的 widget 里。它默默看着你的会话，根据当前工作主题自动备课并在到期时出卡；你通过简短命令完成回忆和英文输出。
 
 ```
 (=^･ω･^=) 单词：overfitting /ˌəʊ.vəˈfɪt.ɪŋ/
@@ -20,11 +20,11 @@
 - **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句
 - **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具
-- **渐进长句**：同一张句子卡按 L1 主干 → L2 扩展 → L3 完整长句训练，配有逐级翻译、意群切分和独立生词卡
-- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；`/kaomoji:answer` 答对自动 Good、答错或部分正确自动 Again，手动 Good/Again/Skip 仍可用；展示卡片本身不会评分
-- **卡片交互**：复习卡随机进行中→英或英→中回忆；`/kaomoji:answer` 判题并自动评分，`/kaomoji:hint`/`flip` 会记录辅助程度（辅助后答对仍为 FSRS Good，但不计无辅助掌握证据）；命令不进入会话历史
-- **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
-- **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡及回忆方向；任一会话完成评分后，其他会话会自动同步，翻面和提示状态仍各自独立
+- **渐进句子输出**：同一张句子卡从 L1 单词填空 → L2 主干英文 → L3 完整自然表达；每级都用 `/kaomoji:answer` 真正输入英文，标准句只是参考，不要求逐字复刻
+- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；单词/词组答对自动 Good、答错或部分正确自动 Again；句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again
+- **卡片交互**：单词/词组复习随机进行中→英或英→中回忆；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度
+- **持久化**：学习记录、句子输出 cycle、重试和辅助状态存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
+- **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；句子级别、纠错、提示、翻面及首次回忆结果也会跨会话/reload 恢复，任一会话提交后其他会话自动同步
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
 
 ### 安装
@@ -51,12 +51,12 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:thinking <等级>` | 设置备课思考等级：`off` 到 `max` |
 | `/kaomoji:interval <分钟\|off>` | 设置自动检查间隔，或关闭自动检查 |
 | `/kaomoji:flip` | 在问题面和答案面之间切换 |
-| `/kaomoji:answer <答案>` | 双向回忆：提交英文或中文答案；系统判定并自动按 Good/Again 调度 |
-| `/kaomoji:hint` | 按当前回忆方向显示英文或中文首字提示 |
+| `/kaomoji:answer <答案>` | 单词/词组双向回忆，或提交句子渐进输出；系统本地匹配或调用 SDK LLM 判定 |
+| `/kaomoji:hint` | 显示当前单词/词组回忆提示，或句子当前级别的英文首字提示 |
 | `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率 |
 | `/kaomoji:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
-| `/kaomoji:good` | 评分为记得；长句训练中升级 |
-| `/kaomoji:again` | 评分为忘了；长句在任意 L1/L2/L3 阶段一次进入 FSRS Again，下次从 L1 开始 |
+| `/kaomoji:good` | 手动评分为记得；句子卡不能跳过真实输出 |
+| `/kaomoji:again` | 手动评分为忘了；句子在任意级别都可结束本轮并从 L1 重新调度 |
 | `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
 
 设置后立即生效并持久化到 `~/.pi/agent/kaomoji-english-tutor.json`。如果项目配置包含同名字段，reload 后仍以项目配置为准。
@@ -102,18 +102,18 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 
 ## English
 
-A kaomoji pet that lives in a widget below the editor and teaches you English based on your conversation topic — fully automatic, no commands needed.
+A kaomoji pet that lives in a widget below the editor, prepares lessons from your conversation topic, and surfaces due cards automatically; short commands handle recall and written output.
 
 ### How it works
 
 - **Time-triggered**: checks lesson/readiness state every 10 minutes by default; when another stored card is ready, rating immediately surfaces it Anki-style with no forced inter-card delay
 - **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence
 - **Unified Pi SDK transport**: lesson generation, independent critique, revision, replacements, sentence-data completion, and answer evaluation all run through isolated in-memory Pi SDK sessions with no discovered extensions, skills, project context, or file tools
-- **Progressive sentences**: one sentence card advances from L1 core clause to L2 expansion and L3 full sentence, with per-level translations, chunks, and companion word cards
-- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); `/kaomoji:answer` auto-rates correct as Good and partial/incorrect as Again, while manual Good/Again/Skip remain available; displaying alone never rates
-- **Card interaction**: review direction is randomized Chinese→English or English→Chinese; `/kaomoji:answer` judges and auto-rates. Hint/flip assistance is recorded; an assisted correct answer still gets FSRS Good but adds no unassisted mastery evidence
-- **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
-- **Multi-session consistency**: concurrent Pi sessions share one current card and recall direction; rating it in any session synchronizes the others, while flip/hint state remains local
+- **Progressive sentence output**: one sentence moves from an L1 word cloze to L2 core-clause writing and L3 natural full-sentence production; every level requires `/kaomoji:answer`, and the reference is not treated as the only valid wording
+- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase answers auto-rate immediately; a sentence allows corrective retries but commits one Good/Again based on the first-recall path
+- **Card interaction**: word/phrase direction is randomized Chinese→English or English→Chinese. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again
+- **Persistent**: learning history, sentence cycles, retries, and assistance live in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
+- **Multi-session consistency**: concurrent Pi sessions share one current card; sentence level, correction, hint/reveal state, and first-recall outcome survive session changes/reload and synchronize automatically
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`
 
 ### Install
@@ -140,12 +140,12 @@ Or add to `settings.json`:
 | `/kaomoji:thinking <level>` | Set lesson reasoning level (`off` through `max`) |
 | `/kaomoji:interval <minutes\|off>` | Set or disable automatic checks |
 | `/kaomoji:flip` | Toggle question and answer sides |
-| `/kaomoji:answer <answer>` | Bidirectional recall: submit English or Chinese; judged and auto-rated Good/Again |
-| `/kaomoji:hint` | Show an English or Chinese initial-character hint for the current direction |
+| `/kaomoji:answer <answer>` | Submit bidirectional word/phrase recall or progressive written sentence output; checked locally or by the SDK evaluator |
+| `/kaomoji:hint` | Show the current word/phrase recall hint or the sentence level's initial-letter hint |
 | `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, and answer accuracy |
 | `/kaomoji:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
-| `/kaomoji:good` | Remember; advances progressive sentences |
-| `/kaomoji:again` | Forget; one press schedules FSRS Again from any sentence level, resetting the next attempt to L1 |
+| `/kaomoji:good` | Manually rate remembered; cannot bypass required sentence output |
+| `/kaomoji:again` | Manually rate forgotten; from any sentence level, end the cycle and schedule the next attempt from L1 |
 | `/kaomoji:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |
 
 Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`. If project config defines the same field, the project value wins after reload.

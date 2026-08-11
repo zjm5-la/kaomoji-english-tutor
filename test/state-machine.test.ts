@@ -182,53 +182,202 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 	}
 });
 
-test("progressive sentence Good touches FSRS only after the full level", { concurrency: false }, async () => {
+test("progressive sentence requires written output and touches FSRS only after L3", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		for (const action of ["good", "good"] as const) {
-			await harness.commands[`kaomoji:${action}`].handler("", harness.ctx);
-		}
-		let check = openTestDb();
-		let row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
-		check.close();
-		assert.deepEqual({ ...row }, { progress: 2, reviews: 0, fsrs_state: "" });
+		assert.match(harness.widget().join(" "), /句子输出（L1\/3）/);
 		await harness.commands["kaomoji:good"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /再见这个句子/, "completed sentence uses a sentence-specific FSRS message");
+		let check = openTestDb();
+		let row = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...row }, { progress: 0, reviews: 0 }, "manual Good cannot bypass sentence output");
+
+		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...row }, { progress: 2, reviews: 0, fsrs_state: "" });
+
+		await harness.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
+		assert.match(harness.widget().join(" "), /独立写对了/);
+		check = openTestDb();
+		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=1").get() as any).n);
 		check.close();
 		assert.equal(row.progress, 2);
 		assert.equal(row.reviews, 1);
 		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
+		assert.equal(attempts, 3);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
 	}
 });
 
-test("one Again rates a progressive sentence and resets it to L1", { concurrency: false }, async () => {
+test("manual Again ends sentence output once and resets it to L1", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
 		assert.match(harness.widget().join(" "), /L3\/3/);
 
 		await harness.commands["kaomoji:again"].handler("", harness.ctx);
 
 		const check = openTestDb();
 		const row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
-		const runtime = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const runtime = check.prepare("SELECT active_item_id,active_review_cycle_id FROM runtime_state WHERE id=1").get() as any;
 		check.close();
 		assert.equal(row.progress, 0);
 		assert.equal(row.reviews, 1);
 		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
 		assert.equal(runtime.active_item_id, null);
+		assert.equal(runtime.active_review_cycle_id, null);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("sentence correction retries stay on the level and final FSRS uses the first recall", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-sentence-eval-faux" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				verdict: "partial",
+				feedback: "主谓一致需要 clears",
+				errorTags: ["grammar"],
+				correctedAnswer: "The extension clears resources during shutdown.",
+			})),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "sentence-retry" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("The extension clear resources during shutdown.", harness.ctx);
+		assert.match(harness.widget().join(" "), /差一点.*主谓一致/);
+
+		let check = openTestDb();
+		let state = check.prepare("SELECT active_cycle_outcome,active_retry_count,active_assistance_level FROM runtime_state WHERE id=1").get() as any;
+		let row = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...row }, { progress: 1, reviews: 0 });
+		assert.deepEqual({ ...state }, { active_cycle_outcome: "again", active_retry_count: 1, active_assistance_level: "hint" });
+
+		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
+		assert.match(harness.widget().join(" "), /首次回忆有辅助或错误/);
+		check = openTestDb();
+		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const attempts = check.prepare("SELECT verdict,explicit_rating,assistance_level,error_tags_json FROM attempts WHERE item_id=1 ORDER BY started_at,id").all() as any[];
+		state = check.prepare("SELECT active_item_id,active_review_cycle_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(row.progress, 0);
+		assert.equal(row.reviews, 1);
+		assert.equal(JSON.parse(row.fsrs_state).reps, 1);
+		assert.equal(attempts.length, 4);
+		assert.equal(attempts.filter((attempt) => attempt.explicit_rating === "again").length, 1);
+		assert.ok(attempts.some((attempt) => attempt.verdict === "partial" && /grammar/.test(attempt.error_tags_json)));
+		assert.deepEqual({ ...state }, { active_item_id: null, active_review_cycle_id: null });
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("a natural L3 variant accepted by the SDK evaluator completes as Good", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-sentence-variant-faux" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				verdict: "correct",
+				feedback: "表达自然",
+				errorTags: [],
+				correctedAnswer: "Since it owns the runtime, the extension cleans up during shutdown so callbacks are not registered twice.",
+			})),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "sentence-variant" });
+		const db = openTestDb();
+		insertSentence(db);
+		db.prepare("UPDATE items SET progress=2, shown=1 WHERE id=1").run();
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("Since it owns the runtime, the extension cleans up during shutdown so callbacks aren't registered twice.", harness.ctx);
+		const check = openTestDb();
+		const item = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
+		const attempt = check.prepare("SELECT verdict,explicit_rating,kind FROM attempts WHERE item_id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...item }, { progress: 2, reviews: 1 });
+		assert.deepEqual({ ...attempt }, { verdict: "correct", explicit_rating: "good", kind: "sentence_production" });
+		assert.equal(registration.state.callCount, 1);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("sentence hint survives reattachment and prevents a clean Good", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ sessionId: "sentence-hint-a" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await a.commands["kaomoji:hint"].handler("", a.ctx);
+		const before = openTestDb();
+		const cycleId = String((before.prepare("SELECT active_review_cycle_id FROM runtime_state WHERE id=1").get() as any).active_review_cycle_id);
+		before.close();
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+
+		const b = await makeSession({ sessionId: "sentence-hint-b" });
+		await b.commands["kaomoji:answer"].handler("extension", b.ctx);
+		await b.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", b.ctx);
+		await b.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", b.ctx);
+		const check = openTestDb();
+		const rated = check.prepare("SELECT explicit_rating FROM attempts WHERE review_cycle_id=? AND explicit_rating IS NOT NULL").get(cycleId) as any;
+		const mastery = check.prepare("SELECT unassisted_good,consecutive_again FROM mastery_state WHERE item_id=1").get() as any;
+		check.close();
+		assert.equal(rated.explicit_rating, "again");
+		assert.deepEqual({ ...mastery }, { unassisted_good: 0, consecutive_again: 1 });
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("sentence evaluator unavailability keeps the card pending with zero attempt writes", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		const before = openTestDb();
+		const version = Number((before.prepare("SELECT active_version FROM runtime_state WHERE id=1").get() as any).active_version);
+		before.close();
+		await harness.commands["kaomoji:answer"].handler("wrong", harness.ctx);
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_item_id,active_version FROM runtime_state WHERE id=1").get() as any;
+		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
+		const reviews = Number((check.prepare("SELECT reviews FROM items WHERE id=1").get() as any).reviews);
+		check.close();
+		assert.deepEqual({ ...state }, { active_item_id: 1, active_version: version });
+		assert.equal(attempts, 0);
+		assert.equal(reviews, 0);
+		assert.ok(harness.notifications().some((message) => /没有记录成绩/.test(message)));
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -491,8 +640,8 @@ test("stale cross-session sentence and Skip actions apply exactly once", { concu
 		db.close();
 		await fake.fire();
 		await fake.fire();
-		await a.commands["kaomoji:good"].handler("", a.ctx);
-		await b.commands["kaomoji:good"].handler("", b.ctx);
+		await a.commands["kaomoji:answer"].handler("extension", a.ctx);
+		await b.commands["kaomoji:answer"].handler("extension", b.ctx);
 		db = openTestDb();
 		const sentence = db.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
 		db.close();
@@ -645,15 +794,17 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const runtimeCols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 4, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4]);
+			assert.deepEqual({ ...meta }, { schema_version: 5, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
 			for (const c of ["lesson_id","lexical_sense_id","role","content_fingerprint","content_version","introduced_at","introduction_kind","introduction_accuracy","content_status","legacy_duplicate_of","fsrs_status","fsrs_error","fsrs_corrupt_at"]) {
 				assert.ok(itemCols.includes(c), `items.${c} exists`);
 			}
-			assert.ok(runtimeCols.includes("active_direction"), "runtime_state.active_direction exists");
+			for (const c of ["active_direction", "active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
+				assert.ok(runtimeCols.includes(c), `runtime_state.${c} exists`);
+			}
 			assert.ok(idxNames.includes("items_content_fingerprint_uq"), "fingerprint unique index exists");
 		};
 		checkSchema();
@@ -667,6 +818,37 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 		assert.equal(client.protocol_version, 1);
 		assert.ok(client.last_seen);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("v5 upgrades an existing v4 database without losing cards", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const first = await createHarness({ sessionId: "migration-v4-source" });
+		await first.handlers.session_shutdown({ reason: "quit" }, first.ctx);
+		let db = openTestDb();
+		insertDueWord(db, "preserved", "保留");
+		for (const column of ["active_assistance_level", "active_retry_count", "active_cycle_outcome", "active_exercise_id", "active_review_cycle_id"]) {
+			db.exec(`ALTER TABLE runtime_state DROP COLUMN ${column}`);
+		}
+		db.prepare("DELETE FROM schema_migrations WHERE version = 5").run();
+		db.prepare("UPDATE schema_meta SET schema_version = 4 WHERE id = 1").run();
+		db.close();
+
+		const upgraded = await makeSession({ sessionId: "migration-v5-target" });
+		db = openTestDb();
+		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
+		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
+		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
+		db.close();
+		assert.equal(meta.schema_version, 5);
+		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
+			assert.ok(cols.includes(column), `${column} migrated`);
+		}
+		assert.deepEqual({ ...card }, { text: "preserved", meaning: "保留" });
+		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
 	}
@@ -1014,7 +1196,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 4, "schema migrated to v4");
+	assert.equal(meta.schema_version, 5, "schema migrated to v5");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -1346,6 +1528,95 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		assert.deepEqual(items.map((row) => ({ ...row })), [{ text: "alpha", reviews: 1 }, { text: "beta", reviews: 0 }]);
 		assert.equal(attemptCount, 0, "stale LLM result writes no attempt");
 		assert.equal(active.active_item_id, 2, "beta remains the active card");
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		releaseResponse?.();
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("stale sentence evaluator result writes no retry or rating after another session ends the cycle", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-stale-sentence-eval" });
+	let releaseResponse!: () => void;
+	let responseStarted!: () => void;
+	const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { responseStarted = resolve; });
+	try {
+		registration.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "自然变体", correctedAnswer: "extension" }));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ model, modelRegistry: registry, sessionId: "stale-sentence-a" });
+		const b = await makeSession({ model, modelRegistry: registry, sessionId: "stale-sentence-b" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await fake.fire();
+		const inFlight = a.commands["kaomoji:answer"].handler("extensio", a.ctx);
+		await started;
+		await b.commands["kaomoji:again"].handler("", b.ctx);
+		releaseResponse();
+		await inFlight;
+		const check = openTestDb();
+		const item = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
+		const attempts = check.prepare("SELECT kind,explicit_rating FROM attempts").all() as any[];
+		const state = check.prepare("SELECT active_item_id,active_review_cycle_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...item }, { progress: 0, reviews: 1 });
+		assert.deepEqual(attempts.map((attempt) => ({ ...attempt })), [{ kind: "sentence_self_report", explicit_rating: "again" }]);
+		assert.deepEqual({ ...state }, { active_item_id: null, active_review_cycle_id: null });
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		releaseResponse?.();
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("a sentence hint invalidates an in-flight clean evaluation", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-hint-race-eval" });
+	let releaseResponse!: () => void;
+	let responseStarted!: () => void;
+	const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { responseStarted = resolve; });
+	try {
+		registration.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "可接受", correctedAnswer: "extension" }));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ model, modelRegistry: registry, sessionId: "hint-race-a" });
+		const b = await makeSession({ model, modelRegistry: registry, sessionId: "hint-race-b" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await fake.fire();
+		const inFlight = a.commands["kaomoji:answer"].handler("extensio", a.ctx);
+		await started;
+		await b.commands["kaomoji:hint"].handler("", b.ctx);
+		releaseResponse();
+		await inFlight;
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_item_id,active_cycle_outcome,active_assistance_level FROM runtime_state WHERE id=1").get() as any;
+		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
+		const item = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...state }, { active_item_id: 1, active_cycle_outcome: "again", active_assistance_level: "hint" });
+		assert.deepEqual({ ...item }, { progress: 0, reviews: 0 });
+		assert.equal(attempts, 0);
+		await b.commands["kaomoji:again"].handler("", b.ctx);
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 	} finally {

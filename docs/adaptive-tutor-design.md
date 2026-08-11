@@ -58,7 +58,7 @@
 - 复习至少覆盖识别、受控回忆、主动产出和迁移四种能力。
 - 收集真实答案并提供及时、具体、可执行的反馈。
 - 连续 Again 后生成新的解释、对比或语境练习，而不是复制卡片。
-- 渐进句子在任意 L1/L2/L3 阶段一次 Again 即完成 FSRS Again、结束当前卡并把下次训练重置到 L1；不得要求逐级连按 Again。
+- 渐进句子要求真实英文输出：L1 单词填空、L2 主干产出、L3 完整自然表达；错误后原级纠正并立即重写，整轮只提交一次 FSRS。
 - 保留 FSRS 和显式评分语义。
 - 保留全局单一卡槽和跨会话“至多一次”行为。
 - 所有 LLM 结果必须经过结构、确定性约束和语义质量门后才能持久化。
@@ -71,7 +71,7 @@
 - 不让 LLM 决定 SQLite 事务、FSRS 到期时间或评分是否生效。
 - 不把扩展变成通用聊天机器人或完整考试认证系统。
 - 第一阶段不加入语音识别、发音评分或多人学习账户。
-- 不要求用户每次都输入答案；Good/Again 保留为低摩擦、自评兜底。
+- 单词/词组仍允许 Good/Again 自评兜底；句子训练不允许用 Good 跳过真实输出，但始终允许 Again 结束本轮。
 
 ## 4. 设计原则
 
@@ -283,7 +283,9 @@ FSRS 决定**何时出现**；掌握阶段和 facet 证据决定**出现时练�
 
 Again 的确定性降阶为：exposure/recognition → recognition，controlled recall → recognition，production → controlled recall，transfer → production。assisted success、partial/incorrect 后 Good 都会清零当前阶段的 unassisted streak；`cannot_judge` 不改变 streak；Skip 结束 stage 选择。wrong-sense 错误或新建 distinct sense 设置 `contrast_pending=1`；一次无提示 contrast 正确+Good 才清除并回到 base stage，Again 保持 contrast pending 且按上表降低 base stage。contrast evidence 同时关联两个 sense，但每个 review cycle 仍只计一次。
 
-现有 progressive sentence 的 L1/L2/L3 progress 仍保持专门状态机：中间级 Good 只升一级，完整级 Good 才进入 FSRS；任意级别 Again 都在一个 CAS 事务中立即执行一次 FSRS Again、把 progress 重置为 L1 并释放全局卡槽。一次命令只能计一次 review，不能逐级退回或要求连续点击。Good 的中间级切换增加 active version，但不伪造新的 scheduled review cycle。提示或翻面后的成功统一记为 assisted。
+Progressive sentence 保持一个跨 L1/L2/L3 的持久化 `review_cycle_id`。L1 使用单词 cloze 降低首次输出门槛，L2 根据中文主干写英文，L3 根据完整中文意图产出自然句子；参考句是语义锚点而非唯一合法字符串。每级都通过 `/kaomoji:answer` 作答，精确匹配本地通过，自然变体交给隔离 SDK evaluator 按语义、语法和搭配判断。
+
+中间级正确只推进 progress、增加 active version 并记录 attempt，不修改 FSRS。partial/incorrect 记录本次 attempt、把 cycle outcome 固定为 Again、增加 retry count，并停留原级给出一个最小修正；第二次失败可展示参考表达。纠正成功后继续训练，但最终 L3 完成时仍按首次回忆路径提交 Again。只有整轮所有首次作答均无辅助正确，L3 才提交 Good。hint/flip 同样把 cycle outcome 固定为 Again；手动 Again 可随时结束，手动 Good 不能跳过句子输出。最终进级/attempt/FSRS/mastery/清槽必须在同一 CAS 事务中完成，一轮至多一次 scheduled review。
 
 ### 6.3 教学规划模式
 
@@ -535,13 +537,7 @@ critic 优先使用与 generator 不同、且彼此不同的已认证提供商�
 
 ### 8.3 评分边界
 
-评价结果只形成推荐：
-
-- correct → 推荐 Good；
-- partial → 推荐用户按主观稳定程度决定；
-- incorrect → 推荐 Again。
-
-只有用户执行 `/kaomoji:good`、`/kaomoji:again` 或 `/kaomoji:skip` 才修改 FSRS、句子进度和统计。评分事务同时把显式 rating 关联到最近 attempt；直接评分则创建 `self_report` 记录。
+单词/词组评价自动驱动评分：correct → Good，partial/incorrect → Again。句子评价则先驱动级别和纠错状态：correct 推进当前级；partial/incorrect 保持原级重写并把本 cycle 的最终评分固定为 Again；完整 L3 后才原子提交一次 FSRS。模型不可用或输出无法解析时保持当前卡 pending，不写 attempt、progress、FSRS 或 mastery，允许稍后重试或手动 Again。手动 Good/Again 继续作为单词/词组自评入口，句子只保留手动 Again 逃生口。
 
 ### 8.4 强化生成
 
@@ -987,8 +983,9 @@ FEEDBACK
 - 质量门失败不写入任何部分课程；
 - planned `dailyNewLimit` 按首次展示严格执行；同一事务下两个 ready job 只能提交一个，隐藏 queued-new 阻止继续生成；replacement 明确额度外、单独计数并优先展示；
 - 旧卡迁移不改变 FSRS、due、reviews 和 progress；损坏的 `fsrs_state` 被保留并阻止评分，而不是重置为新卡；
-- `/answer` 的 correct 自动提交 FSRS Good，partial/incorrect 自动提交 Again；显示题面本身不修改 FSRS；
-- Good/Again/Skip 仍全局至多一次；渐进句子从 L1/L2/L3 任一级一次 Again 都只写一次 FSRS、重置到 L1 并释放卡槽；
+- 单词/词组 `/answer` 的 correct 自动提交 FSRS Good，partial/incorrect 自动提交 Again；显示题面本身不修改 FSRS；
+- 句子 L1/L2 正确只推进级别；L3 clean correct 提交 Good；任一级首次 partial/incorrect 或使用 hint/flip 后，即使纠正并完成 L3 也只提交一次 Again；
+- 句子错误后同级重写期间不提前修改 FSRS，manual Again 可一次结束并重置到 L1，manual Good 不得绕过输出；
 - 两会话同时 answer 时，只有绑定当前 item/version/direction 的结果可在同一事务写 attempt 并评分；
 - 评分发生在评价期间时，旧评价结果零写入并被丢弃；
 - evaluator 崩溃后租约可恢复；
