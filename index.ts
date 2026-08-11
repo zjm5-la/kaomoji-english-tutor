@@ -2061,7 +2061,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 		// Full rating: one-shot, atomic, applies at most once globally.
 		const next = scheduleNext(item.fsrs_state, now, rating);
-		const nextCheck = new Date(now.getTime() + intervalMs()).toISOString();
+		const nextCheck = now.toISOString(); // Anki-style: let the next card surface immediately
 		let applied = false;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -2132,6 +2132,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			lines.push(statsLine(db));
 			updateWidget(ctx, FACES.error, lines);
 		}
+		// Anki-style: surface the next card immediately if one is available.
+		scheduleTimer(0);
 		return true;
 	}
 

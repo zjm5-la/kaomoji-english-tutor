@@ -426,8 +426,9 @@ test("session B auto-refreshes when session A rates the shared card", { concurre
 		// B's poll notices the data_version change and drops the pending card.
 		await fake.firePoll();
 		assert.doesNotMatch(b.widget().join(" "), /timer/);
-		assert.equal(fake.active().length, 2);
-		assert.ok(fake.active().every((timer) => timer.delay > 500_000));
+		// Anki-style rating schedules an immediate next-card work timer, so assert
+		// the cross-session poll timers are intact instead of long work-timer delays.
+		assert.equal(fake.poll().length, 2);
 
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
@@ -1223,6 +1224,28 @@ test("active recall: reverse direction asks for the Chinese meaning", { concurre
 		assert.equal(att.verdict, "correct");
 		assert.equal(att.answer_text, "你好");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("Anki-style: rating immediately surfaces the next due card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ sessionId: "anki" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','alpha','阿尔法',?,?,1)").run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
+		db.close();
+		await fake.fire(); // surface first due card
+		assert.match(a.widget().join(" "), /阿尔法|贝塔/, "first card shown");
+		await a.commands["kaomoji:good"].handler("", a.ctx); // rate -> scheduleTimer(0)
+		await fake.fire(); // immediate next-card tick
+		const w = a.widget().join(" ");
+		assert.ok(/阿尔法|贝塔/.test(w), "next due card surfaced without waiting");
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 	} finally {
 		fake.restore();
 	}
