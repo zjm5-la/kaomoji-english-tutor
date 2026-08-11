@@ -133,7 +133,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 3;
+const SCHEMA_TARGET_VERSION = 4;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -302,6 +302,10 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 		}
 		db.exec("CREATE UNIQUE INDEX IF NOT EXISTS items_content_fingerprint_uq ON items(content_fingerprint) WHERE content_fingerprint IS NOT NULL");
 	},
+	// v4: persist the active recall direction with the global card slot.
+	(db: DatabaseSync) => {
+		addColumnIfMissing(db, "runtime_state", "active_direction TEXT NOT NULL DEFAULT 'forward'");
+	},
 ];
 
 function runMigrations(db: DatabaseSync): void {
@@ -328,6 +332,11 @@ function runMigrations(db: DatabaseSync): void {
 		if (!step) continue;
 		db.exec("BEGIN IMMEDIATE");
 		try {
+			// Another process may have committed this migration while BEGIN waited.
+			if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(v)) {
+				db.exec("COMMIT");
+				continue;
+			}
 			step(db);
 			db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 				.run(v, new Date().toISOString());
@@ -376,6 +385,7 @@ function openDb(): DatabaseSync {
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			active_item_id INTEGER,
 			active_kind TEXT,
+			active_direction TEXT NOT NULL DEFAULT 'forward',
 			active_version INTEGER NOT NULL DEFAULT 0,
 			next_check_at TEXT NOT NULL,
 			coordinator TEXT,
@@ -612,9 +622,25 @@ const SYNC_POLL_MS = 1000;
 /** Grace window a session has to own an in-flight replacement generation. */
 const REPLACEMENT_GRACE_MS = 8000;
 
+type RecallDirection = "forward" | "reverse";
+type AssistanceLevel = "none" | "hint" | "revealed";
+
+interface PendingAttempt {
+	itemId: number;
+	version: number;
+	direction: RecallDirection;
+	sessionGeneration: number;
+	answerText: string;
+	assistanceLevel: AssistanceLevel;
+	startedAt: string;
+	verdict: "correct" | "partial" | "incorrect";
+	feedback: string;
+}
+
 interface RuntimeState {
 	active_item_id: number | null;
 	active_kind: "review" | "teach" | null;
+	active_direction: RecallDirection;
 	active_version: number;
 	next_check_at: string;
 	coordinator: string | null;
@@ -629,6 +655,7 @@ function defaultRuntimeState(): RuntimeState {
 	return {
 		active_item_id: null,
 		active_kind: null,
+		active_direction: "forward",
 		active_version: 0,
 		next_check_at: new Date(0).toISOString(),
 		coordinator: null,
@@ -649,6 +676,7 @@ function getRuntimeState(db: DatabaseSync): RuntimeState {
 	return {
 		active_item_id: row.active_item_id,
 		active_kind: row.active_kind as RuntimeState["active_kind"],
+		active_direction: row.active_direction === "reverse" ? "reverse" : "forward",
 		active_version: Number(row.active_version ?? 0),
 		next_check_at: row.next_check_at ?? "",
 		coordinator: row.coordinator,
@@ -662,6 +690,7 @@ function getRuntimeState(db: DatabaseSync): RuntimeState {
 const RUNTIME_COLUMNS = new Set<keyof RuntimeState>([
 	"active_item_id",
 	"active_kind",
+	"active_direction",
 	"active_version",
 	"next_check_at",
 	"coordinator",
@@ -1463,7 +1492,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	let pendingFlipped = false;
 	/** Whether the pending card is a review (vs first showing / training). */
 	let pendingIsReview = false;
-	let pendingDirection: "forward" | "reverse" = "forward";
+	let pendingDirection: RecallDirection = "forward";
+	let pendingAssistance: AssistanceLevel = "none";
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
 		try {
@@ -1668,7 +1698,11 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			const isReview = state.active_kind === "review";
 			pendingItemId = state.active_item_id;
 			pendingIsReview = isReview;
-			if (changed || pendingFlipped === false) pendingFlipped = false;
+			pendingDirection = state.active_direction;
+			if (changed) {
+				pendingFlipped = false;
+				pendingAssistance = "none";
+			}
 			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped, pendingDirection);
 			lines.push(statsLine(db));
 			updateWidget(ctx, isReview ? FACES.review : FACES.teach, lines);
@@ -1678,6 +1712,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			pendingItemId = null;
 			pendingFlipped = false;
 			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
 			if (changed || localVersion < 0) {
 				updateWidget(ctx, FACES.idle, [statsLine(db)]);
 				recordRendered(state);
@@ -1795,6 +1831,16 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget("kaomoji-english-tutor", out.map(accent), { placement: "belowEditor" });
 	}
 
+	/** Whether an already-stored review/new card can be claimed right now. */
+	function hasReadyQueuedCard(now: Date): boolean {
+		if (!db) return false;
+		const dueReview = db.prepare("SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 LIMIT 1")
+			.get(now.toISOString());
+		if (dueReview) return true;
+		if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) return false;
+		return Boolean(db.prepare("SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 LIMIT 1").get(now.toISOString()));
+	}
+
 	/** Atomically select, mark, and activate the next due card. */
 	function claimDueItem(now: Date): ItemRow | undefined {
 		if (!db) return undefined;
@@ -1829,9 +1875,11 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					.run(now.toISOString(), due.id);
 				touchStreak(db, now);
 			}
+			const direction: RecallDirection = isReview && Math.random() >= 0.5 ? "reverse" : "forward";
 			setRuntimeState(db, {
 				active_item_id: due.id,
 				active_kind: isReview ? "review" : "teach",
+				active_direction: direction,
 				active_version: state.active_version + 1,
 				next_check_at: now.toISOString(),
 			});
@@ -1853,7 +1901,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingItemId = item.id;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
-		pendingDirection = isReview ? (Math.random() < 0.5 ? "forward" : "reverse") : "forward";
+		pendingDirection = state.active_direction;
+		pendingAssistance = "none";
 		recordRendered(state);
 		const face = isReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, isReview, face, false, pendingDirection);
@@ -1884,6 +1933,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
 		pendingFlipped = !pendingFlipped;
+		if (pendingFlipped) pendingAssistance = "revealed";
 		const face = pendingIsReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, pendingIsReview, face, pendingFlipped, pendingDirection);
 		lines.push(statsLine(db));
@@ -1896,7 +1946,11 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
 		const state = getRuntimeState(db);
-		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
+		if (
+			state.active_item_id !== pendingItemId ||
+			state.active_version !== localVersion ||
+			state.active_direction !== pendingDirection
+		) {
 			renderGlobalCard(ctx);
 			return true;
 		}
@@ -1918,29 +1972,29 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			]);
 			return true;
 		}
+
+		// Capture every identity field before an LLM await. Later local/global card
+		// changes must not redirect this answer to a different item.
+		const attemptBase = {
+			itemId: item.id,
+			version: state.active_version,
+			direction: state.active_direction,
+			sessionGeneration,
+			answerText: text,
+			assistanceLevel: pendingAssistance,
+			startedAt: new Date().toISOString(),
+		};
 		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-		const target = pendingDirection === "reverse" ? item.meaning : item.text;
+		const target = attemptBase.direction === "reverse" ? item.meaning : item.text;
 		const exact = norm(text) === norm(target);
-		let verdict: "correct" | "partial" | "incorrect" = exact ? "correct" : "incorrect";
+		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
 		if (!exact) {
-			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx), pendingDirection);
+			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx), attemptBase.direction);
 			verdict = result.verdict;
 			feedback = result.feedback;
 		}
-		const now = new Date();
-		try {
-			db.prepare(
-				"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, feedback_json, started_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-			).run(
-				randomUUID(), item.id, randomUUID(), `recall:${item.id}:${randomUUID()}`,
-				state.active_version, state.active_version, "recall", text, "none",
-				"evaluated", verdict, feedback ? JSON.stringify({ feedback }) : null, now.toISOString(), now.toISOString(),
-			);
-		} catch (err) {
-			console.error(`[kaomoji-english-tutor] attempt record failed: ${err}`);
-		}
-		ensureRecallExercise(item);
+		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback };
 		// Auto-rate: correct -> Good, miss (partial/incorrect) -> Again.
 		const autoRating = verdict === "correct" ? Rating.Good : Rating.Again;
 		const recallNote = verdict === "correct"
@@ -1948,7 +2002,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			: verdict === "partial"
 				? `△ 差一点：${feedback || "有小问题"}（正确：${target}）`
 				: `✗ 答案是：${target}`;
-		ratePending(ctx, autoRating, recallNote);
+		ratePending(ctx, autoRating, recallNote, attempt);
 		return true;
 	}
 
@@ -1968,13 +2022,25 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	/** Show a first-letter hint for the active word/phrase card. */
+	/** Show a direction-aware first-character hint for the active word/phrase card. */
 	function hintPending(ctx: ExtensionContext): boolean {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
+		const state = getRuntimeState(db);
+		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
+			renderGlobalCard(ctx);
+			return true;
+		}
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item || item.type === "sentence") return false;
-		const hint = item.text.split(/\s+/).map((w) => w[0] + "_".repeat(Math.max(0, w.length - 1))).join(" ");
+		const hint = pendingDirection === "reverse"
+			? item.meaning.split(/([，,；;、/\s]+)/).map((part) => {
+				if (!part || /^[，,；;、/\s]+$/.test(part)) return part;
+				const chars = Array.from(part);
+				return chars[0] + "_".repeat(Math.max(0, chars.length - 1));
+			}).join("")
+			: item.text.split(/\s+/).map((word) => word[0] + "_".repeat(Math.max(0, word.length - 1))).join(" ");
+		if (pendingAssistance === "none") pendingAssistance = "hint";
 		ctx.ui.notify(`提示：${hint}`, "info");
 		return true;
 	}
@@ -1986,32 +2052,49 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		const shown = { ...item, progress: level } as ItemRow;
 		pendingFlipped = false;
 		pendingIsReview = false;
+		pendingDirection = "forward";
+		pendingAssistance = "none";
 		const lines = renderCard(shown, false, FACES.teach, false);
 		lines.push(statsLine(db!));
 		updateWidget(ctx, FACES.teach, lines);
 	}
 
 	/** Rate the pending review card; returns true once an action was taken (or a stale action was safely refreshed). */
-	function ratePending(ctx: ExtensionContext, rating: Rating, recallNote = ""): boolean {
+	function ratePending(ctx: ExtensionContext, rating: Rating, recallNote = "", attempt?: PendingAttempt): boolean {
+		// An answer that resumed after reload/session switch belongs to the old runtime.
+		if (attempt && attempt.sessionGeneration !== sessionGeneration) return true;
 		hydratePending(ctx);
-		if (pendingItemId == null || !db) return false;
+		if (!db) return false;
+		const expectedItemId = attempt?.itemId ?? pendingItemId;
+		if (expectedItemId == null) return false;
+		const expectedVersion = attempt?.version ?? localVersion;
+		const expectedDirection = attempt?.direction ?? pendingDirection;
+		const assistanceLevel = attempt?.assistanceLevel ?? pendingAssistance;
 
-		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
+		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(expectedItemId) as ItemRow | undefined;
 		if (!item || item.shown === 0) {
 			pendingItemId = null;
 			pendingFlipped = false;
 			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
 			return true;
 		}
 
 		const now = new Date();
 		const levels = parseJsonCol<string[]>(item.levels);
 		const stateAtStart = getRuntimeState(db);
-		// A stale rating (another session changed the global card) must not double-apply.
-		if (stateAtStart.active_item_id !== item.id || stateAtStart.active_version !== localVersion) {
+		// Bind the rating to the exact item/version/direction observed before any LLM await.
+		if (
+			stateAtStart.active_item_id !== item.id ||
+			stateAtStart.active_version !== expectedVersion ||
+			stateAtStart.active_direction !== expectedDirection
+		) {
 			pendingItemId = null;
 			pendingFlipped = false;
 			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
 			renderGlobalCard(ctx);
 			return true;
 		}
@@ -2027,10 +2110,16 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					db.exec("BEGIN IMMEDIATE");
 					const cur = getRuntimeState(db);
 					const current = db.prepare("SELECT progress FROM items WHERE id = ?").get(item.id) as { progress: number } | undefined;
-					if (cur.active_item_id === item.id && cur.active_version === stateAtStart.active_version && current?.progress === item.progress) {
+					if (
+						cur.active_item_id === item.id &&
+						cur.active_version === expectedVersion &&
+						cur.active_direction === expectedDirection &&
+						current?.progress === item.progress
+					) {
 						db.prepare("UPDATE items SET progress = ?, due_at = ? WHERE id = ?").run(nextProgress, now.toISOString(), item.id);
 						setRuntimeState(db, {
 							active_kind: "teach",
+							active_direction: "forward",
 							active_version: cur.active_version + 1,
 							next_check_at: now.toISOString(),
 						});
@@ -2045,6 +2134,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					pendingItemId = null;
 					pendingFlipped = false;
 					pendingIsReview = false;
+					pendingDirection = "forward";
+					pendingAssistance = "none";
 					renderGlobalCard(ctx);
 					return true;
 				}
@@ -2061,34 +2152,62 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 		// Full rating: one-shot, atomic, applies at most once globally.
 		const next = scheduleNext(item.fsrs_state, now, rating);
-		const nextCheck = now.toISOString(); // Anki-style: let the next card surface immediately
 		let applied = false;
+		let hasImmediateNext = false;
 		try {
 			db.exec("BEGIN IMMEDIATE");
 			const cur = getRuntimeState(db);
-			if (cur.active_item_id === item.id && cur.active_version === stateAtStart.active_version) {
+			if (
+				cur.active_item_id === item.id &&
+				cur.active_version === expectedVersion &&
+				cur.active_direction === expectedDirection
+			) {
 				if (item.type === "sentence" && rating === Rating.Again) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
+				if (attempt) {
+					ensureRecallExercise(item);
+					db.prepare(
+						"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+					).run(
+						randomUUID(), item.id, randomUUID(), `recall:${item.id}:${randomUUID()}`,
+						expectedVersion, expectedVersion, "recall", attempt.answerText, attempt.assistanceLevel,
+						"evaluated", attempt.verdict, attempt.feedback ? JSON.stringify({ feedback: attempt.feedback }) : null,
+						rating === Rating.Good ? "good" : "again", attempt.startedAt, now.toISOString(), now.toISOString(),
+					);
+				}
 				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
-				// Milestone 3: track mastery evidence and advance/demote the stage from explicit ratings.
-				const m = db.prepare("SELECT stage, unassisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { stage: string; unassisted_good: number; consecutive_again: number } | undefined;
+				// Assisted Good still advances FSRS, but cannot create unassisted mastery evidence.
+				const m = db.prepare("SELECT stage, unassisted_good, assisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { stage: string; unassisted_good: number; assisted_good: number; consecutive_again: number } | undefined;
 				const prevStage = m?.stage ?? "exposure";
-				const newGood = rating === Rating.Good ? Number(m?.unassisted_good ?? 0) + 1 : 0;
+				const assisted = assistanceLevel !== "none";
+				const newGood = rating === Rating.Good
+					? (assisted ? Number(m?.unassisted_good ?? 0) : Number(m?.unassisted_good ?? 0) + 1)
+					: 0;
+				const newAssistedGood = rating === Rating.Good && assisted
+					? Number(m?.assisted_good ?? 0) + 1
+					: Number(m?.assisted_good ?? 0);
 				const newAgain = rating === Rating.Again ? Number(m?.consecutive_again ?? 0) + 1 : 0;
-				const stage = computeMasteryStage(prevStage, newGood, rating === Rating.Again);
+				const stage = rating === Rating.Good && assisted
+					? prevStage
+					: computeMasteryStage(prevStage, newGood, rating === Rating.Again);
 				if (m) {
-					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
-						.run(stage, newGood, newAgain, now.toISOString(), item.id);
+					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, assisted_good = ?, consecutive_again = ?, last_exercise_kind = 'recall', updated_at = ? WHERE item_id = ?")
+						.run(stage, newGood, newAssistedGood, newAgain, now.toISOString(), item.id);
 				} else {
-					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, ?, ?, ?, 'recall', ?)")
-						.run(item.id, stage, newGood, newAgain, now.toISOString());
+					db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, assisted_good, consecutive_again, last_exercise_kind, updated_at) VALUES (?, ?, ?, ?, ?, 'recall', ?)")
+						.run(item.id, stage, newGood, newAssistedGood, newAgain, now.toISOString());
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
+				hasImmediateNext = hasReadyQueuedCard(now);
+				const nextCheck = hasImmediateNext
+					? now.toISOString()
+					: new Date(now.getTime() + intervalMs()).toISOString();
 				setRuntimeState(db, {
 					active_item_id: null,
 					active_kind: null,
+					active_direction: "forward",
 					active_version: cur.active_version + 1,
 					next_check_at: nextCheck,
 					coordinator: cur.coordinator,
@@ -2109,6 +2228,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			pendingItemId = null;
 			pendingFlipped = false;
 			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
 		}
 
 		if (!applied) {
@@ -2132,8 +2253,9 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			lines.push(statsLine(db));
 			updateWidget(ctx, FACES.error, lines);
 		}
-		// Anki-style: surface the next card immediately if one is available.
-		scheduleTimer(0);
+		// Anki-style queue: immediate only when another stored card is claimable.
+		if (hasImmediateNext) scheduleTimer(0);
+		else scheduleTimer();
 		return true;
 	}
 
@@ -2157,6 +2279,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				pendingItemId = null;
 				pendingFlipped = false;
 				pendingIsReview = false;
+				pendingDirection = "forward";
+				pendingAssistance = "none";
 				return undefined;
 			}
 			db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
@@ -2171,6 +2295,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			setRuntimeState(db, {
 				active_item_id: null,
 				active_kind: null,
+				active_direction: "forward",
 				active_version: cur.active_version + 1,
 				next_check_at: new Date(now.getTime() + REPLACEMENT_GRACE_MS).toISOString(),
 				coordinator: myId,
@@ -2193,6 +2318,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
+		pendingDirection = "forward";
+		pendingAssistance = "none";
 		if (applied) {
 			recordRendered(getRuntimeState(db));
 			updateWidget(ctx, FACES.party, [
@@ -2294,6 +2421,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					setRuntimeState(db, {
 						active_item_id: id,
 						active_kind: "teach",
+						active_direction: "forward",
 						active_version: state.active_version + 1,
 						next_check_at: now.toISOString(),
 						generation_token: null,
@@ -2527,6 +2655,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 				setRuntimeState(db, {
 					active_item_id: firstId,
 					active_kind: "teach",
+					active_direction: "forward",
 					active_version: state.active_version + 1,
 					next_check_at: insertedAt.toISOString(),
 					generation_token: null,
@@ -2752,9 +2881,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("kaomoji:good", {
 		description: "Rate the pending review card as remembered (FSRS Good)",
 		handler: async (_args, ctx) => {
-			if (ratePending(ctx, Rating.Good)) {
-				scheduleTimer();
-			} else {
+			if (!ratePending(ctx, Rating.Good)) {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
 			}
 		},
@@ -2763,9 +2890,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	pi.registerCommand("kaomoji:again", {
 		description: "Rate the pending review card as forgotten (FSRS Again)",
 		handler: async (_args, ctx) => {
-			if (ratePending(ctx, Rating.Again)) {
-				scheduleTimer();
-			} else {
+			if (!ratePending(ctx, Rating.Again)) {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
 			}
 		},
@@ -2779,18 +2904,18 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("kaomoji:answer", {
-		description: "Submit an English answer for the active word/phrase card (active recall)",
+		description: "Submit an English or Chinese answer for bidirectional active recall",
 		handler: async (args, ctx) => {
 			const text = String(args ?? "").trim();
 			const ok = await answerPending(ctx, text);
 			if (!ok && !text) {
-				ctx.ui.notify("用法：/kaomoji:answer <你的英文答案>（无参数显示题目）", "info");
+				ctx.ui.notify("用法：/kaomoji:answer <你的答案>（无参数显示题目）", "info");
 			}
 		},
 	});
 
 	pi.registerCommand("kaomoji:hint", {
-		description: "Show a first-letter hint for the active word/phrase card",
+		description: "Show an English or Chinese initial-character hint for the current recall direction",
 		handler: async (_args, ctx) => {
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
 		},
@@ -2850,6 +2975,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
+		pendingDirection = "forward";
+		pendingAssistance = "none";
 		try {
 			db = openDb();
 		} catch (err) {
@@ -2883,6 +3010,8 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		pendingItemId = null;
 		pendingFlipped = false;
 		pendingIsReview = false;
+		pendingDirection = "forward";
+		pendingAssistance = "none";
 		pendingLLMCall = false;
 		sessionId = "";
 		myId = "";

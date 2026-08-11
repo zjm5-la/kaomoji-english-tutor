@@ -111,6 +111,26 @@ test("finalizePhase advances the phase only for the lease holder with matching v
 	} finally { db.close(); }
 });
 
+test("finalizePhase rejects an expired lease before reap", () => {
+	const db = openDb();
+	try {
+		const claimedAt = new Date(1000);
+		const id = createJob(db, { ...baseParams, now: claimedAt });
+		const token = randomUUID();
+		claimJob(db, id, "owner", token, new Date(2000), claimedAt);
+		const versionAtClaim = getJob(db, id)!.version;
+		assert.equal(
+			finalizePhase(db, id, versionAtClaim, token, {
+				phase: "critique", status: "ready", artifactsJson: "{}", failureJson: null, nextRunAt: new Date(3000).toISOString(),
+			}, new Date(3000)),
+			false,
+		);
+		const job = getJob(db, id)!;
+		assert.equal(job.status, "running");
+		assert.equal(job.phase, "generate");
+	} finally { db.close(); }
+});
+
 test("writeArtifact is idempotent and does not bump the parent version", () => {
 	const db = openDb();
 	try {

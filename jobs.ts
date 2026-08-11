@@ -86,7 +86,7 @@ export function claimJob(
 	return res.changes === 1;
 }
 
-/** Advance the phase and clear the lease. CAS on (id, version, lease_token). */
+/** Advance the phase and clear an unexpired running lease. */
 export function finalizePhase(
 	db: DatabaseSync,
 	id: string,
@@ -99,8 +99,9 @@ export function finalizePhase(
 		`UPDATE tutor_jobs
 		 SET phase = ?, status = ?, artifacts_json = ?, failure_json = ?, next_run_at = ?,
 		     lease_token = NULL, lease_until = NULL, owner = NULL, version = version + 1, updated_at = ?
-		 WHERE id = ? AND version = ? AND lease_token = ?`,
-	).run(next.phase, next.status, next.artifactsJson, next.failureJson, next.nextRunAt, now.toISOString(), id, expectedVersion, leaseToken);
+		 WHERE id = ? AND version = ? AND lease_token = ?
+		   AND status = 'running' AND lease_until IS NOT NULL AND lease_until > ?`,
+	).run(next.phase, next.status, next.artifactsJson, next.failureJson, next.nextRunAt, now.toISOString(), id, expectedVersion, leaseToken, now.toISOString());
 	return res.changes === 1;
 }
 

@@ -18,10 +18,10 @@
 1. 从“固定生成单词、词组、长句”升级为“按学习价值选择 `wait | new | reinforce | contrast | transfer`”。
 2. 以**具体义项**而不是拼写作为学习对象。
 3. 新课形成一个紧密关联的教学单元；目标词、词组、例句、长句和练习共同服务同一个教学目标。
-4. 新增 `/kaomoji:answer <答案>`，收集不进入会话历史的真实英文答案。
+4. 新增 `/kaomoji:answer <答案>`，收集不进入会话历史的真实英文或中文答案，并自动映射为 FSRS Good/Again。
 5. 复习从被动识别逐步升级为填空、主动产出和迁移使用。
 6. 使用多候选、多审查、有限修订的 LLM 流水线；质量门不通过时宁可不新增内容。
-7. LLM 永不直接修改 FSRS。只有用户明确执行 Good、Again 或 Skip 才改变调度。
+7. LLM 只提供判题 verdict，永不直接写 FSRS；确定性引擎在 item/version/direction CAS 成功后把 correct 映射为 Good、partial/incorrect 映射为 Again，用户仍可手动执行 Good、Again 或 Skip。
 
 ## 2. 背景与问题
 
@@ -123,7 +123,7 @@
 (=^‥^=) 主动回忆 · 填空
   We need to ___ access to shared state across several sessions.
   提示：协调
-💬 /kaomoji:answer <英文答案> · /kaomoji:hint · /kaomoji:flip
+💬 /kaomoji:answer <答案> · /kaomoji:hint · /kaomoji:flip
 ```
 
 用户输入：
@@ -160,7 +160,7 @@
 
 | 命令 | 行为 |
 | --- | --- |
-| `/kaomoji:answer <text>` | 提交当前练习答案；不修改 FSRS |
+| `/kaomoji:answer <text>` | 提交当前双向练习答案；correct 自动 FSRS Good，partial/incorrect 自动 Again |
 | `/kaomoji:hint` | 逐级显示预生成提示，并记录本次回答的辅助程度 |
 | `/kaomoji:report <reason>` | 报告错误/不自然内容，将当前 exercise 置为 quarantined 并触发独立复审；不修改 FSRS |
 | `/kaomoji:forget-attempts <all\|days>` | 删除原始答案历史，保留 FSRS 与不可逆推出原文的聚合计数 |
@@ -176,7 +176,7 @@
 | `/kaomoji:again` | 用户明确确认不稳；全局至多一次地退级或更新 FSRS |
 | `/kaomoji:skip` | 标记很熟并保留一对一补卡义务 |
 
-直接 Good/Again 仍可用，但记录为 `self_report`，没有真实答案评价。系统不因 LLM 判定自动评分。
+直接 Good/Again 仍可用，但记录为 `self_report`，没有真实答案评价。`/answer` 的 LLM 只返回 verdict；确定性引擎在 CAS 成功后将 correct 自动映射为 Good、partial/incorrect 自动映射为 Again。
 
 ### 5.5 Exercise 与交互状态契约
 
@@ -504,7 +504,7 @@ critic 优先使用与 generator 不同、且彼此不同的已认证提供商�
 4. 同一事务把 `runtime_state.active_phase` 改为 `evaluating`、写入 `active_attempt_id`，并把 `active_version` 加一；
 5. 提交后在事务外运行评价；
 6. 评价完成时再次 `BEGIN IMMEDIATE`，只有 attempt token、active item/exercise/attempt、phase 和 evaluating version 全部匹配，才写入 feedback、切换 phase 并再次增加版本；
-7. 若当前卡已被其他会话评分、重试或替换，将 attempt 标记为 `stale`，不得改变 Widget、mastery 或调度。
+7. 若当前卡已被其他会话评分、重试或替换，当前实现直接丢弃过期评价且零写入；不得写 attempt、Widget、mastery 或调度。未来若增加独立审计流，也只能写非权威 stale 记录。
 
 `questionVersion` 明确定义为 answer claim 事务开始时、phase 仍为 question/feedback 的 `runtime_state.active_version`；`evaluationVersion = questionVersion + 1`，即步骤 4 提交后的版本。feedback 后重答先获得新的 active version，因此生成新的 claim key，不与旧 attempt 冲突。
 
@@ -986,10 +986,10 @@ FEEDBACK
 - 质量门失败不写入任何部分课程；
 - planned `dailyNewLimit` 按首次展示严格执行；同一事务下两个 ready job 只能提交一个，隐藏 queued-new 阻止继续生成；replacement 明确额度外、单独计数并优先展示；
 - 旧卡迁移不改变 FSRS、due、reviews 和 progress；损坏的 `fsrs_state` 被保留并阻止评分，而不是重置为新卡；
-- `/answer` 不修改 FSRS；
+- `/answer` 的 correct 自动提交 FSRS Good，partial/incorrect 自动提交 Again；显示题面本身不修改 FSRS；
 - Good/Again/Skip 仍全局至多一次；渐进句子从 L1/L2/L3 任一级一次 Again 都只写一次 FSRS、重置到 L1 并释放卡槽；
-- 两会话同时 answer 只有一个 evaluation claim，phase/version CAS 和 claim_key 唯一约束都被实际触发；
-- 评分发生在评价期间时，旧评价结果被标记 stale；
+- 两会话同时 answer 时，只有绑定当前 item/version/direction 的结果可在同一事务写 attempt 并评分；
+- 评分发生在评价期间时，旧评价结果零写入并被丢弃；
 - evaluator 崩溃后租约可恢复；
 - 连续 Again 只增加强化练习，不复制 item；
 - reload/shutdown 清理本地 timer/lease 投影但不清除全局卡；
@@ -1044,9 +1044,9 @@ FEEDBACK
 ## 17. 已确定决策
 
 - 教学效果优先，不以 LLM 调用成本为优化目标。
-- 用户愿意在部分复习中输入英文答案。
+- 用户愿意在部分复习中输入英文或中文答案。
 - 不恢复键盘面板；使用 Widget 和斜杠命令。
-- LLM 评价不自动修改 FSRS，用户显式评分仍是唯一权威。
+- LLM verdict 不直接写 FSRS；确定性引擎通过 CAS 将 answer 的 correct 自动映射为 Good、partial/incorrect 映射为 Again，用户显式评分仍可覆盖无 answer 的场景。
 - SQLite 是跨会话学习状态的唯一权威。
 - 多轮 LLM 调用不持有数据库事务，所有提交使用 token + version CAS。
 - 采用渐进里程碑，而不是一次性重写。

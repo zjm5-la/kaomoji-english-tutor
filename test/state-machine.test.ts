@@ -86,6 +86,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 	const commands: Record<string, any> = {};
 	const shortcuts: Record<string, any> = {};
 	let widget: string[] = [];
+	const notifications: string[] = [];
 	const pi: any = {
 		getSessionName: () => "",
 		setSessionName: () => {},
@@ -101,7 +102,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 		model: options.model,
 		ui: {
 			setWidget: (_key: string, lines: string[] | undefined) => { widget = lines ?? []; },
-			notify: () => {},
+			notify: (message: unknown) => { notifications.push(String(message)); },
 			theme: { fg: (_token: string, text: string) => text },
 		},
 		sessionManager: {
@@ -112,7 +113,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 	};
 	await (extension as any)(pi);
 	await handlers.session_start({ reason: "startup" }, ctx);
-	return { handlers, commands, shortcuts, ctx, widget: () => widget };
+	return { handlers, commands, shortcuts, ctx, widget: () => widget, notifications: () => notifications };
 }
 
 function openTestDb() {
@@ -630,16 +631,18 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const versions = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as any[]).map((r) => r.version);
 			const tableNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
 			const itemCols = (db.prepare("PRAGMA table_info(items)").all() as any[]).map((r) => r.name);
+			const runtimeCols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 3, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3]);
+			assert.deepEqual({ ...meta }, { schema_version: 4, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
 			for (const c of ["lesson_id","lexical_sense_id","role","content_fingerprint","content_version","introduced_at","introduction_kind","introduction_accuracy","content_status","legacy_duplicate_of","fsrs_status","fsrs_error","fsrs_corrupt_at"]) {
 				assert.ok(itemCols.includes(c), `items.${c} exists`);
 			}
+			assert.ok(runtimeCols.includes("active_direction"), "runtime_state.active_direction exists");
 			assert.ok(idxNames.includes("items_content_fingerprint_uq"), "fingerprint unique index exists");
 		};
 		checkSchema();
@@ -845,6 +848,8 @@ test("active recall: a correct answer is judged and recorded", { concurrency: fa
 		assert.match(harness.widget().join(" "), /你好/, "review front shows the Chinese meaning, not the English answer");
 		await harness.commands["kaomoji:answer"].handler("hello", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/);
+		assert.equal(fake.active().length, 1, "normal pacing timer remains when the queue is empty");
+		assert.ok(fake.active()[0].delay > 590_000, "feedback is not overwritten by a 0ms idle tick");
 		const check = openTestDb();
 		const att = check.prepare("SELECT verdict, kind, answer_text FROM attempts WHERE item_id = 1").get() as any;
 		check.close();
@@ -998,7 +1003,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 3, "schema migrated to v3");
+	assert.equal(meta.schema_version, 4, "schema migrated to v4");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -1216,15 +1221,125 @@ test("active recall: reverse direction asks for the Chinese meaning", { concurre
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /写出「hello」的中文释义/, "reverse front shows English, asks for Chinese");
+		await harness.commands["kaomoji:hint"].handler("", harness.ctx);
+		assert.match(harness.notifications().at(-1) ?? "", /提示：你_/, "reverse hint masks the Chinese answer");
 		await harness.commands["kaomoji:answer"].handler("你好", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/, "correct Chinese answer auto-rates Good");
 		const check = openTestDb();
-		const att = check.prepare("SELECT verdict, answer_text FROM attempts WHERE item_id = 1").get() as any;
+		const att = check.prepare("SELECT verdict, answer_text, assistance_level FROM attempts WHERE item_id = 1").get() as any;
+		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.equal(att.verdict, "correct");
-		assert.equal(att.answer_text, "你好");
+		assert.deepEqual({ ...att }, { verdict: "correct", answer_text: "你好", assistance_level: "hint" });
+		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 1 });
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
+		fake.restore();
+	}
+});
+
+test("active recall direction is shared across sessions and survives reattachment", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ sessionId: "direction-a" });
+		const b = await makeSession({ sessionId: "direction-b" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','persist','持久化',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		Math.random = () => 1; // A claims a reverse card.
+		await fake.fire();
+		Math.random = () => 0; // Other sessions must not choose again.
+		await fake.fire();
+		assert.match(a.widget().join(" "), /写出「persist」的中文释义/);
+		assert.match(b.widget().join(" "), /写出「persist」的中文释义/);
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_direction FROM runtime_state WHERE id = 1").get() as any;
+		check.close();
+		assert.equal(state.active_direction, "reverse");
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+		const c = await makeSession({ sessionId: "direction-c" });
+		assert.match(c.widget().join(" "), /写出「persist」的中文释义/, "new session restores persisted direction");
+		await c.handlers.session_shutdown({ reason: "quit" }, c.ctx);
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("flip-assisted correct answer rates Good without unassisted mastery evidence", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','cat','猫',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,updated_at) VALUES(1,'controlled_recall',2,?)")
+			.run(new Date().toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:flip"].handler("", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("cat", harness.ctx);
+		const check = openTestDb();
+		const item = check.prepare("SELECT reviews FROM items WHERE id = 1").get() as any;
+		const attempt = check.prepare("SELECT assistance_level, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
+		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
+		check.close();
+		assert.equal(item.reviews, 1, "assisted correct answer still advances FSRS Good");
+		assert.deepEqual({ ...attempt }, { assistance_level: "revealed", explicit_rating: "good" });
+		assert.deepEqual({ ...mastery }, { stage: "controlled_recall", unassisted_good: 2, assisted_good: 1 });
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("stale async answer cannot record or rate the next global card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-stale-eval" });
+	let releaseResponse!: () => void;
+	let responseStarted!: () => void;
+	const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { responseStarted = resolve; });
+	try {
+		registration.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "可接受" }));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ model, modelRegistry: registry, sessionId: "stale-answer-a" });
+		const b = await makeSession({ model, modelRegistry: registry, sessionId: "stale-answer-b" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','alpha','阿尔法',?,?,1)").run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
+		db.close();
+		await fake.fire(); // A claims alpha.
+		await fake.fire(); // B renders alpha.
+		const inFlight = a.commands["kaomoji:answer"].handler("alph", a.ctx);
+		await started;
+		await b.commands["kaomoji:good"].handler("", b.ctx); // B rates alpha.
+		assert.equal(fake.active()[0].delay, 0);
+		await fake.fire(); // B advances the global slot to beta.
+		releaseResponse();
+		await inFlight;
+		const check = openTestDb();
+		const items = check.prepare("SELECT text, reviews FROM items ORDER BY id").all() as any[];
+		const attemptCount = (check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n;
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id = 1").get() as any;
+		check.close();
+		assert.deepEqual(items.map((row) => ({ ...row })), [{ text: "alpha", reviews: 1 }, { text: "beta", reviews: 0 }]);
+		assert.equal(attemptCount, 0, "stale LLM result writes no attempt");
+		assert.equal(active.active_item_id, 2, "beta remains the active card");
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		releaseResponse?.();
+		registration.unregister();
 		fake.restore();
 	}
 });
@@ -1242,6 +1357,8 @@ test("Anki-style: rating immediately surfaces the next due card", { concurrency:
 		await fake.fire(); // surface first due card
 		assert.match(a.widget().join(" "), /阿尔法|贝塔/, "first card shown");
 		await a.commands["kaomoji:good"].handler("", a.ctx); // rate -> scheduleTimer(0)
+		assert.equal(fake.active().length, 1);
+		assert.equal(fake.active()[0].delay, 0, "command handler must not overwrite the immediate timer");
 		await fake.fire(); // immediate next-card tick
 		const w = a.widget().join(" ");
 		assert.ok(/阿尔法|贝塔/.test(w), "next due card surfaced without waiting");

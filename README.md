@@ -17,13 +17,13 @@
 
 ### 机制
 
-- **时间触发**：默认每 10 分钟自动检查一次（可配置）；有待评分卡片时暂停，评分后重新计时
+- **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句
 - **渐进长句**：同一张句子卡按 L1 主干 → L2 扩展 → L3 完整长句训练，配有逐级翻译、意群切分和独立生词卡
-- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；只有明确的 Good/Again/Skip 才修改调度，展示卡片不会自动评分
-- **卡片交互**：卡片常驻编辑器下方 Widget；使用 `/kaomoji:flip` 翻面、`/kaomoji:good` 记得、`/kaomoji:again` 忘了、`/kaomoji:skip` 标记很熟并尝试补充同类型卡片；命令不进入会话历史
+- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；`/kaomoji:answer` 答对自动 Good、答错或部分正确自动 Again，手动 Good/Again/Skip 仍可用；展示卡片本身不会评分
+- **卡片交互**：复习卡随机进行中→英或英→中回忆；`/kaomoji:answer` 判题并自动评分，`/kaomoji:hint`/`flip` 会记录辅助程度（辅助后答对仍为 FSRS Good，但不计无辅助掌握证据）；命令不进入会话历史
 - **持久化**：学习记录存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
-- **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；任一会话完成评分后，其他会话会自动同步，翻面状态仍各自独立
+- **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡及回忆方向；任一会话完成评分后，其他会话会自动同步，翻面和提示状态仍各自独立
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
 
 ### 安装
@@ -50,8 +50,8 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:thinking <等级>` | 设置备课思考等级：`off` 到 `max` |
 | `/kaomoji:interval <分钟\|off>` | 设置自动检查间隔，或关闭自动检查 |
 | `/kaomoji:flip` | 在问题面和答案面之间切换 |
-| `/kaomoji:answer <英文>` | 默写练习：看中文写出英文，系统判定对错并记录 |
-| `/kaomoji:hint` | 显示当前词卡的首字母提示 |
+| `/kaomoji:answer <答案>` | 双向回忆：提交英文或中文答案；系统判定并自动按 Good/Again 调度 |
+| `/kaomoji:hint` | 按当前回忆方向显示英文或中文首字提示 |
 | `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率 |
 | `/kaomoji:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
 | `/kaomoji:good` | 评分为记得；长句训练中升级 |
@@ -82,7 +82,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `provider` | *(自动检测)* | 备课模型提供商 |
 | `model` | *(自动检测)* | 备课模型 ID |
 | `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
-| `intervalMinutes` | `10` | 自动检查间隔（分钟）；设为 `0` 可关闭 |
+| `intervalMinutes` | `10` | 无现成队列卡时的自动检查/备课间隔（分钟）；设为 `0` 可关闭；现成队列卡之间不等待 |
 | `dailyNewLimit` | `3` | 每天新学学习项上限 |
 | `maxTokens` | `900` | 备课 LLM 响应的最大 token 数 |
 | `showWidget` | `true` | 是否显示宠物 widget |
@@ -105,13 +105,13 @@ A kaomoji pet that lives in a widget below the editor and teaches you English ba
 
 ### How it works
 
-- **Time-triggered**: checks automatically every 10 minutes by default; pauses while a card awaits a rating and restarts after completion
+- **Time-triggered**: checks lesson/readiness state every 10 minutes by default; when another stored card is ready, rating immediately surfaces it Anki-style with no forced inter-card delay
 - **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence
 - **Progressive sentences**: one sentence card advances from L1 core clause to L2 expansion and L3 full sentence, with per-level translations, chunks, and companion word cards
-- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); only explicit Good/Again/Skip actions change scheduling—displaying a card never rates it
-- **Card interaction**: cards remain visible in the widget; use `/kaomoji:flip` to reveal the answer, `/kaomoji:good` for Good, `/kaomoji:again` for Again, and `/kaomoji:skip` to mark a card known and attempt a same-type replacement; commands do not enter session history
+- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); `/kaomoji:answer` auto-rates correct as Good and partial/incorrect as Again, while manual Good/Again/Skip remain available; displaying alone never rates
+- **Card interaction**: review direction is randomized Chinese→English or English→Chinese; `/kaomoji:answer` judges and auto-rates. Hint/flip assistance is recorded; an assisted correct answer still gets FSRS Good but adds no unassisted mastery evidence
 - **Persistent**: learning history lives in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
-- **Multi-session consistency**: concurrent Pi sessions share one current card; rating it in any session automatically synchronizes the others, while flip state remains local
+- **Multi-session consistency**: concurrent Pi sessions share one current card and recall direction; rating it in any session synchronizes the others, while flip/hint state remains local
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`
 
 ### Install
@@ -138,8 +138,8 @@ Or add to `settings.json`:
 | `/kaomoji:thinking <level>` | Set lesson reasoning level (`off` through `max`) |
 | `/kaomoji:interval <minutes\|off>` | Set or disable automatic checks |
 | `/kaomoji:flip` | Toggle question and answer sides |
-| `/kaomoji:answer <english>` | Active recall: type the English for the shown meaning; judged and recorded locally |
-| `/kaomoji:hint` | Show a first-letter hint for the active word/phrase card |
+| `/kaomoji:answer <answer>` | Bidirectional recall: submit English or Chinese; judged and auto-rated Good/Again |
+| `/kaomoji:hint` | Show an English or Chinese initial-character hint for the current direction |
 | `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, and answer accuracy |
 | `/kaomoji:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
 | `/kaomoji:good` | Remember; advances progressive sentences |
@@ -157,7 +157,7 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `provider` | *(auto-detect)* | Lesson model provider |
 | `model` | *(auto-detect)* | Lesson model ID |
 | `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| `intervalMinutes` | `10` | Automatic check interval in minutes; `0` disables it |
+| `intervalMinutes` | `10` | Background check/lesson interval when no stored card is ready; `0` disables it; ready queued cards have no inter-card wait |
 | `dailyNewLimit` | `3` | Max new items taught per day |
 | `maxTokens` | `900` | Max tokens for lesson generation |
 | `showWidget` | `true` | Show the pet widget |
