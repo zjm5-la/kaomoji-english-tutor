@@ -569,15 +569,6 @@ function countTodayNew(db: DatabaseSync, now: Date): number {
 		return Number(row.n);
 }
 
-function countTodayReviews(db: DatabaseSync, now: Date): number {
-	const row = db
-		.prepare(
-			"SELECT COUNT(*) AS n FROM items WHERE reviews >= 1 AND json_extract(fsrs_state, '$.last_review') >= ? AND json_extract(fsrs_state, '$.last_review') < ?",
-		)
-		.get(localDayStartISO(now), localDayStartISO(new Date(now.getTime() + 24 * 3600 * 1000))) as { n: number };
-	return Number(row.n);
-}
-
 function knownList(db: DatabaseSync): string[] {
 	const rows = db.prepare("SELECT text FROM items WHERE shown = 1 ORDER BY id DESC LIMIT 30").all() as {
 		text: string;
@@ -1419,18 +1410,24 @@ const TYPE_LABELS: Record<string, string> = {
 	sentence: "句子",
 };
 
-function statsLine(db: DatabaseSync): string {
-	const total = Number(
-		(db.prepare("SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND status = 'learning'").get() as { n: number }).n,
-	);
-	const now = new Date();
-	const todayNew = countTodayNew(db, now);
-	const todayReviews = countTodayReviews(db, now);
-	const reinforce = Number(
-		(db.prepare("SELECT COUNT(*) AS n FROM mastery_state WHERE consecutive_again >= 2").get() as { n: number }).n,
-	);
+function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): number {
+	const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+	const due = Number((db.prepare(
+		"SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND status = 'learning' AND due_at < ?",
+	).get(tomorrow) as { n: number }).n);
+	const queuedNew = Number((db.prepare(
+		"SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND due_at < ?",
+	).get(tomorrow) as { n: number }).n);
+	const remainingNew = dailyNewLimit === 0
+		? queuedNew
+		: Math.min(queuedNew, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
+	return due + remainingNew;
+}
+
+function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
 	const streak = Number(getStat(db, "streak_days") ?? 0);
-	return `📚 已学 ${total} · 今日新增 ${todayNew} · 今日复习 ${todayReviews} · 需强化 ${reinforce} · 连续学习 ${streak} 天`;
+	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
+	return `🔥 连续学习 ${streak} 天 · 今日剩余 ${remaining} 张卡片`;
 }
 
 /** Parse a JSON column safely. */
@@ -1621,6 +1618,7 @@ export default function kaomojiEnglishTutorExtension(
 
 	// -- State ------------------------------------------------------------
 	let config: PetConfig = { ...DEFAULTS };
+	const statsLine = (database: DatabaseSync) => formatStatusLine(database, config.dailyNewLimit);
 	let db: DatabaseSync | null = null;
 	let resolvedModelName = "";
 	let lastError = "";

@@ -12,7 +12,7 @@
 (=^･ω･^=) 单词：overfitting /ˌəʊ.vəˈfɪt.ɪŋ/
   释义：过拟合
   例：Dropout can help reduce overfitting in neural networks.（Dropout 可以帮助减少神经网络中的过拟合。）
-📚 已学 12 · 今日新增 2 · 今日复习 3 · 连续学习 5 天
+🔥 连续学习 5 天 · 今日剩余 4 张卡片
 ```
 
 ### 机制
@@ -23,6 +23,7 @@
 - **渐进句子输出**：同一张句子卡从 L1 单词填空 → L2 主干英文 → L3 完整自然表达；每级都用 `/kaomoji:answer` 真正输入英文，标准句只是参考，不要求逐字复刻
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；单词/词组答对自动 Good、答错或部分正确自动 Again；句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again
 - **卡片交互**：单词/词组复习随机进行中→英或英→中回忆；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度
+- **精简状态**：常驻 widget 只显示连续学习天数和今日剩余卡片；掌握阶段、强化需求和正确率通过 `/kaomoji:stats` 查看
 - **持久化**：学习记录、句子输出 cycle、重试和辅助状态存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
 - **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；句子级别、纠错、提示、翻面及首次回忆结果也会跨会话/reload 恢复，任一会话提交后其他会话自动同步
 - **颜文字心情**：教新课 `(=^･ω･^=)`、复习 `(=^‥^=)`、无事打瞌睡 `(=ΦωΦ=)`、出错 `(=；ω；=)`
@@ -112,6 +113,7 @@ A kaomoji pet that lives in a widget below the editor, prepares lessons from you
 - **Progressive sentence output**: one sentence moves from an L1 word cloze to L2 core-clause writing and L3 natural full-sentence production; every level requires `/kaomoji:answer`, and the reference is not treated as the only valid wording
 - **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase answers auto-rate immediately; a sentence allows corrective retries but commits one Good/Again based on the first-recall path
 - **Card interaction**: word/phrase direction is randomized Chinese→English or English→Chinese. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again
+- **Compact status**: the persistent widget only shows learning streak and cards remaining today; `/kaomoji:stats` keeps mastery, reinforcement, and accuracy details
 - **Persistent**: learning history, sentence cycles, retries, and assistance live in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
 - **Multi-session consistency**: concurrent Pi sessions share one current card; sentence level, correction, hint/reveal state, and first-recall outcome survive session changes/reload and synchronize automatically
 - **Kaomoji moods**: teaching `(=^･ω･^=)`, reviewing `(=^‥^=)`, dozing off `(=ΦωΦ=)`, error `(=；ω；=)`

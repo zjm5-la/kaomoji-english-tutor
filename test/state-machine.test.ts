@@ -164,7 +164,7 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /timer/);
-		assert.match(harness.widget().join(" "), /今日新增 1/);
+		assert.match(harness.widget().join(" "), /连续学习 1 天.*今日剩余 1 张卡片/);
 		assert.match(harness.widget().join(" "), /\/kaomoji:flip/);
 		assert.equal(harness.shortcuts["ctrl+alt+k"], undefined);
 		assert.equal(fake.active().length, 0);
@@ -907,6 +907,41 @@ test("planned new-card quota blocks extra new cards at display", { concurrency: 
 	}
 });
 
+test("today remaining counts due cards plus only the available new-card quota", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 2 });
+		const harness = await makeSession({ sessionId: "remaining-quota" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at,introduction_kind) VALUES('word','review','复习',?,?,1,?,'planned')")
+			.run(now, new Date(0).toISOString(), now);
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','new-one','新一',?,?)").run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','new-two','新二',?,?)").run(now, new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=NULL, next_check_at=? WHERE id=1").run(new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /今日剩余 2 张卡片/, "current review plus one quota-eligible new card");
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		const after = openTestDb();
+		const localStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
+		const planned = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind='planned' AND introduced_at >= ?").get(localStart) as any).n);
+		const queued = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=0").get() as any).n);
+		const tomorrow = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1).toISOString();
+		const due = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND status='learning' AND due_at < ?").get(tomorrow) as any).n);
+		after.close();
+		assert.deepEqual({ planned, queued }, { planned: 1, queued: 2 });
+		assert.match(
+			harness.widget().join(" "),
+			new RegExp(`今日剩余 ${due + 1} 张卡片`),
+			"status includes cards still due later today plus one quota-eligible new card",
+		);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("content fingerprint unique index rejects exact duplicates", { concurrency: false }, async () => {
 	const harness = await createHarness();
 	try {
@@ -1247,7 +1282,7 @@ test("mastery stage demotes one level on Again", { concurrency: false }, async (
 	}
 });
 
-test("statsLine shows reinforcement count for struggling cards", { concurrency: false }, async () => {
+test("persistent status stays compact while kaomoji:stats keeps detailed metrics", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -1255,7 +1290,11 @@ test("statsLine shows reinforcement count for struggling cards", { concurrency: 
 		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'exposure',0,2,?)").run(new Date().toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /需强化 1/, "statsLine reflects one card needing reinforcement");
+		const status = harness.widget().join(" ");
+		assert.match(status, /连续学习 0 天.*今日剩余 0 张卡片/);
+		assert.doesNotMatch(status, /需强化|今日新增|今日复习|已学/);
+		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
+		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
