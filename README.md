@@ -19,6 +19,7 @@
 
 - **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句
+- **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具
 - **渐进长句**：同一张句子卡按 L1 主干 → L2 扩展 → L3 完整长句训练，配有逐级翻译、意群切分和独立生词卡
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；`/kaomoji:answer` 答对自动 Good、答错或部分正确自动 Again，手动 Good/Again/Skip 仍可用；展示卡片本身不会评分
 - **卡片交互**：复习卡随机进行中→英或英→中回忆；`/kaomoji:answer` 判题并自动评分，`/kaomoji:hint`/`flip` 会记录辅助程度（辅助后答对仍为 FSRS Good，但不计无辅助掌握证据）；命令不进入会话历史
@@ -107,6 +108,7 @@ A kaomoji pet that lives in a widget below the editor and teaches you English ba
 
 - **Time-triggered**: checks lesson/readiness state every 10 minutes by default; when another stored card is ready, rating immediately surfaces it Anki-style with no forced inter-card delay
 - **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence
+- **Unified Pi SDK transport**: lesson generation, independent critique, revision, replacements, sentence-data completion, and answer evaluation all run through isolated in-memory Pi SDK sessions with no discovered extensions, skills, project context, or file tools
 - **Progressive sentences**: one sentence card advances from L1 core clause to L2 expansion and L3 full sentence, with per-level translations, chunks, and companion word cards
 - **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js); `/kaomoji:answer` auto-rates correct as Good and partial/incorrect as Again, while manual Good/Again/Skip remain available; displaying alone never rates
 - **Card interaction**: review direction is randomized Chinese→English or English→Chinese; `/kaomoji:answer` judges and auto-rates. Hint/flip assistance is recorded; an assisted correct answer still gets FSRS Good but adds no unassisted mastery evidence

@@ -4,10 +4,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, registerFauxProvider, streamSimple as streamModel } from "@earendil-works/pi-ai/compat";
 
 const agentDir = mkdtempSync(join(tmpdir(), "kaomoji-tutor-test-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
+const sdkRuntimeFactory = async (ctx: any) => ({
+	getModel: (provider: string, modelId: string) => ctx.modelRegistry.find(provider, modelId),
+	hasConfiguredAuth: () => true,
+	setRuntimeApiKey: async () => {},
+	streamSimple: async (model: any, context: any, options: any) => {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok || !auth.apiKey) throw new Error("NO_API_KEY");
+		return streamModel(model, context, { ...options, apiKey: auth.apiKey, headers: auth.headers });
+	},
+}) as any;
 const { default: extension, contentFingerprint } = await import("../index.ts");
 let sessionSeq = 0;
 
@@ -111,7 +121,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 		},
 		modelRegistry: options.modelRegistry ?? { getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => false },
 	};
-	await (extension as any)(pi);
+	await (extension as any)(pi, { runtimeFactory: sdkRuntimeFactory });
 	await handlers.session_start({ reason: "startup" }, ctx);
 	return { handlers, commands, shortcuts, ctx, widget: () => widget, notifications: () => notifications };
 }

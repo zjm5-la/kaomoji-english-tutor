@@ -2,12 +2,12 @@ import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { FSRS, Rating, Card } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { reapExpiredJobs } from "./jobs.ts";
+import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 
 // -- Configuration --------------------------------------------------------
 
@@ -117,6 +117,7 @@ function addColumnIfMissing(db: DatabaseSync, table: string, columnDef: string):
 	const name = columnDef.trim().split(/\s+/)[0];
 	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
 	if (!cols.some((c) => c.name === name)) {
+		// pi-lens-ignore: sql-injection
 		db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
 	}
 }
@@ -346,7 +347,8 @@ function runMigrations(db: DatabaseSync): void {
 			throw err;
 		}
 	}
-	db.exec(`UPDATE schema_meta SET schema_version = ${SCHEMA_TARGET_VERSION}, adaptive_protocol = 1, migration_state = 'complete' WHERE id = 1`);
+	db.prepare("UPDATE schema_meta SET schema_version = ?, adaptive_protocol = 1, migration_state = 'complete' WHERE id = 1")
+		.run(SCHEMA_TARGET_VERSION);
 }
 
 function openDb(): DatabaseSync {
@@ -932,6 +934,7 @@ interface ResolvedModel {
 const MAX_LESSON_REVISIONS = 2;
 
 async function generateLesson(
+	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
 	conversation: string,
@@ -939,23 +942,6 @@ async function generateLesson(
 	config: PetConfig,
 	feedback?: CritiqueIssue[],
 ): Promise<LessonDecision> {
-	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
-	if (!model) {
-		const err = new Error("MODEL_NOT_FOUND");
-		(err as Error & { code?: string }).code = "MODEL_NOT_FOUND";
-		throw err;
-	}
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) {
-		const err = new Error("NO_API_KEY");
-		(err as Error & { code?: string }).code = "NO_API_KEY";
-		throw err;
-	}
-	const requestAuth = {
-		apiKey: auth.apiKey,
-		headers: auth.headers as Record<string, string> | undefined,
-	};
-
 	const prompt = [
 		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
 		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
@@ -989,37 +975,12 @@ async function generateLesson(
 		"</conversation>",
 	].join("\n");
 
-	const llmOptions: Record<string, unknown> = {
-		apiKey: requestAuth.apiKey,
-		headers: requestAuth.headers,
+	const text = await llm.complete(ctx, resolved, {
+		systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
+		prompt,
 		maxTokens: config.maxTokens,
-	};
-	if (config.thinkingLevel) {
-		llmOptions.reasoning = config.thinkingLevel;
-	}
-
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
-			messages: [{
-				role: "user" as const,
-				content: [{ type: "text" as const, text: prompt }],
-				timestamp: Date.now(),
-			}],
-		},
-		llmOptions as any,
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(response.errorMessage || "provider error");
-	}
-	const text = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join(" ")
-		.trim();
-	if (!text) throw new Error("EMPTY_RESPONSE");
+		thinkingLevel: config.thinkingLevel,
+	});
 
 	// Tolerate markdown fences around the JSON
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
@@ -1052,7 +1013,7 @@ async function generateLesson(
 	// Models sometimes omit them — backfill with a dedicated follow-up call.
 	for (const it of items) {
 		if (it.type === "sentence" && !validSentenceTraining(it)) {
-			await completeSentenceData(model, requestAuth, config, it);
+			await completeSentenceData(llm, ctx, resolved, config, it);
 		}
 	}
 	const sentence = items.find((item) => item.type === "sentence")!;
@@ -1078,6 +1039,7 @@ interface CritiqueVerdict {
  * or broken critic never blocks lesson generation — it only adds a gate when it works.
  */
 async function critiqueLesson(
+	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
 	lesson: { topic: string; items: GeneratedItem[] },
@@ -1085,12 +1047,6 @@ async function critiqueLesson(
 	config: PetConfig,
 ): Promise<CritiqueVerdict> {
 	const failOpen = (summary: string): CritiqueVerdict => ({ pass: true, issues: [], summary });
-	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
-	if (!model) return failOpen("critic model unavailable");
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) return failOpen("critic unauthenticated");
-	const requestAuth = { apiKey: auth.apiKey, headers: auth.headers as Record<string, string> | undefined };
-
 	const outline = lesson.items.map((it) =>
 		it.type === "sentence"
 			? `sentence: "${it.text}" -> ${it.meaning} (levels: ${it.levels?.length ?? 0})`
@@ -1113,26 +1069,17 @@ async function critiqueLesson(
 		"</lesson>",
 ].join("\n");
 
-	const llmOptions: Record<string, unknown> = { apiKey: requestAuth.apiKey, headers: requestAuth.headers, maxTokens: 450 };
-	if (config.thinkingLevel) llmOptions.reasoning = config.thinkingLevel;
-
-	let response;
+	let text: string;
 	try {
-		response = await completeSimple(model, {
+		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语教学内容审查员，只输出 JSON。",
-			messages: [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }],
-		}, llmOptions as any);
+			prompt,
+			maxTokens: 450,
+			thinkingLevel: config.thinkingLevel,
+		});
 	} catch {
 		return failOpen("critic call failed");
 	}
-	if (response.stopReason === "error") return failOpen(response.errorMessage || "critic error");
-
-	const text = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join(" ")
-		.trim();
-	if (!text) return failOpen("critic empty response");
 
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
@@ -1157,6 +1104,7 @@ interface AnswerEvaluation {
 
 /** LLM evaluation for a near-miss answer. Fail-closed to incorrect when unavailable. */
 async function evaluateAttempt(
+	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
 	item: ItemRow,
 	answer: string,
@@ -1165,11 +1113,6 @@ async function evaluateAttempt(
 ): Promise<AnswerEvaluation> {
 	const failClosed = (feedback = ""): AnswerEvaluation => ({ verdict: "incorrect", feedback });
 	if (!resolved) return failClosed();
-	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
-	if (!model) return failClosed();
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) return failClosed();
-	const requestAuth = { apiKey: auth.apiKey, headers: auth.headers as Record<string, string> | undefined };
 	const isReverse = direction === "reverse";
 	const target = isReverse ? item.meaning : item.text;
 	const answerLang = isReverse ? "中文" : "英文";
@@ -1184,22 +1127,16 @@ async function evaluateAttempt(
 		`- partial: ${answerLang}有小错（拼写/近义/字形），但明显是想表达这个意思`,
 		"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
 	].join("\n");
-	let response;
+	let text: string;
 	try {
-		response = await completeSimple(model, {
+		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
-			messages: [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }],
-		}, { apiKey: requestAuth.apiKey, headers: requestAuth.headers, maxTokens: 200 });
+			prompt,
+			maxTokens: 200,
+		});
 	} catch {
 		return failClosed();
 	}
-	if (response.stopReason === "error") return failClosed();
-	const text = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join(" ")
-		.trim();
-	if (!text) return failClosed();
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
 	const end = cleaned.lastIndexOf("}");
@@ -1214,6 +1151,7 @@ async function evaluateAttempt(
 }
 
 async function generateReplacement(
+	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
 	resolved: ResolvedModel,
 	conversation: string,
@@ -1221,14 +1159,6 @@ async function generateReplacement(
 	config: PetConfig,
 	skipped: ItemRow,
 ): Promise<ReplacementDecision> {
-	const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
-	if (!model) throw new Error("MODEL_NOT_FOUND");
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) throw new Error("NO_API_KEY");
-	const requestAuth = {
-		apiKey: auth.apiKey,
-		headers: auth.headers as Record<string, string> | undefined,
-	};
 	const itemSchema = skipped.type === "sentence"
 		? '{"type":"sentence","text":"完整长句","meaning":"中文翻译","levels":["L1主干","L2扩展","与text相同的L3"],"levels_cn":["L1翻译","L2翻译","L3翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"释义"}]}'
 		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
@@ -1247,31 +1177,12 @@ async function generateReplacement(
 		conversation,
 		"</conversation>",
 	].join("\n");
-	const llmOptions: Record<string, unknown> = {
-		apiKey: requestAuth.apiKey,
-		headers: requestAuth.headers,
+	const text = await llm.complete(ctx, resolved, {
+		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
+		prompt,
 		maxTokens: skipped.type === "sentence" ? config.maxTokens : 450,
-	};
-	if (config.thinkingLevel) llmOptions.reasoning = config.thinkingLevel;
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
-			messages: [{
-				role: "user" as const,
-				content: [{ type: "text" as const, text: prompt }],
-				timestamp: Date.now(),
-			}],
-		},
-		llmOptions as any,
-	);
-	if (response.stopReason === "error") throw new Error(response.errorMessage || "provider error");
-	const text = response.content
-		.filter((content): content is { type: "text"; text: string } => content.type === "text")
-		.map((content) => content.text)
-		.join(" ")
-		.trim();
-	if (!text) throw new Error("EMPTY_RESPONSE");
+		thinkingLevel: config.thinkingLevel,
+	});
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
 	const end = cleaned.lastIndexOf("}");
@@ -1289,7 +1200,7 @@ async function generateReplacement(
 	const item = parseGeneratedItem(parsed.item, skipped.type);
 	if (!item) throw new Error("EMPTY_REPLACEMENT");
 	if (item.type === "sentence" && !validSentenceTraining(item)) {
-		await completeSentenceData(model, requestAuth, config, item);
+		await completeSentenceData(llm, ctx, resolved, config, item);
 	}
 	if (item.type === "sentence" && !validSentenceTraining(item)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
 	return { ready: true, item };
@@ -1297,8 +1208,9 @@ async function generateReplacement(
 
 /** Backfill levels/chunks/keyWords for a sentence card via a focused call. */
 async function completeSentenceData(
-	model: ReturnType<ExtensionContext["modelRegistry"]["find"]> & object,
-	auth: { apiKey: string; headers?: Record<string, string> },
+	llm: PiSdkLlmClient,
+	ctx: ExtensionContext,
+	resolved: ResolvedModel,
 	config: PetConfig,
 	item: GeneratedItem,
 ) {
@@ -1312,35 +1224,17 @@ async function completeSentenceData(
 		"</sentence>",
 	].join("\n");
 
-	const llmOptions: Record<string, unknown> = {
-		apiKey: auth.apiKey,
-		headers: auth.headers,
-		maxTokens: 500,
-	};
-	if (config.thinkingLevel) {
-		llmOptions.reasoning = config.thinkingLevel;
-	}
-
-	const response = await completeSimple(
-		model as never,
-		{
+	let text: string;
+	try {
+		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语学习卡生成器，只输出 JSON。",
-			messages: [{
-				role: "user" as const,
-				content: [{ type: "text" as const, text: prompt }],
-				timestamp: Date.now(),
-			}],
-		},
-		llmOptions as any,
-	);
-
-	if (response.stopReason === "error") return;
-	const text = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join(" ")
-		.trim();
-	if (!text) return;
+			prompt,
+			maxTokens: 500,
+			thinkingLevel: config.thinkingLevel,
+		});
+	} catch {
+		return;
+	}
 
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
@@ -1460,7 +1354,17 @@ function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer =
 
 // -- Extension ------------------------------------------------------------
 
-export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
+export interface KaomojiEnglishTutorExtensionOptions {
+	/** Dependency injection seam for isolated SDK transport tests. */
+	runtimeFactory?: PiSdkRuntimeFactory;
+}
+
+export default function kaomojiEnglishTutorExtension(
+	pi: ExtensionAPI,
+	options: KaomojiEnglishTutorExtensionOptions = {},
+) {
+	const llm = new PiSdkLlmClient(options.runtimeFactory);
+
 	// -- State ------------------------------------------------------------
 	let config: PetConfig = { ...DEFAULTS };
 	let db: DatabaseSync | null = null;
@@ -1990,7 +1894,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
 		if (!exact) {
-			const result = await evaluateAttempt(ctx, item, text, resolveModel(ctx), attemptBase.direction);
+			const result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction);
 			verdict = result.verdict;
 			feedback = result.feedback;
 		}
@@ -2014,7 +1918,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			"INSERT OR IGNORE INTO exercises (item_id, kind, schema_version, stage, content_fingerprint, prompt_json, answer_json, hints_json, rubric_json, quality_json, created_at) VALUES (?, 'recall', 1, 'recall', ?, ?, ?, ?, '{}', '{}', ?)",
 		).run(
 			item.id,
-			`recall:${item.id}`,
+			"recall:" + item.id,
 			JSON.stringify({ meaning: item.meaning }),
 			JSON.stringify({ acceptedForms: [item.text] }),
 			JSON.stringify([hint]),
@@ -2170,7 +2074,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 					db.prepare(
 						"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 					).run(
-						randomUUID(), item.id, randomUUID(), `recall:${item.id}:${randomUUID()}`,
+						randomUUID(), item.id, randomUUID(), "recall:" + item.id + ":" + randomUUID(),
 						expectedVersion, expectedVersion, "recall", attempt.answerText, attempt.assistanceLevel,
 						"evaluated", attempt.verdict, attempt.feedback ? JSON.stringify({ feedback: attempt.feedback }) : null,
 						rating === Rating.Good ? "good" : "again", attempt.startedAt, now.toISOString(), now.toISOString(),
@@ -2363,12 +2267,13 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			if (!resolved) throw new Error("NO_MODEL");
 			let decision: ReplacementDecision;
 			try {
-				decision = await generateReplacement(ctx, resolved, conversation, replacementKnownList(db), config, skipped);
+				decision = await generateReplacement(llm, ctx, resolved, conversation, replacementKnownList(db), config, skipped);
 			} catch (err) {
 				if (!resolved.fromSession && ctx.model &&
 					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)) {
 					if (sessionGeneration !== generation || !db) return false;
 					decision = await generateReplacement(
+						llm,
 						ctx,
 						{ provider: ctx.model.provider, model: ctx.model.id, fromSession: true },
 						conversation,
@@ -2563,7 +2468,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config);
+				decision = await generateLesson(llm, ctx, resolved, conversation, db ? knownList(db) : [], config);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
 				if (!resolved.fromSession && ctx.model &&
@@ -2573,7 +2478,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(ctx, fallback, conversation, db ? knownList(db) : [], config);
+					decision = await generateLesson(llm, ctx, fallback, conversation, db ? knownList(db) : [], config);
 					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${fallback.provider}/${fallback.model}（当前会话·降级）`;
 				} else {
@@ -2594,17 +2499,17 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			let verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
+			let verdict = await critiqueLesson(llm, ctx, resolved, lesson, db ? knownList(db) : [], config);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
 			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && !verdict.pass; attempt++) {
-				const revised = await generateLesson(ctx, resolved, conversation, db ? knownList(db) : [], config, verdict.issues);
+				const revised = await generateLesson(llm, ctx, resolved, conversation, db ? knownList(db) : [], config, verdict.issues);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
 				lesson = revised;
-				verdict = await critiqueLesson(ctx, resolved, lesson, db ? knownList(db) : [], config);
+				verdict = await critiqueLesson(llm, ctx, resolved, lesson, db ? knownList(db) : [], config);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			}
@@ -3003,6 +2908,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		sessionGeneration++;
+		await llm.dispose();
 		stopTimer();
 		stopPolling();
 		releaseCoordinator();
@@ -3026,5 +2932,4 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (event.source !== "extension") ensureCoordinator(new Date(), true);
 		return { action: "continue" };
 	});
-
 }

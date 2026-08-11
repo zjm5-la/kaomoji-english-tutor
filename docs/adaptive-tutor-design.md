@@ -34,6 +34,7 @@
 - 句子 L1 → L2 → L3 训练；
 - FSRS Good/Again 与 Skip 补卡；
 - 单一全局当前卡、跨进程版本 CAS、coordinator 和 generation lease；
+- 所有 LLM 通信统一通过隔离的 Pi SDK 内存 AgentSession；内部会话禁用扩展、skills、项目上下文和文件工具，generator 与 critic 使用独立会话；
 - LLM 调用期间不持有 SQLite 事务；
 - Widget 常驻展示及 `/kaomoji:*` 命令交互。
 

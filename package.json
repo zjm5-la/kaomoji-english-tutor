@@ -12,6 +12,7 @@
   "files": [
     "index.ts",
     "jobs.ts",
+    "pi-sdk-llm.ts",
     "README.md"
   ],
   "pi": {
@@ -19,12 +20,12 @@
       "./index.ts"
     ]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "^0.80.0",
-    "@earendil-works/pi-tui": "*"
-  },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-tui": "^0.84.1",
     "fsrs.js": "^1.2.2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.1"
   }
 }
