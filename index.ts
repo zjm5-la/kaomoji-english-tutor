@@ -2241,7 +2241,7 @@ export default function kaomojiEnglishTutorExtension(pi: ExtensionAPI) {
 		if (rating === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				...(recallNote ? [recallNote] : []),
-				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个词`,
+				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个${TYPE_LABELS[item.type] ?? "学习项"}`,
 				statsLine(db),
 			]);
 		} else {

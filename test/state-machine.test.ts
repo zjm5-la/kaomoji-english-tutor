@@ -186,6 +186,7 @@ test("progressive sentence Good touches FSRS only after the full level", { concu
 		check.close();
 		assert.deepEqual({ ...row }, { progress: 2, reviews: 0, fsrs_state: "" });
 		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /再见这个句子/, "completed sentence uses a sentence-specific FSRS message");
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		check.close();
