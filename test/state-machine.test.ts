@@ -164,7 +164,7 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /timer/);
-		assert.match(harness.widget().join(" "), /连续学习 1 天.*今日剩余 1 张卡片/);
+		assert.match(harness.widget().join(" "), /连续学习 1 天.*今日剩余卡片（复习 1）/);
 		assert.match(harness.widget().join(" "), /\/kaomoji:flip/);
 		assert.equal(harness.shortcuts["ctrl+alt+k"], undefined);
 		assert.equal(fake.active().length, 0);
@@ -1265,7 +1265,7 @@ test("today remaining counts due cards plus only the available new-card quota", 
 		db.prepare("UPDATE runtime_state SET active_item_id=NULL, next_check_at=? WHERE id=1").run(new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /今日剩余 2 张卡片/, "current review plus one quota-eligible new card");
+		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 1 · 新卡 1）/, "current review plus one quota-eligible new card");
 		await harness.commands["kaomoji:good"].handler("", harness.ctx);
 		const after = openTestDb();
 		const localStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
@@ -1277,8 +1277,8 @@ test("today remaining counts due cards plus only the available new-card quota", 
 		assert.deepEqual({ planned, queued }, { planned: 1, queued: 2 });
 		assert.match(
 			harness.widget().join(" "),
-			new RegExp(`今日剩余 ${due + 1} 张卡片`),
-			"status includes cards still due later today plus one quota-eligible new card",
+			new RegExp(`今日剩余卡片（复习 ${due} · 新卡 1）`),
+			"status separates cards still due later today from one quota-eligible new card",
 		);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -1302,7 +1302,7 @@ test("today remaining includes hidden quota-free replacements after planned quot
 		db.prepare("UPDATE runtime_state SET next_check_at=? WHERE id=1").run("2099-01-01T00:00:00.000Z");
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /今日剩余 1 张卡片/);
+		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 0 · 新卡 1）/);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -1343,7 +1343,8 @@ test("a matured Skip card due today is counted and claimable", { concurrency: fa
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /到期熟词/);
-		assert.match(harness.widget().join(" "), /今日剩余 1 张卡片/);
+		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 1）/);
+		assert.doesNotMatch(harness.widget().join(" "), /新卡 0/);
 		const check = openTestDb();
 		const active = check.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
 		check.close();
@@ -1820,7 +1821,7 @@ test("persistent status stays compact while kaomoji:stats keeps detailed metrics
 		db.close();
 		await fake.fire();
 		const status = harness.widget().join(" ");
-		assert.match(status, /连续学习 0 天.*今日剩余 0 张卡片/);
+		assert.match(status, /连续学习 0 天.*今日剩余卡片（复习 0）/);
 		assert.doesNotMatch(status, /需强化|今日新增|今日复习|已学/);
 		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
 		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));

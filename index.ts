@@ -1515,10 +1515,10 @@ const TYPE_LABELS: Record<string, string> = {
 	sentence: "句子",
 };
 
-function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): number {
+function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): { total: number; reviews: number; newCards: number } {
 	const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
 	// Due reviews (shown items due today or earlier).
-	const due = Number((db.prepare(
+	const reviews = Number((db.prepare(
 		`SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
 	// Queued replacements are quota-free; planned cards consume the remaining daily quota.
@@ -1531,13 +1531,17 @@ function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: nu
 	const remainingPlanned = dailyNewLimit === 0
 		? queuedPlanned
 		: Math.min(queuedPlanned, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
-	return due + queuedReplacement + remainingPlanned;
+	const newCards = queuedReplacement + remainingPlanned;
+	return { total: reviews + newCards, reviews, newCards };
 }
 
 function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
 	const streak = Number(getStat(db, "streak_days") ?? 0);
 	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
-	return `🔥 连续学习 ${streak} 天 · 今日剩余 ${remaining} 张卡片`;
+	const breakdown = remaining.newCards > 0
+		? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
+		: `（复习 ${remaining.reviews}）`;
+	return `🔥 连续学习 ${streak} 天 · 今日剩余卡片${breakdown}`;
 }
 
 /** Parse a JSON column safely. */
