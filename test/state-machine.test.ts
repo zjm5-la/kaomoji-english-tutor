@@ -298,6 +298,8 @@ test("sentence correction retries stay on the level and final FSRS uses the firs
 		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
 		await harness.commands["kaomoji:answer"].handler("The extension clear resources during shutdown.", harness.ctx);
 		assert.match(harness.widget().join(" "), /差一点.*主谓一致/);
+		const reattached = await makeSession({ model, modelRegistry: registry, sessionId: "sentence-retry-reattached" });
+		assert.match(reattached.widget().join(" "), /差一点.*主谓一致/, "SQLite reattachment preserves corrective teaching");
 
 		let check = openTestDb();
 		let state = check.prepare("SELECT active_cycle_outcome,active_retry_count,active_assistance_level FROM runtime_state WHERE id=1").get() as any;
@@ -321,6 +323,7 @@ test("sentence correction retries stay on the level and final FSRS uses the firs
 		assert.equal(attempts.filter((attempt) => attempt.explicit_rating === "again").length, 1);
 		assert.ok(attempts.some((attempt) => attempt.verdict === "partial" && /grammar/.test(attempt.error_tags_json)));
 		assert.deepEqual({ ...state }, { active_item_id: null, active_review_cycle_id: null });
+		await reattached.handlers.session_shutdown({ reason: "quit" }, reattached.ctx);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		registration.unregister();

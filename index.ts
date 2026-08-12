@@ -1940,6 +1940,30 @@ export default function kaomojiEnglishTutorExtension(
 		).run(myId, token);
 	}
 
+	/** Rebuild persisted sentence-correction teaching after polls, reattachment, or reload. */
+	function sentenceCorrectionLines(item: ItemRow, state: RuntimeState): string[] | undefined {
+		if (
+			!db || item.type !== "sentence" || state.active_cycle_outcome !== "again" ||
+			state.active_retry_count <= 0 || !state.active_review_cycle_id || state.active_exercise_id == null
+		) return undefined;
+		const attempt = db.prepare(
+			"SELECT verdict,feedback_json FROM attempts WHERE item_id = ? AND review_cycle_id = ? AND exercise_id = ? AND verdict IN ('partial','incorrect') ORDER BY completed_at DESC,id DESC LIMIT 1",
+		).get(item.id, state.active_review_cycle_id, state.active_exercise_id) as { verdict: "partial" | "incorrect"; feedback_json: string | null } | undefined;
+		if (!attempt) return undefined;
+		const feedback = parseJsonCol<{ feedback?: string; correctedAnswer?: string }>(attempt.feedback_json);
+		const exercise = sentenceExercise(item);
+		if (!exercise) return undefined;
+		const lines = [
+			attempt.verdict === "partial"
+				? `△ 差一点：${feedback?.feedback || "有一个小问题"}`
+				: `✗ 再试一次：${feedback?.feedback || "意思或表达还不对"}`,
+		];
+		if (state.active_retry_count === 1) lines.push(`提示：${exercise.hint}`);
+		if (state.active_retry_count >= 2) lines.push(`参考：${feedback?.correctedAnswer || exercise.reference}`);
+		lines.push(...renderCard(item, state.active_kind === "review", FACES.error, false, "forward"));
+		return lines;
+	}
+
 	/** Bump the global card version and cache the rendered state locally. */
 	function recordRendered(state: RuntimeState | undefined) {
 		if (!state) {
@@ -1968,9 +1992,11 @@ export default function kaomojiEnglishTutorExtension(
 				pendingFlipped = item.type === "sentence" && state.active_assistance_level === "revealed";
 				pendingAssistance = item.type === "sentence" ? state.active_assistance_level : "none";
 			}
-			const lines = renderCard(item, isReview, isReview ? FACES.review : FACES.teach, pendingFlipped, pendingDirection);
+			const correction = sentenceCorrectionLines(item, state);
+			const face = correction ? FACES.error : isReview ? FACES.review : FACES.teach;
+			const lines = correction ?? renderCard(item, isReview, face, pendingFlipped, pendingDirection);
 			lines.push(statsLine(db));
-			updateWidget(ctx, isReview ? FACES.review : FACES.teach, lines);
+			updateWidget(ctx, face, lines);
 			recordRendered(state);
 		} else {
 			// No global card: reflect cleared state (respecting pacing status line).
@@ -2275,24 +2301,7 @@ export default function kaomojiEnglishTutorExtension(
 			renderGlobalCard(ctx);
 			return true;
 		}
-		const state = getRuntimeState(db);
-		const refreshed = db.prepare("SELECT * FROM items WHERE id = ?").get(item.id) as unknown as ItemRow;
-		pendingItemId = item.id;
-		pendingFlipped = retryCount >= 2;
-		pendingIsReview = state.active_kind === "review";
-		pendingDirection = "forward";
-		pendingAssistance = state.active_assistance_level;
-		recordRendered(state);
-		const lines = [
-			attempt.verdict === "partial"
-				? `△ 差一点：${attempt.feedback || "有一个小问题"}`
-				: `✗ 再试一次：${attempt.feedback || "意思或表达还不对"}`,
-		];
-		if (retryCount === 1) lines.push(`提示：${exercise.hint}`);
-		if (retryCount >= 2) lines.push(`参考：${attempt.correctedAnswer || exercise.reference}`);
-		lines.push(...renderCard(refreshed, pendingIsReview, FACES.error, pendingFlipped));
-		lines.push(statsLine(db));
-		updateWidget(ctx, FACES.error, lines);
+		renderGlobalCard(ctx);
 		return true;
 	}
 
