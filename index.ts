@@ -1,632 +1,24 @@
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { FSRS, Rating, Card, State } from "fsrs.js";
+import type { DatabaseSync } from "node:sqlite";
+import { Rating } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { reapExpiredJobs } from "./jobs.ts";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
+import { AUTO_DETECT_MODELS, DEFAULTS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
+import { advanceReview, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, enqueueReplacement, getDueItem, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
+import { quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
+import { buildConversation } from "./conversation.ts";
+import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
+import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, renderCard, sentenceExercise, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
+import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 
-// -- Configuration --------------------------------------------------------
+export { contentFingerprint };
 
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-interface PetConfig {
-	provider?: string;
-	model?: string;
-	/** Reasoning/thinking level passed to the model. Omit for provider default. */
-	thinkingLevel?: ThinkingLevel;
-	/** Minutes between automatic lesson/review checks. Zero disables the timer. */
-	intervalMinutes: number;
-	/** Max new items (word/phrase/sentence) taught per day. */
-	dailyNewLimit: number;
-	maxTokens: number;
-	showWidget: boolean;
-	verbose: boolean;
-}
-
-const DEFAULTS: PetConfig = {
-	intervalMinutes: 10,
-	dailyNewLimit: 3,
-	maxTokens: 900,
-	showWidget: true,
-	verbose: false,
-};
-
-/** Models to try in order when no explicit model is configured. */
-const AUTO_DETECT_MODELS = [
-	"gpt-5.4-mini",
-	"deepseek-v4-flash",
-	"grok-4.3",
-	"glm-5.2",
-];
-function loadConfig(cwd: string): PetConfig {
-	const globalPath = join(getAgentDir(), "kaomoji-english-tutor.json");
-	const projectPath = join(cwd, ".pi", "kaomoji-english-tutor.json");
-
-	let config: PetConfig = { ...DEFAULTS };
-
-	for (const path of [globalPath, projectPath]) {
-		if (existsSync(path)) {
-			try {
-				const parsed = JSON.parse(readFileSync(path, "utf-8"));
-				config = { ...config, ...parsed };
-			} catch (err) {
-				console.error(`[kaomoji-english-tutor] Failed to load config from ${path}: ${err}`);
-			}
-		}
-	}
-
-	if (!Number.isFinite(config.intervalMinutes) || config.intervalMinutes < 0 || config.intervalMinutes > 1440) {
-		config.intervalMinutes = DEFAULTS.intervalMinutes;
-	}
-	return config;
-}
-
-// -- Pet faces ------------------------------------------------------------
-
-const FACES = {
-	teach: "(=^･ω･^=)",
-	review: "(=^‥^=)",
-	idle: "(=ΦωΦ=)",
-	party: "(=^‥^=)ﾉ",
-	error: "(=；ω；=)",
-} as const;
-
-// -- SQLite storage -------------------------------------------------------
-
-interface ItemRow {
-	id: number;
-	type: "word" | "phrase" | "sentence";
-	text: string;
-	phonetic: string | null;
-	meaning: string;
-	example: string | null;
-	example_cn: string | null;
-	learned_at: string;
-	fsrs_state: string;
-	due_at: string;
-	shown: number;
-	reviews: number;
-	status: string;
-	levels: string | null;
-	levels_cn: string | null;
-	chunks: string | null;
-	key_words: string | null;
-	progress: number;
-	// Adaptive columns (inert in protocol 1; written by later milestones)
-	lesson_id?: number | null;
-	lexical_sense_id?: number | null;
-	role?: string | null;
-	content_fingerprint?: string | null;
-	content_version?: number;
-	introduced_at?: string | null;
-	introduction_kind?: string | null;
-	introduction_accuracy?: string;
-	content_status?: string;
-	legacy_duplicate_of?: number | null;
-	fsrs_status?: string;
-	fsrs_error?: string | null;
-	fsrs_corrupt_at?: string | null;
-}
-
-/** Add a column only when missing; replaces the old try/catch ALTER pattern. */
-function addColumnIfMissing(db: DatabaseSync, table: string, columnDef: string): void {
-	const name = columnDef.trim().split(/\s+/)[0];
-	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-	if (!cols.some((c) => c.name === name)) {
-		// pi-lens-ignore: sql-injection
-		db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
-	}
-}
-
-/** Record this client's protocol version + heartbeat (protocol 1). */
-function touchClient(db: DatabaseSync, clientId: string): void {
-	db.prepare(
-		"INSERT INTO runtime_clients (client_id, protocol_version, last_seen) VALUES (?, 1, ?) ON CONFLICT(client_id) DO UPDATE SET last_seen = excluded.last_seen, protocol_version = excluded.protocol_version",
-	).run(clientId, new Date().toISOString());
-}
-
-/**
- * Versioned, idempotent schema migrations. Each step runs inside its own short
- * transaction and is recorded in `schema_migrations`, so completion no longer
- * depends on swallowing ALTER errors.
- */
-const SCHEMA_TARGET_VERSION = 7;
-const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
-	// v1: adaptive tutor compatibility schema (protocol 1).
-	// All structures are empty and unused at runtime; existing behavior is unchanged.
-	(db: DatabaseSync) => {
-		// Legacy column upgrades (previously guarded by try/catch ALTER).
-		for (const col of [
-			"status TEXT NOT NULL DEFAULT 'learning'",
-			"levels TEXT", "levels_cn TEXT", "chunks TEXT", "key_words TEXT",
-			"progress INTEGER NOT NULL DEFAULT 0",
-		]) addColumnIfMissing(db, "items", col);
-		for (const col of ["generation_token TEXT", "generation_until TEXT"]) {
-			addColumnIfMissing(db, "runtime_state", col);
-		}
-
-		// Adaptive items columns (written by later milestones; inert in protocol 1).
-		for (const col of [
-			"lesson_id INTEGER", "lexical_sense_id INTEGER", "role TEXT",
-			"content_fingerprint TEXT", "content_version INTEGER NOT NULL DEFAULT 1",
-			"introduced_at TEXT", "introduction_kind TEXT",
-			"introduction_accuracy TEXT NOT NULL DEFAULT 'exact'",
-			"content_status TEXT NOT NULL DEFAULT 'approved'",
-			"legacy_duplicate_of INTEGER", "fsrs_status TEXT NOT NULL DEFAULT 'ok'",
-			"fsrs_error TEXT", "fsrs_corrupt_at TEXT",
-		]) addColumnIfMissing(db, "items", col);
-
-		db.exec(`
-			CREATE TABLE IF NOT EXISTS lessons (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				mode TEXT NOT NULL, topic TEXT, objective TEXT NOT NULL,
-				context_hash TEXT NOT NULL, snapshot_version INTEGER NOT NULL,
-				plan_json TEXT NOT NULL, quality_json TEXT NOT NULL,
-				status TEXT NOT NULL, created_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS lexical_senses (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				kind TEXT NOT NULL CHECK (kind IN ('word','phrase')),
-				surface TEXT NOT NULL, normalized_surface TEXT NOT NULL,
-				part_of_speech TEXT, meaning_zh TEXT NOT NULL,
-				normalized_meaning TEXT NOT NULL, usage_note TEXT,
-				sense_fingerprint TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
-			);
-			CREATE INDEX IF NOT EXISTS lexical_senses_surface_idx
-				on lexical_senses(kind, normalized_surface);
-			CREATE TABLE IF NOT EXISTS lexical_surface_versions (
-				kind TEXT NOT NULL, normalized_surface TEXT NOT NULL,
-				version INTEGER NOT NULL DEFAULT 0,
-				PRIMARY KEY (kind, normalized_surface)
-			);
-			CREATE TABLE IF NOT EXISTS supporting_materials (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				lesson_id INTEGER NOT NULL, kind TEXT NOT NULL,
-				content_json TEXT NOT NULL,
-				content_fingerprint TEXT NOT NULL UNIQUE,
-				status TEXT NOT NULL DEFAULT 'approved', created_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS exercises (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				item_id INTEGER NOT NULL, kind TEXT NOT NULL,
-				schema_version INTEGER NOT NULL, stage TEXT NOT NULL,
-				content_fingerprint TEXT NOT NULL UNIQUE,
-				prompt_json TEXT NOT NULL, answer_json TEXT NOT NULL,
-				hints_json TEXT NOT NULL, rubric_json TEXT NOT NULL,
-				quality_json TEXT NOT NULL,
-				status TEXT NOT NULL DEFAULT 'approved',
-				used_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS exercise_senses (
-				exercise_id INTEGER NOT NULL, lexical_sense_id INTEGER NOT NULL,
-				role TEXT NOT NULL CHECK (role IN ('target','contrast','accepted_alternative')),
-				PRIMARY KEY (exercise_id, lexical_sense_id, role)
-			);
-			CREATE TABLE IF NOT EXISTS content_catalog_state (
-				id INTEGER PRIMARY KEY CHECK (id = 1),
-				version INTEGER NOT NULL DEFAULT 0
-			);
-			INSERT OR IGNORE INTO content_catalog_state (id, version) VALUES (1, 0);
-			CREATE TABLE IF NOT EXISTS attempts (
-				id TEXT PRIMARY KEY, item_id INTEGER NOT NULL, exercise_id INTEGER,
-				review_cycle_id TEXT NOT NULL, claim_key TEXT NOT NULL UNIQUE,
-				question_version INTEGER NOT NULL, evaluation_version INTEGER NOT NULL,
-				kind TEXT NOT NULL, answer_text TEXT, assistance_level TEXT NOT NULL,
-				status TEXT NOT NULL CHECK (status IN ('evaluating','evaluated','superseded','stale','abandoned','self_report')),
-				evaluation_owner TEXT, evaluation_token TEXT, evaluation_until TEXT,
-				verdict TEXT, error_tags_json TEXT, feedback_json TEXT,
-				explicit_rating TEXT, started_at TEXT NOT NULL,
-				completed_at TEXT, rated_at TEXT
-			);
-			CREATE TABLE IF NOT EXISTS mastery_state (
-				item_id INTEGER PRIMARY KEY, stage TEXT NOT NULL,
-				recognition_evidence INTEGER NOT NULL DEFAULT 0,
-				recall_evidence INTEGER NOT NULL DEFAULT 0,
-				use_evidence INTEGER NOT NULL DEFAULT 0,
-				transfer_evidence INTEGER NOT NULL DEFAULT 0,
-				unassisted_good INTEGER NOT NULL DEFAULT 0,
-				assisted_good INTEGER NOT NULL DEFAULT 0,
-				consecutive_again INTEGER NOT NULL DEFAULT 0,
-				contrast_pending INTEGER NOT NULL DEFAULT 0,
-				last_evidence_cycle_id TEXT,
-				error_profile_json TEXT NOT NULL DEFAULT '{}',
-				last_exercise_kind TEXT, updated_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS content_reports (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				item_id INTEGER, exercise_id INTEGER, reason TEXT NOT NULL,
-				content_version INTEGER NOT NULL, status TEXT NOT NULL,
-				review_job_id TEXT, resolution_json TEXT, created_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS fsrs_corruptions (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				item_id INTEGER NOT NULL, raw_fsrs_state TEXT, error_code TEXT,
-				detected_at TEXT NOT NULL, resolution TEXT
-			);
-			CREATE TABLE IF NOT EXISTS tutor_jobs (
-				id TEXT PRIMARY KEY, purpose TEXT NOT NULL,
-				job_key TEXT NOT NULL UNIQUE, snapshot_hash TEXT NOT NULL,
-				pipeline_version INTEGER NOT NULL, phase TEXT NOT NULL,
-				status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
-				attempt_count INTEGER NOT NULL DEFAULT 0, next_run_at TEXT NOT NULL,
-				owner TEXT, lease_token TEXT, lease_until TEXT,
-				artifacts_json TEXT NOT NULL DEFAULT '{}', failure_json TEXT,
-				created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS tutor_job_artifacts (
-				job_id TEXT NOT NULL, job_version INTEGER NOT NULL, phase TEXT NOT NULL,
-				artifact_key TEXT NOT NULL, input_hash TEXT, status TEXT NOT NULL,
-				payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
-				PRIMARY KEY (job_id, job_version, phase, artifact_key)
-			);
-			CREATE TABLE IF NOT EXISTS replacement_requests (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				source_item_id INTEGER, source_snapshot_json TEXT,
-				requested_type TEXT NOT NULL, status TEXT NOT NULL,
-				attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
-				last_context_hash TEXT, created_at TEXT NOT NULL, completed_at TEXT
-			);
-			CREATE TABLE IF NOT EXISTS runtime_clients (
-				client_id TEXT PRIMARY KEY,
-				protocol_version INTEGER NOT NULL,
-				last_seen TEXT NOT NULL
-			);
-		`);
-	},
-	// v2: backfill introduced_at for items shown before quota tracking (protocol 1 baseline).
-	(db: DatabaseSync) => {
-		db.exec(
-			"UPDATE items SET introduced_at = learned_at, introduction_kind = 'legacy', introduction_accuracy = 'approximate' " +
-			"WHERE shown = 1 AND introduced_at IS NULL",
-		);
-	},
-	// v3: content fingerprint dedup — backfill canonical items and add a unique partial index.
-	(db: DatabaseSync) => {
-		const rows = db.prepare("SELECT id, type, text, meaning FROM items WHERE content_fingerprint IS NULL ORDER BY id ASC")
-			.all() as { id: number; type: string; text: string; meaning: string }[];
-		const seen = new Map<string, number>();
-		const setFp = db.prepare("UPDATE items SET content_fingerprint = ? WHERE id = ?");
-		const markDup = db.prepare("UPDATE items SET content_fingerprint = NULL, legacy_duplicate_of = ? WHERE id = ?");
-		for (const r of rows) {
-			const fp = contentFingerprint(r.type, r.text, r.meaning);
-			const canonical = seen.get(fp);
-			if (canonical != null) {
-				markDup.run(canonical, r.id);
-			} else {
-				seen.set(fp, r.id);
-				setFp.run(fp, r.id);
-			}
-		}
-		db.exec("CREATE UNIQUE INDEX IF NOT EXISTS items_content_fingerprint_uq ON items(content_fingerprint) WHERE content_fingerprint IS NOT NULL");
-	},
-	// v4: persist the active recall direction with the global card slot.
-	(db: DatabaseSync) => {
-		addColumnIfMissing(db, "runtime_state", "active_direction TEXT NOT NULL DEFAULT 'forward'");
-	},
-	// v5: persist progressive sentence-output cycles across sessions/reloads.
-	(db: DatabaseSync) => {
-		for (const col of [
-			"active_review_cycle_id TEXT",
-			"active_exercise_id INTEGER",
-			"active_cycle_outcome TEXT",
-			"active_retry_count INTEGER NOT NULL DEFAULT 0",
-			"active_assistance_level TEXT NOT NULL DEFAULT 'none'",
-		]) addColumnIfMissing(db, "runtime_state", col);
-	},
-	// v6: indexes for the now-shared scheduling and first-display predicates.
-	(db: DatabaseSync) => {
-		db.exec("CREATE INDEX IF NOT EXISTS items_due_shown_idx ON items(due_at, shown, id) WHERE content_status = 'approved'");
-		db.exec("CREATE INDEX IF NOT EXISTS items_introduction_idx ON items(introduction_kind, introduced_at) WHERE introduction_kind = 'planned'");
-	},
-	// v7: restore states falsely quarantined because fsrs.js emits fractional elapsed_days.
-	(db: DatabaseSync) => {
-		const rows = db.prepare(
-			"SELECT c.id AS corruption_id, c.item_id, c.raw_fsrs_state FROM fsrs_corruptions c JOIN items i ON i.id = c.item_id WHERE c.resolution IS NULL AND c.error_code = 'invalid_field:elapsed_days' AND i.fsrs_status = 'corrupt' AND i.fsrs_state = c.raw_fsrs_state",
-		).all() as { corruption_id: number; item_id: number; raw_fsrs_state: string }[];
-		for (const row of rows) {
-			if ("corrupt" in restoreCard(row.raw_fsrs_state)) continue;
-			const restored = db.prepare(
-				"UPDATE items SET fsrs_status = 'ok', fsrs_error = NULL, fsrs_corrupt_at = NULL WHERE id = ? AND fsrs_status = 'corrupt' AND fsrs_state = ?",
-			).run(row.item_id, row.raw_fsrs_state);
-			if (Number(restored.changes) > 0) {
-				db.prepare("UPDATE fsrs_corruptions SET resolution = 'restored:v7_fractional_elapsed_days_false_positive' WHERE id = ?")
-					.run(row.corruption_id);
-			}
-		}
-	},
-];
-
-function runMigrations(db: DatabaseSync): void {
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS schema_meta (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			schema_version INTEGER NOT NULL DEFAULT 0,
-			adaptive_protocol INTEGER NOT NULL DEFAULT 0,
-			migration_state TEXT NOT NULL DEFAULT 'pending'
-		);
-		INSERT OR IGNORE INTO schema_meta (id, schema_version, adaptive_protocol, migration_state)
-		VALUES (1, 0, 0, 'pending');
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-		);
-	`);
-	const applied = new Set(
-		(db.prepare("SELECT version FROM schema_migrations").all() as { version: number }[])
-			.map((r) => r.version),
-	);
-	for (let v = 1; v <= SCHEMA_TARGET_VERSION; v++) {
-		if (applied.has(v)) continue;
-		const step = SCHEMA_MIGRATIONS[v - 1];
-		if (!step) continue;
-		db.exec("BEGIN IMMEDIATE");
-		try {
-			// Another process may have committed this migration while BEGIN waited.
-			if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(v)) {
-				db.exec("COMMIT");
-				continue;
-			}
-			step(db);
-			db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-				.run(v, new Date().toISOString());
-			db.exec("COMMIT");
-		} catch (err) {
-			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-			throw err;
-		}
-	}
-	db.prepare("UPDATE schema_meta SET schema_version = ?, adaptive_protocol = 1, migration_state = 'complete' WHERE id = 1")
-		.run(SCHEMA_TARGET_VERSION);
-}
-
-function openDb(): DatabaseSync {
-	const db = new DatabaseSync(join(getAgentDir(), "kaomoji-english-tutor.db"));
-	db.exec(`
-		PRAGMA busy_timeout = 5000;
-		PRAGMA journal_mode = WAL;
-		CREATE TABLE IF NOT EXISTS items (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			type TEXT NOT NULL CHECK (type IN ('word', 'phrase', 'sentence')),
-			text TEXT NOT NULL,
-			phonetic TEXT,
-			meaning TEXT NOT NULL,
-			example TEXT,
-			example_cn TEXT,
-			learned_at TEXT NOT NULL,
-			fsrs_state TEXT NOT NULL DEFAULT '',
-			due_at TEXT NOT NULL,
-			shown INTEGER NOT NULL DEFAULT 0,
-			reviews INTEGER NOT NULL DEFAULT 0,
-			status TEXT NOT NULL DEFAULT 'learning',
-			levels TEXT,
-			levels_cn TEXT,
-			chunks TEXT,
-			key_words TEXT,
-			progress INTEGER NOT NULL DEFAULT 0
-		);
-		CREATE TABLE IF NOT EXISTS stats (
-			key TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		);
-	`);
-	// Single global card-slot row.
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS runtime_state (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			active_item_id INTEGER,
-			active_kind TEXT,
-			active_direction TEXT NOT NULL DEFAULT 'forward',
-			active_version INTEGER NOT NULL DEFAULT 0,
-			active_review_cycle_id TEXT,
-			active_exercise_id INTEGER,
-			active_cycle_outcome TEXT,
-			active_retry_count INTEGER NOT NULL DEFAULT 0,
-			active_assistance_level TEXT NOT NULL DEFAULT 'none',
-			next_check_at TEXT NOT NULL,
-			coordinator TEXT,
-			coordinator_until TEXT,
-			generation_token TEXT,
-			generation_until TEXT,
-			last_activity TEXT
-		);
-		INSERT OR IGNORE INTO runtime_state (id, active_version, next_check_at) VALUES (1, 0, '');
-	`);
-	runMigrations(db);
-	return db;
-}
-
-function getStat(db: DatabaseSync, key: string): string | null {
-	const row = db.prepare("SELECT value FROM stats WHERE key = ?").get(key) as { value: string } | undefined;
-	return row?.value ?? null;
-}
-
-function setStat(db: DatabaseSync, key: string, value: string | number) {
-	db.prepare(
-		"INSERT INTO stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-	).run(key, String(value));
-}
-
-function bumpStat(db: DatabaseSync, key: string, delta: number) {
-	setStat(db, key, Number(getStat(db, key) ?? 0) + delta);
-}
-
-function localDateStr(d: Date = new Date()): string {
-	const y = d.getFullYear();
-	const m = String(d.getMonth() + 1).padStart(2, "0");
-	const day = String(d.getDate()).padStart(2, "0");
-	return `${y}-${m}-${day}`;
-}
-
-function localDayStartISO(d: Date = new Date()): string {
-	return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
-}
-
-/** Extend the learning streak based on today's activity. */
-function touchStreak(db: DatabaseSync, now: Date) {
-	const today = localDateStr(now);
-	const last = getStat(db, "last_active_date");
-	if (last === today) return;
-	const yesterday = localDateStr(new Date(now.getTime() - 24 * 3600 * 1000));
-	const days = last === yesterday ? Number(getStat(db, "streak_days") ?? 0) + 1 : 1;
-	setStat(db, "streak_days", days);
-	setStat(db, "last_active_date", today);
-}
-
-/** Mastery stage progression + demotion (deterministic, §6.2). */
-const MASTERY_STAGES = ["exposure", "recognition", "controlled_recall", "production", "transfer"] as const;
-const MASTERY_PROMOTE_THRESHOLDS = [1, 2, 2, 2]; // unassisted Good count needed to leave each stage
-function computeMasteryStage(prevStage: string, unassistedGood: number, isAgain: boolean): string {
-	let idx = Math.max(0, MASTERY_STAGES.indexOf(prevStage as never));
-	if (isAgain) return MASTERY_STAGES[Math.max(0, idx - 1)];
-	// Promote at most one stage per rating: reaching the threshold advances a single level.
-	if (idx < MASTERY_STAGES.length - 1 && unassistedGood >= MASTERY_PROMOTE_THRESHOLDS[idx]) {
-		return MASTERY_STAGES[idx + 1];
-	}
-	return MASTERY_STAGES[idx];
-}
-
-/** Deterministic content fingerprint for exact dedup: type + normalized text + normalized meaning. */
-export function contentFingerprint(type: string, text: string, meaning: string): string {
-	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-	return createHash("sha256")
-		.update(`${type}\u0000${norm(text)}\u0000${norm(meaning)}`, "utf8")
-		.digest("hex");
-}
-
-/** Sense fingerprint: kind + normalized surface + part of speech + normalized meaning. */
-function senseFingerprint(kind: "word" | "phrase", surface: string, pos: string | null, meaning: string): string {
-	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-	return createHash("sha256")
-		.update(`${kind}\u0000${norm(surface)}\u0000${pos ?? ""}\u0000${norm(meaning)}`, "utf8")
-		.digest("hex");
-}
-
-/** Find or create a lexical_sense for a word/phrase item; sentences have no sense. */
-function ensureLexicalSense(db: DatabaseSync, type: string, text: string, meaning: string, now: Date): number | null {
-	if (type !== "word" && type !== "phrase") return null;
-	const kind = type as "word" | "phrase";
-	const fp = senseFingerprint(kind, text, null, meaning);
-	const existing = db.prepare("SELECT id FROM lexical_senses WHERE sense_fingerprint = ?").get(fp) as { id: number } | undefined;
-	if (existing) return existing.id;
-	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-	const result = db.prepare(
-		"INSERT INTO lexical_senses (kind, surface, normalized_surface, part_of_speech, meaning_zh, normalized_meaning, sense_fingerprint, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-	).run(kind, text, norm(text), meaning, norm(meaning), fp, now.toISOString());
-	return Number(result.lastInsertRowid);
-}
-
-function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
-	return db
-		.prepare(`SELECT * FROM items WHERE due_at <= ? ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
-		.get(now.toISOString()) as ItemRow | undefined;
-}
-
-/** Shared predicate for items eligible to be surfaced by the scheduler.
- * Excludes corrupt, quarantined, or legacy-duplicate content. */
-const SCHEDULABLE = "AND (fsrs_status = 'ok' OR fsrs_status IS NULL) AND content_status = 'approved' AND legacy_duplicate_of IS NULL";
-
-function insertItem(
-	db: DatabaseSync,
-	type: string,
-	text: string,
-	phonetic: string | null,
-	meaning: string,
-	example: string | null,
-	example_cn: string | null,
-	now: Date,
-	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"]; introductionKind?: "planned" | "replacement" },
-): number {
-	const senseId = ensureLexicalSense(db, type, text, meaning, now);
-	const ts = now.toISOString();
-	const introductionKind = extra?.introductionKind ?? "planned";
-	const result = db.prepare(
-		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-	).run(
-		type,
-		text,
-		phonetic,
-		meaning,
-		example,
-		example_cn,
-		ts,
-		ts,
-		extra?.levels ? JSON.stringify(extra.levels) : null,
-		extra?.levels_cn ? JSON.stringify(extra.levels_cn) : null,
-		extra?.chunks ? JSON.stringify(extra.chunks) : null,
-		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
-		contentFingerprint(type, text, meaning),
-		senseId,
-		introductionKind,
-	);
-	return Number(result.lastInsertRowid);
-}
-
-function markShown(db: DatabaseSync, id: number) {
-	db.prepare("UPDATE items SET shown = 1 WHERE id = ?").run(id);
-}
-
-function advanceReview(db: DatabaseSync, id: number, fsrsState: string, dueAt: string, reviews: number) {
-	db.prepare("UPDATE items SET fsrs_state = ?, due_at = ?, reviews = ? WHERE id = ?").run(
-		fsrsState,
-		dueAt,
-		reviews,
-		id,
-	);
-}
-
-function countTodayNew(db: DatabaseSync, now: Date): number {
-		const row = db
-				.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind = 'planned' AND introduced_at >= ?")
-				.get(localDayStartISO(now)) as { n: number };
-		return Number(row.n);
-}
-
-function knownList(db: DatabaseSync): string[] {
-	const rows = db.prepare("SELECT text FROM items WHERE shown = 1 ORDER BY id DESC LIMIT 30").all() as {
-		text: string;
-	}[];
-	return rows.map((r) => r.text);
-}
-
-function replacementKnownList(db: DatabaseSync): string[] {
-	const rows = db.prepare("SELECT type, text, meaning FROM items ORDER BY id DESC LIMIT 50").all() as Array<{
-		type: string;
-		text: string;
-		meaning: string;
-	}>;
-	return rows.map((row) => `${row.type}: ${row.text} = ${row.meaning}`);
-}
-
-function pendingReplacementTypes(db: DatabaseSync): GeneratedItem["type"][] {
-	const raw = getStat(db, "pending_replacements");
-	if (!raw) return [];
-	try {
-		const parsed = JSON.parse(raw);
-		if (!Array.isArray(parsed)) return [];
-		return parsed.filter((type): type is GeneratedItem["type"] =>
-			type === "word" || type === "phrase" || type === "sentence"
-		);
-	} catch {
-		return [];
-	}
-}
-
-function enqueueReplacement(db: DatabaseSync, type: GeneratedItem["type"]) {
-	setStat(db, "pending_replacements", JSON.stringify([...pendingReplacementTypes(db), type]));
-}
-
-function consumeReplacement(db: DatabaseSync, type: GeneratedItem["type"]): boolean {
-	const queue = pendingReplacementTypes(db);
-	if (queue[0] !== type) return false;
-	queue.shift();
-	setStat(db, "pending_replacements", JSON.stringify(queue));
-	return true;
-}
-
-// -- Multi-session runtime state ------------------------------------------
+// -- Timing & pacing knobs (closure orchestration) ---------------------------
 
 /**
  * Single global learning slot shared across every concurrent Pi session.
@@ -648,1119 +40,6 @@ const REPLACEMENT_GRACE_MS = 8000;
 const AGAIN_FEEDBACK_GRACE_MS = 15_000;
 const ANSWER_THINKING_INTERVAL_MS = 120;
 const ANSWER_THINKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-type RecallDirection = "forward" | "reverse";
-type AssistanceLevel = "none" | "hint" | "revealed";
-
-interface PendingAttempt {
-	itemId: number;
-	version: number;
-	direction: RecallDirection;
-	sessionGeneration: number;
-	answerText: string;
-	assistanceLevel: AssistanceLevel;
-	startedAt: string;
-	verdict: "correct" | "partial" | "incorrect";
-	feedback: string;
-	reviewCycleId?: string;
-	exerciseId?: number;
-	kind?: string;
-	errorTags?: string[];
-	correctedAnswer?: string;
-}
-
-interface RuntimeState {
-	active_item_id: number | null;
-	active_kind: "review" | "teach" | null;
-	active_direction: RecallDirection;
-	active_version: number;
-	active_review_cycle_id: string | null;
-	active_exercise_id: number | null;
-	active_cycle_outcome: "clean" | "again" | null;
-	active_retry_count: number;
-	active_assistance_level: AssistanceLevel;
-	next_check_at: string;
-	coordinator: string | null;
-	coordinator_until: string | null;
-	generation_token: string | null;
-	generation_until: string | null;
-	last_activity: string | null;
-}
-
-/** Build the non-null default runtime state when the row is missing. */
-function defaultRuntimeState(): RuntimeState {
-	return {
-		active_item_id: null,
-		active_kind: null,
-		active_direction: "forward",
-		active_version: 0,
-		active_review_cycle_id: null,
-		active_exercise_id: null,
-		active_cycle_outcome: null,
-		active_retry_count: 0,
-		active_assistance_level: "none",
-		next_check_at: new Date(0).toISOString(),
-		coordinator: null,
-		coordinator_until: null,
-		generation_token: null,
-		generation_until: null,
-		last_activity: null,
-	};
-}
-
-function getRuntimeState(db: DatabaseSync): RuntimeState {
-	let row = db.prepare("SELECT * FROM runtime_state WHERE id = 1").get() as RuntimeState | undefined;
-	if (!row) {
-		db.prepare("INSERT OR IGNORE INTO runtime_state (id, active_version, next_check_at) VALUES (1, 0, '')").run();
-		row = db.prepare("SELECT * FROM runtime_state WHERE id = 1").get() as RuntimeState | undefined;
-	}
-	if (!row) return defaultRuntimeState();
-	return {
-		active_item_id: row.active_item_id,
-		active_kind: row.active_kind as RuntimeState["active_kind"],
-		active_direction: row.active_direction === "reverse" ? "reverse" : "forward",
-		active_version: Number(row.active_version ?? 0),
-		active_review_cycle_id: row.active_review_cycle_id,
-		active_exercise_id: row.active_exercise_id == null ? null : Number(row.active_exercise_id),
-		active_cycle_outcome: row.active_cycle_outcome === "again" ? "again" : row.active_cycle_outcome === "clean" ? "clean" : null,
-		active_retry_count: Number(row.active_retry_count ?? 0),
-		active_assistance_level: row.active_assistance_level === "revealed" ? "revealed" : row.active_assistance_level === "hint" ? "hint" : "none",
-		next_check_at: row.next_check_at ?? "",
-		coordinator: row.coordinator,
-		coordinator_until: row.coordinator_until,
-		generation_token: row.generation_token,
-		generation_until: row.generation_until,
-		last_activity: row.last_activity,
-	};
-}
-
-const RUNTIME_COLUMNS = new Set<keyof RuntimeState>([
-	"active_item_id",
-	"active_kind",
-	"active_direction",
-	"active_version",
-	"active_review_cycle_id",
-	"active_exercise_id",
-	"active_cycle_outcome",
-	"active_retry_count",
-	"active_assistance_level",
-	"next_check_at",
-	"coordinator",
-	"coordinator_until",
-	"generation_token",
-	"generation_until",
-	"last_activity",
-]);
-
-/** Update only the supplied columns so unrelated cross-process state cannot be clobbered. */
-function setRuntimeState(db: DatabaseSync, patch: Partial<RuntimeState>) {
-	const entries = Object.entries(patch).filter(([key]) => RUNTIME_COLUMNS.has(key as keyof RuntimeState));
-	if (!entries.length) return;
-	const assignments = entries.map(([key]) => `${key} = ?`).join(", ");
-	db.prepare(`UPDATE runtime_state SET ${assignments} WHERE id = 1`).run(...entries.map(([, value]) => value));
-}
-
-const EMPTY_SENTENCE_CYCLE: Pick<RuntimeState,
-	"active_review_cycle_id" | "active_exercise_id" | "active_cycle_outcome" | "active_retry_count" | "active_assistance_level"
-> = {
-	active_review_cycle_id: null,
-	active_exercise_id: null,
-	active_cycle_outcome: null,
-	active_retry_count: 0,
-	active_assistance_level: "none",
-};
-
-/** Lazily attach an authoritative sentence-output cycle to the global card slot. */
-function ensureSentenceCycle(db: DatabaseSync, item: ItemRow, state: RuntimeState): RuntimeState {
-	if (item.type !== "sentence" || state.active_item_id !== item.id) return state;
-	const exercise = sentenceExercise(item);
-	if (!exercise) return state;
-	const exerciseId = ensureSentenceExercise(db, item, exercise);
-	db.prepare(
-		"UPDATE runtime_state SET active_direction = 'forward', active_review_cycle_id = COALESCE(active_review_cycle_id, ?), active_exercise_id = ?, active_cycle_outcome = COALESCE(active_cycle_outcome, 'clean'), active_retry_count = COALESCE(active_retry_count, 0), active_assistance_level = COALESCE(active_assistance_level, 'none') WHERE id = 1 AND active_item_id = ? AND active_version = ?",
-	).run(randomUUID(), exerciseId, item.id, state.active_version);
-	return getRuntimeState(db);
-}
-
-/** True when the global pacing window (next_check_at) has elapsed. */
-function pacingReady(state: RuntimeState, now: Date): boolean {
-	if (!state.next_check_at) return true;
-	return now.getTime() >= new Date(state.next_check_at).getTime();
-}
-
-/** My coordinator identity: `<sessionId>::<instanceToken>`. */
-function myCoordinatorId(sessionId: string, instanceToken: string): string {
-	return `${sessionId || "session"}::${instanceToken}`;
-}
-
-/** Lower the global pacing window to `now` (used when a card is activated). */
-function resetPacing(db: DatabaseSync) {
-	setRuntimeState(db, { next_check_at: new Date().toISOString() });
-}
-
-function activeItem(db: DatabaseSync): ItemRow | undefined {
-	const state = getRuntimeState(db);
-	if (state.active_item_id == null) return undefined;
-	return db.prepare("SELECT * FROM items WHERE id = ?").get(state.active_item_id) as ItemRow | undefined;
-}
-
-function latestMasteredItem(db: DatabaseSync, type: GeneratedItem["type"]): ItemRow | undefined {
-	return db
-		.prepare("SELECT * FROM items WHERE type = ? AND status = 'mastered' ORDER BY id DESC LIMIT 1")
-		.get(type) as ItemRow | undefined;
-}
-
-// -- FSRS scheduling ------------------------------------------------------
-
-const scheduler = new FSRS();
-
-/** Rebuild a Card from its stored JSON state (dates come back as strings).
- * Empty state is a valid new Card; non-empty malformed state is corruption. */
-function restoreCard(stateJson: string): { card: Card } | { corrupt: true; error: string } {
-	if (!stateJson.trim()) return { card: new Card() };
-	let parsed: Card;
-	try {
-		parsed = JSON.parse(stateJson) as Card;
-	} catch (err) {
-		return { corrupt: true, error: `json_parse: ${(err as Error).message}` };
-	}
-	if (parsed == null || typeof parsed !== "object") {
-		return { corrupt: true, error: "not_object" };
-	}
-	const required: Array<[string, unknown]> = [
-		["due", parsed.due],
-		["stability", parsed.stability],
-		["difficulty", parsed.difficulty],
-		["elapsed_days", parsed.elapsed_days],
-		["scheduled_days", parsed.scheduled_days],
-		["reps", parsed.reps],
-		["lapses", parsed.lapses],
-		["state", parsed.state],
-	];
-	for (const [name, value] of required) {
-		if (value == null) return { corrupt: true, error: `missing_field:${name}` };
-		if (name !== "due" && (typeof value !== "number" || !Number.isFinite(value))) {
-			return { corrupt: true, error: `invalid_field:${name}` };
-		}
-	}
-	if (![State.New, State.Learning, State.Review, State.Relearning].includes(parsed.state)) {
-		return { corrupt: true, error: "invalid_field:state" };
-	}
-	if (parsed.elapsed_days < 0) return { corrupt: true, error: "invalid_field:elapsed_days" };
-	for (const [name, value] of [["scheduled_days", parsed.scheduled_days], ["reps", parsed.reps], ["lapses", parsed.lapses]] as const) {
-		if (!Number.isInteger(value) || value < 0) return { corrupt: true, error: `invalid_field:${name}` };
-	}
-	if (parsed.stability < 0 || parsed.difficulty < 0 || parsed.difficulty > 10) {
-		return { corrupt: true, error: "invalid_field:fsrs_range" };
-	}
-	if (parsed.state !== State.New && (parsed.stability <= 0 || parsed.difficulty < 1)) {
-		return { corrupt: true, error: "invalid_field:review_range" };
-	}
-	const due = new Date(parsed.due);
-	const lastReview = parsed.last_review ? new Date(parsed.last_review) : new Date(parsed.due);
-	if (Number.isNaN(due.getTime())) return { corrupt: true, error: "invalid_date:due" };
-	if (Number.isNaN(lastReview.getTime())) return { corrupt: true, error: "invalid_date:last_review" };
-	const card = new Card();
-	card.due = due;
-	card.last_review = lastReview;
-	card.stability = parsed.stability;
-	card.difficulty = parsed.difficulty;
-	card.elapsed_days = parsed.elapsed_days;
-	card.scheduled_days = parsed.scheduled_days;
-	card.reps = parsed.reps;
-	card.lapses = parsed.lapses;
-	card.state = parsed.state;
-	return { card };
-}
-
-/** Advance a card only after an explicit user rating.
- * Passing null state creates the first schedule for a brand-new item.
- * Returns corrupt when the stored FSRS blob is malformed; callers must quarantine. */
-function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } | { corrupt: true; error: string } {
-	if (!stateJson) {
-		const info = scheduler.repeat(new Card(), now)[rating];
-		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
-	}
-	const restored = restoreCard(stateJson);
-	if ("corrupt" in restored) return restored;
-	try {
-		const info = scheduler.repeat(restored.card, now)[rating];
-		if (!info?.card || Number.isNaN(info.card.due.getTime())) {
-			return { corrupt: true, error: "scheduler_invalid_due" };
-		}
-		for (const value of [info.card.stability, info.card.difficulty, info.card.elapsed_days, info.card.scheduled_days, info.card.reps, info.card.lapses]) {
-			if (!Number.isFinite(value)) return { corrupt: true, error: "scheduler_invalid_field" };
-		}
-		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
-	} catch (err) {
-		return { corrupt: true, error: `scheduler_error:${(err as Error).message}` };
-	}
-}
-
-/** Atomically quarantine a corrupt FSRS item: preserve the raw blob, mark it corrupt,
- * insert one diagnostic row, and clear the active card slot. */
-function quarantineCorruptFsrs(db: DatabaseSync, itemId: number, rawFsrsState: string, error: string, now: Date): void {
-	const ts = now.toISOString();
-	const errCode = error.slice(0, 80);
-	try {
-		db.exec("BEGIN IMMEDIATE");
-		const marked = db.prepare("UPDATE items SET fsrs_status = 'corrupt', fsrs_error = ?, fsrs_corrupt_at = ? WHERE id = ? AND fsrs_status IS NOT 'corrupt'")
-			.run(errCode, ts, itemId);
-		if (Number(marked.changes) > 0) {
-			db.prepare(
-				"INSERT INTO fsrs_corruptions (item_id, raw_fsrs_state, error_code, detected_at, resolution) VALUES (?, ?, ?, ?, NULL)",
-			).run(itemId, rawFsrsState, errCode, ts);
-		}
-		// Clear the active card slot so the corrupt item is not re-surfaced.
-		const cur = getRuntimeState(db);
-		if (cur.active_item_id === itemId) {
-			setRuntimeState(db, {
-				active_item_id: null,
-				active_kind: null,
-				active_direction: "forward",
-				active_version: cur.active_version + 1,
-				...EMPTY_SENTENCE_CYCLE,
-				next_check_at: now.toISOString(),
-			});
-		}
-		db.exec("COMMIT");
-	} catch (err) {
-		try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-		console.error(`[kaomoji-english-tutor] FSRS quarantine failed for item ${itemId}: ${err}`);
-	}
-}
-
-// -- Conversation extraction ----------------------------------------------
-
-interface ContentBlock {
-	type?: string;
-	text?: string;
-	name?: string;
-}
-
-interface SessionEntry {
-	type: string;
-	message?: {
-		role?: string;
-		content?: unknown;
-	};
-}
-
-/** Extract user+assistant text from a content field, collapsing tool calls. */
-function renderText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	const parts: string[] = [];
-	for (const block of content) {
-		if (!block || typeof block !== "object") continue;
-		const b = block as ContentBlock;
-		if (b.type === "text" && typeof b.text === "string") {
-			parts.push(b.text);
-		} else if (b.type === "toolCall" && typeof b.name === "string") {
-			parts.push(`[调用了工具 ${b.name}]`);
-		}
-	}
-	return parts.join("\n");
-}
-
-/** Build a compact conversation tail (last ~12 messages, ~3000 chars) for the LLM. */
-function buildConversation(entries: SessionEntry[]): string {
-	const parts: string[] = [];
-	for (let i = Math.max(0, entries.length - 12); i < entries.length; i++) {
-		const e = entries[i];
-		if (e.type !== "message" || !e.message?.role) continue;
-		const role = e.message.role;
-		if (role !== "user" && role !== "assistant") continue;
-		const text = renderText(e.message.content).trim();
-		if (!text) continue;
-		parts.push(`${role === "user" ? "用户" : "助手"}: ${text}`);
-	}
-	let s = parts.join("\n");
-	if (s.length > 3000) s = s.slice(-3000);
-	return s;
-}
-
-// -- LLM lesson generation ------------------------------------------------
-
-interface GeneratedItem {
-	type: "word" | "phrase" | "sentence";
-	text: string;
-	phonetic?: string;
-	meaning: string;
-	example?: string;
-	example_cn?: string;
-	/** Sentence only: 3 progressive levels (main clause -> full sentence). */
-	levels?: string[];
-	/** Sentence only: per-level Chinese translations, aligned with levels. */
-	levels_cn?: string[];
-	/** Sentence only: chunking of the full sentence for guided reading. */
-	chunks?: string[];
-	/** Sentence only: likely-new words inside the sentence, with meanings. */
-	keyWords?: { text: string; phonetic?: string; meaning: string }[];
-}
-
-function stringArray(value: unknown): string[] | undefined {
-	if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.trim())) return undefined;
-	return value;
-}
-
-function keyWordArray(value: unknown): GeneratedItem["keyWords"] | undefined {
-	if (!Array.isArray(value)) return undefined;
-	const result: NonNullable<GeneratedItem["keyWords"]> = [];
-	for (const entry of value) {
-		if (!entry || typeof entry !== "object") return undefined;
-		const record = entry as Record<string, unknown>;
-		if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) {
-			return undefined;
-		}
-		if (record.phonetic != null && typeof record.phonetic !== "string") return undefined;
-		result.push({ text: record.text, meaning: record.meaning, phonetic: record.phonetic as string | undefined });
-	}
-	return result;
-}
-
-function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]): GeneratedItem | undefined {
-	if (!raw || typeof raw !== "object") return undefined;
-	const record = raw as Record<string, unknown>;
-	const type = record.type;
-	if (type !== "word" && type !== "phrase" && type !== "sentence") return undefined;
-	if (expectedType && type !== expectedType) return undefined;
-	if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) return undefined;
-	for (const key of ["phonetic", "example", "example_cn"] as const) {
-		if (record[key] != null && typeof record[key] !== "string") return undefined;
-	}
-	const item: GeneratedItem = {
-		type,
-		text: record.text,
-		meaning: record.meaning,
-		phonetic: record.phonetic as string | undefined,
-		example: record.example as string | undefined,
-		example_cn: record.example_cn as string | undefined,
-	};
-	if (type === "sentence") {
-		if (record.levels != null && !(item.levels = stringArray(record.levels))) return undefined;
-		if (record.levels_cn != null && !(item.levels_cn = stringArray(record.levels_cn))) return undefined;
-		if (record.chunks != null && !(item.chunks = stringArray(record.chunks))) return undefined;
-		if (record.keyWords != null && !(item.keyWords = keyWordArray(record.keyWords))) return undefined;
-	}
-	return item;
-}
-
-function validSentenceTraining(item: GeneratedItem): boolean {
-	if (item.type !== "sentence" || !item.levels || !item.levels_cn || !item.chunks || !item.keyWords) return false;
-	const fullWords = item.text.trim().split(/\s+/).length;
-	const middleWords = item.levels[1]?.trim().split(/\s+/).length ?? 0;
-	return (
-		fullWords >= 15 &&
-		item.levels.length === 3 &&
-		new Set(item.levels.map((level) => level.trim())).size === 3 &&
-		item.levels_cn.length === 3 &&
-		item.chunks.length >= 2 && item.chunks.length <= 5 &&
-		item.keyWords.length >= 1 && item.keyWords.length <= 3 &&
-		item.levels[2].trim() === item.text.trim() &&
-		middleWords / fullWords >= 0.35 && middleWords / fullWords <= 0.9
-	);
-}
-
-interface ReadyLesson {
-	ready: true;
-	topic: string;
-	items: GeneratedItem[];
-}
-
-interface WaitingLesson {
-	ready: false;
-	reason?: string;
-}
-
-type LessonDecision = ReadyLesson | WaitingLesson;
-
-interface ReadyReplacement {
-	ready: true;
-	item: GeneratedItem;
-}
-
-type ReplacementDecision = ReadyReplacement | WaitingLesson;
-
-interface ResolvedModel {
-	provider: string;
-	model: string;
-	fromSession: boolean;
-}
-
-/** Max critic-driven revision rounds before a lesson is discarded. */
-const MAX_LESSON_REVISIONS = 2;
-
-async function generateLesson(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	resolved: ResolvedModel,
-	conversation: string,
-	known: string[],
-	config: PetConfig,
-	feedback?: CritiqueIssue[],
-): Promise<LessonDecision> {
-	const prompt = [
-		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
-		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
-		"只有信息充分时，才围绕主题准备 3 个学习项：1 个单词、1 个词组、1 个渐进长句。",
-		"",
-		"备课条件：",
-		"- 只要会话中出现过真实、常用的英语表达（单词、词组、完整句子），就可以备课",
-		"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得中级学习者掌握的英语",
-		"- 只有纯寒暄、单字命令、无意义占位或环境通知才返回 ready=false",
-		"- 有英语内容就倾向 ready=true，不要因为话题不够像传统英语课而拒绝",
-		"",
-		"学习项要求：",
-		"- 内容要真实常用，宁简单不冷僻，适合中级学习者",
-		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
-		"- 教学项必须关联：word 的 text 必须自然出现在 sentence 的 text 中；phrase 尽量出现在 sentence 中，形成一个统一的教学单元",
-		"- sentence 的 text 必须是真正的长句：至少 15 个单词，包含从句或插入成分；禁止用简单句或短句充数",
-		"- 长句结构要多样化：定语从句、状语从句、宾语从句、插入语、分词短语、同位语等轮换使用，避免总是使用 which 定语从句",
-		"- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（2-3 个生词）",
-		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
-		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
-		"- 只输出 JSON，不要任何其他文字：",
-		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
-		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
-		...(feedback && feedback.length
-			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
-				...feedback.map((i) => `- [${i.severity}] ${i.category}: ${i.description}`)]
-			: []),
-		"",
-		"<conversation>",
-		conversation,
-		"</conversation>",
-	].join("\n");
-
-	const text = await llm.complete(ctx, resolved, {
-		systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
-		prompt,
-		maxTokens: config.maxTokens,
-		thinkingLevel: config.thinkingLevel,
-	});
-
-	// Tolerate markdown fences around the JSON
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) throw new Error("BAD_JSON");
-
-	let parsed: Record<string, unknown>;
-	try {
-		parsed = JSON.parse(cleaned.slice(start, end + 1));
-	} catch {
-		throw new Error("BAD_JSON");
-	}
-
-	if (parsed.ready === false) {
-		return {
-			ready: false,
-			reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
-		};
-	}
-	if (parsed.ready !== true) throw new Error("INVALID_READY");
-
-	if (!Array.isArray(parsed.items) || parsed.items.length !== 3) throw new Error("INVALID_LESSON_SHAPE");
-	const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
-	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
-	const items = parsedItems as GeneratedItem[];
-	if (new Set(items.map((item) => item.type)).size !== 3) throw new Error("INVALID_LESSON_SHAPE");
-
-	// Sentence cards need levels/chunks/keyWords for progressive training.
-	// Models sometimes omit them — backfill with a dedicated follow-up call.
-	for (const it of items) {
-		if (it.type === "sentence" && !validSentenceTraining(it)) {
-			await completeSentenceData(llm, ctx, resolved, config, it);
-		}
-	}
-	const sentence = items.find((item) => item.type === "sentence")!;
-	if (!validSentenceTraining(sentence)) throw new Error("INVALID_SENTENCE_TRAINING");
-
-	return { ready: true, topic: String(parsed.topic ?? ""), items };
-}
-
-interface CritiqueIssue {
-	severity: "blocker" | "minor";
-	category: string;
-	description: string;
-}
-
-interface CritiqueVerdict {
-	available: boolean;
-	pass: boolean;
-	issues: CritiqueIssue[];
-	summary: string;
-}
-
-/**
- * Independent quality gate. Fail-closed on model/auth/runtime/bad-JSON errors
- * so a broken critic defers insertion rather than approving unreviewed content.
- */
-async function critiqueLesson(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	resolved: ResolvedModel,
-	lesson: { topic: string; items: GeneratedItem[] },
-	known: string[],
-	config: PetConfig,
-): Promise<CritiqueVerdict> {
-	const failClosed = (summary: string): CritiqueVerdict => ({ available: false, pass: false, issues: [], summary });
-	// Pass the complete bounded lesson structure (not just an outline) so the critic
-	// can judge examples, levels, chunks, and keywords.
-	const lessonJson = JSON.stringify(lesson);
-
-	const prompt = [
-		"你是「英语小宠物」的内容审查员。审查下面备课是否适合中级学习者，只输出 JSON。",
-		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression","description":"..."}], "summary":"一句话"}',
-		"审查标准：",
-		"- 英语单词/词组/句子必须正确、自然",
-		"- 中文释义准确，不得机翻味",
-		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
-		"- 长句至少 15 词、含从句；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致",
-		"- 单词必须自然出现在句子中",
-		"- 不得为凑结构硬造不自然句子",
-		"- 只有明确问题才标 blocker；小瑕疵标 minor",
-		"",
-		`<lesson>${lessonJson}</lesson>`,
-	].join("\n");
-
-	let text: string;
-	try {
-		text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语教学内容审查员，只输出 JSON。",
-			prompt,
-			maxTokens: 450,
-			thinkingLevel: config.thinkingLevel,
-		});
-	} catch {
-		return failClosed("critic call failed");
-	}
-
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return failClosed("critic bad json");
-	try {
-		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { pass?: unknown; issues?: unknown; summary?: unknown };
-		return {
-			available: true,
-			pass: parsed.pass === true,
-			issues: Array.isArray(parsed.issues) ? (parsed.issues as CritiqueIssue[]).slice(0, 20) : [],
-			summary: typeof parsed.summary === "string" ? parsed.summary : "",
-		};
-	} catch {
-		return failClosed("critic unparseable");
-	}
-}
-
-interface AnswerEvaluation {
-	available: boolean;
-	verdict: "correct" | "partial" | "incorrect";
-	feedback: string;
-}
-
-/** LLM evaluation for a near-miss answer. Provider/model/bad-JSON failures leave the card pending with zero writes. */
-async function evaluateAttempt(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	item: ItemRow,
-	answer: string,
-	resolved: { provider: string; model: string } | undefined,
-	direction: "forward" | "reverse" = "forward",
-): Promise<AnswerEvaluation> {
-	const unavailable = (): AnswerEvaluation => ({ available: false, verdict: "incorrect", feedback: "" });
-	if (!resolved) return unavailable();
-	const isReverse = direction === "reverse";
-	const target = isReverse ? item.meaning : item.text;
-	const answerLang = isReverse ? "中文" : "英文";
-	const prompt = [
-		`你是英语导师。学生看到${isReverse ? "英文" : "中文"}要写出对应的${answerLang}。`,
-		`目标：${target}`,
-		`学生写了：${answer}`,
-		"判断学生的答案，只输出 JSON：",
-		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
-		`- 学生必须用${answerLang}作答；写错语言一律 incorrect`,
-		`- correct: ${answerLang}与目标完全一致，或仅大小写/标点/多余空格差异`,
-		`- partial: ${answerLang}有小错（拼写/近义/字形），但明显是想表达这个意思`,
-		"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
-	].join("\n");
-	let text: string;
-	try {
-		text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
-			prompt,
-			maxTokens: 200,
-		});
-	} catch {
-		return unavailable();
-	}
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return unavailable();
-	try {
-		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { verdict?: unknown; feedback?: unknown };
-		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
-		return { available: true, verdict, feedback: typeof parsed.feedback === "string" ? parsed.feedback : "" };
-	} catch {
-		return unavailable();
-	}
-}
-
-interface SentenceEvaluation extends AnswerEvaluation {
-	available: boolean;
-	errorTags: string[];
-	correctedAnswer: string;
-}
-
-/** Semantic sentence-output evaluation. Provider failures leave the card pending with zero writes. */
-async function evaluateSentenceAttempt(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	exercise: SentenceExerciseView,
-	answer: string,
-	resolved: { provider: string; model: string } | undefined,
-): Promise<SentenceEvaluation> {
-	const unavailable = (): SentenceEvaluation => ({
-		available: false,
-		verdict: "incorrect",
-		feedback: "",
-		errorTags: [],
-		correctedAnswer: "",
-	});
-	const normalize = (value: string) => value
-		.toLowerCase()
-		.replace(/[’]/g, "'")
-		.replace(/[^a-z0-9']+/g, " ")
-		.trim()
-		.replace(/\s+/g, " ");
-	const normalizedAnswer = normalize(answer);
-	if (
-		normalizedAnswer === normalize(exercise.expected) ||
-		(exercise.kind === "sentence_cloze" && normalizedAnswer === normalize(exercise.reference))
-	) {
-		return { available: true, verdict: "correct", feedback: "", errorTags: [], correctedAnswer: exercise.reference };
-	}
-	if (!resolved) return unavailable();
-	const task = exercise.kind === "sentence_cloze"
-		? [
-			"这是单词填空。学生可以只写缺失词，也可以写完整句子。",
-			`缺失词：${exercise.expected}`,
-			`填空句：${exercise.cloze}`,
-		]
-		: [
-			"这是开放式中文到英文产出。不要要求与参考句逐字相同。",
-			`中文意图：${exercise.chinese}`,
-			`参考表达：${exercise.reference}`,
-			...(exercise.focusExpression ? [`建议目标表达：${exercise.focusExpression}`] : []),
-		];
-	const prompt = [
-		"你是严格但鼓励性的英语写作导师。评价学生英文，只输出 JSON。",
-		...task,
-		`学生答案：${answer}`,
-		'输出：{"verdict":"correct|partial|incorrect","feedback":"一个最小中文修正","errorTags":["grammar|collocation|meaning|missing_target|word_order|spelling"],"correctedAnswer":"自然修正版"}',
-		"correct：语义满足中文意图且英文自然；自然变体应接受。",
-		"partial：意图基本正确，仅有一个或少量可修正问题。",
-		"incorrect：核心意思错误、无法理解、写成中文，或填空目标明显错误。",
-		"feedback 只指出当前最关键的一个问题，不要长篇讲解。",
-	].join("\n");
-	let text: string;
-	try {
-		text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语输出评价员，只输出严格 JSON。",
-			prompt,
-			maxTokens: 350,
-		});
-	} catch {
-		return unavailable();
-	}
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return unavailable();
-	try {
-		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
-		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
-		const errorTags = Array.isArray(parsed.errorTags)
-			? parsed.errorTags.filter((tag): tag is string => typeof tag === "string").slice(0, 5)
-			: [];
-		return {
-			available: true,
-			verdict,
-			feedback: typeof parsed.feedback === "string" ? parsed.feedback : "",
-			errorTags,
-			correctedAnswer: typeof parsed.correctedAnswer === "string" ? parsed.correctedAnswer : exercise.reference,
-		};
-	} catch {
-		return unavailable();
-	}
-}
-
-async function generateReplacement(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	resolved: ResolvedModel,
-	conversation: string,
-	known: string[],
-	config: PetConfig,
-	skipped: ItemRow,
-): Promise<ReplacementDecision> {
-	const itemSchema = skipped.type === "sentence"
-		? '{"type":"sentence","text":"完整长句","meaning":"中文翻译","levels":["L1主干","L2扩展","与text相同的L3"],"levels_cn":["L1翻译","L2翻译","L3翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"释义"}]}'
-		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
-	const prompt = [
-		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟。`,
-		`请根据会话主题补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
-		"如果会话信息不足以生成真实有用的同类型卡片，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
-		"信息充分时只输出：",
-		`{"ready":true,"item":${itemSchema}}`,
-		skipped.type === "sentence"
-			? "句子必须至少 15 个单词；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文。"
-			: "内容要真实常用，贴近当前会话主题，适合中级学习者。",
-		"已有内容：" + (known.length ? known.join("；") : "（无）"),
-		"",
-		"<conversation>",
-		conversation,
-		"</conversation>",
-	].join("\n");
-	const text = await llm.complete(ctx, resolved, {
-		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
-		prompt,
-		maxTokens: skipped.type === "sentence" ? config.maxTokens : 450,
-		thinkingLevel: config.thinkingLevel,
-	});
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) throw new Error("BAD_JSON");
-	let parsed: Record<string, unknown>;
-	try {
-		parsed = JSON.parse(cleaned.slice(start, end + 1));
-	} catch {
-		throw new Error("BAD_JSON");
-	}
-	if (parsed.ready === false) {
-		return { ready: false, reason: typeof parsed.reason === "string" ? parsed.reason : undefined };
-	}
-	if (parsed.ready !== true) throw new Error("INVALID_READY");
-	const item = parseGeneratedItem(parsed.item, skipped.type);
-	if (!item) throw new Error("EMPTY_REPLACEMENT");
-	if (item.type === "sentence" && !validSentenceTraining(item)) {
-		await completeSentenceData(llm, ctx, resolved, config, item);
-	}
-	if (item.type === "sentence" && !validSentenceTraining(item)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
-	return { ready: true, item };
-}
-
-/** Backfill levels/chunks/keyWords for a sentence card via a focused call. */
-async function completeSentenceData(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	resolved: ResolvedModel,
-	config: PetConfig,
-	item: GeneratedItem,
-) {
-	const prompt = [
-		"为下面的英文句子生成长句训练数据，只输出 JSON：",
-		'{"levels":["主干短句（去掉所有修饰成分，同一语义）","主干+一个修饰成分","与原文完全相同的完整长句"],"levels_cn":["主干短句的中文翻译","加一个成分后的中文翻译","完整长句的中文翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}',
-		"要求：levels 最后一级必须与原文完全相同；三个级别互不相同，每级只增加一个主要意群，L2 词数约为 L3 的 50%-75%；levels_cn 与 levels 一一对应，使用自然地道的中文；chunks 是原文的意群切分（3-5 个）；keyWords 是句中 2-3 个可能生僻的词（含音标和中文释义）。",
-		"",
-		"<sentence>",
-		item.text,
-		"</sentence>",
-	].join("\n");
-
-	let text: string;
-	try {
-		text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语学习卡生成器，只输出 JSON。",
-			prompt,
-			maxTokens: 500,
-			thinkingLevel: config.thinkingLevel,
-		});
-	} catch {
-		return;
-	}
-
-	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return;
-	let parsed: Record<string, unknown>;
-	try {
-		parsed = JSON.parse(cleaned.slice(start, end + 1));
-	} catch {
-		return;
-	}
-
-	const levels = stringArray(parsed.levels);
-	const levelsCn = stringArray(parsed.levels_cn);
-	const chunks = stringArray(parsed.chunks);
-	const keyWords = keyWordArray(parsed.keyWords);
-	if (levels?.length === 3) {
-		levels[2] = item.text;
-		item.levels = levels;
-	}
-	if (levelsCn?.length === 3) item.levels_cn = levelsCn;
-	if (chunks) item.chunks = chunks;
-	if (keyWords) item.keyWords = keyWords;
-}
-
-// -- Widget rendering -----------------------------------------------------
-
-const TYPE_LABELS: Record<string, string> = {
-	word: "单词",
-	phrase: "词组",
-	sentence: "句子",
-};
-
-function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): { total: number; reviews: number; newCards: number } {
-	const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
-	// Due reviews (shown items due today or earlier).
-	const reviews = Number((db.prepare(
-		`SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND due_at < ? ${SCHEDULABLE}`,
-	).get(tomorrow) as { n: number }).n);
-	// Queued replacements are quota-free; planned cards consume the remaining daily quota.
-	const queuedReplacement = Number((db.prepare(
-		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND introduction_kind = 'replacement' AND due_at < ? ${SCHEDULABLE}`,
-	).get(tomorrow) as { n: number }).n);
-	const queuedPlanned = Number((db.prepare(
-		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND (introduction_kind = 'planned' OR introduction_kind IS NULL) AND due_at < ? ${SCHEDULABLE}`,
-	).get(tomorrow) as { n: number }).n);
-	const remainingPlanned = dailyNewLimit === 0
-		? queuedPlanned
-		: Math.min(queuedPlanned, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
-	const newCards = queuedReplacement + remainingPlanned;
-	return { total: reviews + newCards, reviews, newCards };
-}
-
-function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
-	const streak = Number(getStat(db, "streak_days") ?? 0);
-	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
-	if (remaining.total === 0) return "";
-	const breakdown = remaining.newCards > 0
-		? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
-		: `（复习 ${remaining.reviews}）`;
-	return `🔥 连续学习 ${streak} 天 · 今日剩余卡片${breakdown}`;
-}
-
-/** Parse a JSON column safely. */
-function parseJsonCol<T>(raw: string | null): T | undefined {
-	if (!raw) return undefined;
-	try {
-		return JSON.parse(raw) as T;
-	} catch {
-		return undefined;
-	}
-}
-
-function wordEditDistance(left: string, right: string): number {
-	const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-	for (let i = 1; i <= left.length; i++) {
-		const current = [i];
-		for (let j = 1; j <= right.length; j++) {
-			current[j] = Math.min(
-			current[j - 1] + 1,
-			previous[j] + 1,
-			previous[j - 1] + (left[i - 1].toLowerCase() === right[j - 1].toLowerCase() ? 0 : 1),
-			);
-		}
-		previous.splice(0, previous.length, ...current);
-	}
-	return previous[right.length];
-}
-
-function highlightWordChange(before: string, after: string): string {
-	let prefix = 0;
-	while (prefix < before.length && prefix < after.length && before[prefix].toLowerCase() === after[prefix].toLowerCase()) prefix++;
-	let suffix = 0;
-	while (
-		suffix < before.length - prefix && suffix < after.length - prefix &&
-		before[before.length - 1 - suffix].toLowerCase() === after[after.length - 1 - suffix].toLowerCase()
-	) suffix++;
-	const mark = (word: string) => {
-		const end = word.length - suffix;
-		return `${word.slice(0, prefix)}[${word.slice(prefix, end) || "∅"}]${word.slice(end)}`;
-	};
-	return `${mark(before)} → ${mark(after)}`;
-}
-
-function spellingComparisonLines(answer: string | null, correctedAnswer: string | undefined, errorTags: string[]): string[] {
-	if (!answer || !correctedAnswer || !errorTags.includes("spelling")) return [];
-	const before = answer.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) ?? [];
-	const after = correctedAnswer.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) ?? [];
-	if (before.length !== after.length) return [];
-	const changes = before.flatMap((word, index) => {
-		const corrected = after[index];
-		if (word.toLowerCase() === corrected.toLowerCase()) return [];
-		return wordEditDistance(word, corrected) <= 2 ? [highlightWordChange(word, corrected)] : [];
-	}).slice(0, 3);
-	return changes.length ? [`🔎 拼写对比：${changes.join("；")}`] : [];
-}
-
-interface SentenceExerciseView {
-	level: number;
-	kind: "sentence_cloze" | "sentence_production";
-	chinese: string;
-	reference: string;
-	expected: string;
-	focusExpression?: string;
-	cloze?: string;
-	hint: string;
-}
-
-const SENTENCE_STOP_WORDS = new Set([
-	"a", "an", "and", "are", "as", "at", "be", "because", "been", "before", "but", "by", "for", "from",
-	"has", "have", "he", "her", "his", "i", "in", "is", "it", "its", "of", "on", "or", "our", "she", "so",
-	"that", "the", "their", "them", "they", "this", "to", "was", "we", "were", "will", "with", "you", "your",
-]);
-
-function sentenceExercise(item: ItemRow, requestedLevel = item.progress): SentenceExerciseView | undefined {
-	const levels = parseJsonCol<string[]>(item.levels);
-	if (!levels?.length) return undefined;
-	const level = Math.max(0, Math.min(requestedLevel, levels.length - 1));
-	const reference = levels[level].trim();
-	const levelsCn = parseJsonCol<string[]>(item.levels_cn);
-	const chinese = levelsCn?.[level]?.trim() || item.meaning;
-	const words = [...reference.matchAll(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g)];
-	const keyWords = parseJsonCol<{ text: string; meaning: string }[]>(item.key_words) ?? [];
-	let focusMatch = words.find((match) => keyWords.some((key) => {
-		const word = match[0].toLowerCase();
-		const keyWord = key.text.toLowerCase();
-		return word === keyWord || word.startsWith(keyWord) || keyWord.startsWith(word);
-	}));
-	focusMatch ??= words
-		.filter((match) => !SENTENCE_STOP_WORDS.has(match[0].toLowerCase()))
-		.sort((a, b) => b[0].length - a[0].length)[0];
-	const focusExpression = focusMatch?.[0];
-	const firstLetterHint = (text: string) => text
-		.split(/(\s+)/)
-		.map((part) => /^[A-Za-z]/.test(part) ? part[0] + "_".repeat(Math.max(0, part.replace(/[^A-Za-z]/g, "").length - 1)) : part)
-		.join("");
-	if (level === 0 && focusMatch?.index != null) {
-		const start = focusMatch.index;
-		const cloze = reference.slice(0, start) + "____" + reference.slice(start + focusMatch[0].length);
-		return {
-			level,
-			kind: "sentence_cloze",
-			chinese,
-			reference,
-			expected: focusMatch[0],
-			focusExpression,
-			cloze,
-			hint: firstLetterHint(focusMatch[0]),
-		};
-	}
-	return {
-		level,
-		kind: "sentence_production",
-		chinese,
-		reference,
-		expected: reference,
-		focusExpression,
-		hint: firstLetterHint(reference),
-	};
-}
-
-function ensureSentenceExercise(db: DatabaseSync, item: ItemRow, exercise: SentenceExerciseView): number {
-	const fingerprint = createHash("sha256")
-		.update(`sentence-output\0${item.id}\0${item.content_version ?? 1}\0${exercise.level}\0${exercise.reference}`)
-		.digest("hex");
-	db.prepare(
-		"INSERT OR IGNORE INTO exercises (item_id, kind, schema_version, stage, content_fingerprint, prompt_json, answer_json, hints_json, rubric_json, quality_json, created_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, '{}', ?)",
-	).run(
-		item.id,
-		exercise.kind,
-		"L" + (exercise.level + 1),
-		fingerprint,
-		JSON.stringify({ chinese: exercise.chinese, cloze: exercise.cloze, focusExpression: exercise.focusExpression }),
-		JSON.stringify({ reference: exercise.reference, expected: exercise.expected }),
-		JSON.stringify([exercise.hint]),
-		JSON.stringify({ semanticMatch: exercise.kind === "sentence_production", requireNaturalEnglish: true }),
-		new Date().toISOString(),
-	);
-	const row = db.prepare("SELECT id FROM exercises WHERE content_fingerprint = ?").get(fingerprint) as { id: number };
-	return Number(row.id);
-}
-
-function insertEvaluatedAttempt(
-	db: DatabaseSync,
-	attempt: PendingAttempt,
-	explicitRating: "good" | "again" | null,
-	now: Date,
-): void {
-	const reviewCycleId = attempt.reviewCycleId ?? randomUUID();
-	const kind = attempt.kind ?? "recall";
-	const claimKey = attempt.reviewCycleId
-		? `${kind}:${reviewCycleId}:${attempt.version}`
-		: `recall:${attempt.itemId}:${randomUUID()}`;
-	const feedback = attempt.feedback || attempt.correctedAnswer
-		? JSON.stringify({ feedback: attempt.feedback, correctedAnswer: attempt.correctedAnswer })
-		: null;
-	db.prepare(
-		"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, answer_text, assistance_level, status, verdict, error_tags_json, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-	).run(
-		randomUUID(), attempt.itemId, attempt.exerciseId ?? null, reviewCycleId, claimKey,
-		attempt.version, attempt.version, kind, attempt.answerText, attempt.assistanceLevel,
-		"evaluated", attempt.verdict, attempt.errorTags?.length ? JSON.stringify(attempt.errorTags) : null,
-		feedback, explicitRating, attempt.startedAt, now.toISOString(), explicitRating ? now.toISOString() : null,
-	);
-}
-
-/** Render a teach/review card as widget lines (front = question, back = answer). */
-function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward"): string[] {
-	const label = TYPE_LABELS[item.type] ?? item.type;
-	const lines: string[] = [];
-
-	// Sentence cards use progressive written production rather than self-reported reading.
-	const levels = parseJsonCol<string[]>(item.levels);
-	if (item.type === "sentence" && levels && levels.length > 1) {
-		const exercise = sentenceExercise(item);
-		if (!exercise) return lines;
-		const chunks = parseJsonCol<string[]>(item.chunks);
-		lines.push(`${face} 句子输出（L${exercise.level + 1}/${levels.length}）：`);
-		lines.push(`  中文：${exercise.chinese}`);
-		if (exercise.kind === "sentence_cloze") {
-			lines.push(`  填空：${exercise.cloze}`);
-			lines.push("  只需写出缺失的英文词，也可以写完整句子。");
-		} else {
-			lines.push("  请写出自然英文，不要求与参考句逐字一致。");
-			if (exercise.focusExpression) lines.push(`  尽量使用：${exercise.focusExpression}`);
-		}
-		if (showAnswer) {
-			lines.push(`  参考：${exercise.reference}`);
-			if (exercise.level === levels.length - 1 && chunks?.length) lines.push(`  意群：${chunks.join(" / ")}`);
-		}
-		lines.push("💬 /kaomoji:answer <英文> · /kaomoji:hint · /kaomoji:flip · /kaomoji:again");
-		return lines;
-	}
-
-	if (isReview) {
-		if (showAnswer) {
-			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
-			lines.push(`  第 ${item.reviews + 1} 次复习`);
-		} else if (direction === "reverse") {
-			lines.push(`${face} 复习时间到：✍️ 写出「${item.text}」的中文释义`);
-		} else {
-			lines.push(`${face} 复习时间到：✍️ 默写「${item.meaning}」的英文`);
-		}
-		if (item.example && showAnswer) {
-			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
-		}
-		lines.push(`💬 /kaomoji:answer 默写 · /kaomoji:hint 提示 · /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
-	} else {
-		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
-		if (showAnswer) {
-			lines.push(`  释义：${item.meaning}`);
-			if (item.example) {
-				lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
-			}
-		}
-		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:skip 已会`);
-	}
-	return lines;
-}
 
 // -- Extension ------------------------------------------------------------
 
@@ -1823,9 +102,27 @@ export default function kaomojiEnglishTutorExtension(
 	function resetState() {
 		lastError = "";
 		pendingLLMCall = false;
+		pendingLLMCallAt = 0;
 		lastRejectedConversation = "";
 		lastRejectedReplacementKey = "";
 		resolvedModelName = "";
+	}
+
+	function clearPendingLocals() {
+		pendingItemId = null;
+		pendingFlipped = false;
+		pendingIsReview = false;
+		pendingDirection = "forward";
+		pendingAssistance = "none";
+	}
+
+	/** Clear a locally stuck call after the global generation lease has had time to expire. */
+	function resetHungLlmCall(): boolean {
+		if (!pendingLLMCall || Date.now() - pendingLLMCallAt < 180_000) return false;
+		pendingLLMCall = false;
+		pendingLLMCallAt = 0;
+		if (db) setStat(db, "last_gen_status", "hung_llm_reset");
+		return true;
 	}
 
 	function stopTimer() {
@@ -1880,14 +177,9 @@ export default function kaomojiEnglishTutorExtension(
 		const ctx = latestCtx;
 		const generation = sessionGeneration;
 		if (!ctx || isCtxStale(ctx) || config.intervalMinutes <= 0) return;
-		if (pendingLLMCall) {
-			if (Date.now() - pendingLLMCallAt >= 180_000) {
-				pendingLLMCall = false;
-				if (db) setStat(db, "last_gen_status", "hung_llm_reset");
-			} else {
-				scheduleTimer(Math.min(30_000, intervalMs()));
-				return;
-			}
+		if (pendingLLMCall && !resetHungLlmCall()) {
+			scheduleTimer(Math.min(30_000, intervalMs()));
+			return;
 		}
 		try {
 			await petTick(ctx);
@@ -2078,11 +370,7 @@ export default function kaomojiEnglishTutorExtension(
 			recordRendered(state);
 		} else {
 			// No global card: reflect cleared state (respecting pacing status line).
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 			if (changed || localVersion < 0) {
 				updateWidget(ctx, FACES.idle, [statsLine(db)]);
 				recordRendered(state);
@@ -2351,7 +639,6 @@ export default function kaomojiEnglishTutorExtension(
 		exercise: SentenceExerciseView,
 	): boolean {
 		if (!db || attempt.sessionGeneration !== sessionGeneration || !attempt.reviewCycleId) return true;
-		let applied = false;
 		let retryCount = 0;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -2372,16 +659,11 @@ export default function kaomojiEnglishTutorExtension(
 					active_assistance_level: retryCount >= 2 ? "revealed" : "hint",
 					active_version: cur.active_version + 1,
 				});
-				applied = true;
 			}
 			db.exec("COMMIT");
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
 			console.error(`[kaomoji-english-tutor] Sentence-attempt CAS failed: ${err}`);
-		}
-		if (!applied) {
-			renderGlobalCard(ctx);
-			return true;
 		}
 		renderGlobalCard(ctx);
 		return true;
@@ -2612,11 +894,7 @@ export default function kaomojiEnglishTutorExtension(
 
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(expectedItemId) as ItemRow | undefined;
 		if (!item || item.shown === 0) {
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 			return true;
 		}
 
@@ -2633,11 +911,7 @@ export default function kaomojiEnglishTutorExtension(
 			stateAtStart.active_version !== expectedVersion ||
 			stateAtStart.active_direction !== expectedDirection
 		) {
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 			renderGlobalCard(ctx);
 			return true;
 		}
@@ -2691,11 +965,7 @@ export default function kaomojiEnglishTutorExtension(
 					console.error(`[kaomoji-english-tutor] Sentence CAS failed: ${err}`);
 				}
 				if (!applied) {
-					pendingItemId = null;
-					pendingFlipped = false;
-					pendingIsReview = false;
-					pendingDirection = "forward";
-					pendingAssistance = "none";
+					clearPendingLocals();
 					renderGlobalCard(ctx);
 					return true;
 				}
@@ -2713,11 +983,7 @@ export default function kaomojiEnglishTutorExtension(
 		const next = scheduleNext(item.fsrs_state, now, rating);
 		if ("corrupt" in next) {
 			if (db) quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 			if (!isCtxStale(ctx)) {
 				ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离，不会重复出现。原始数据已保留。`, "warning");
 				renderGlobalCard(ctx);
@@ -2811,11 +1077,7 @@ export default function kaomojiEnglishTutorExtension(
 			}
 			console.error(`[kaomoji-english-tutor] Rate CAS failed: ${err}`);
 		} finally {
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 		}
 
 		if (!applied) {
@@ -2855,11 +1117,7 @@ export default function kaomojiEnglishTutorExtension(
 		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
 		if ("corrupt" in next) {
 			quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
-			pendingItemId = null;
-			pendingFlipped = false;
-			pendingIsReview = false;
-			pendingDirection = "forward";
-			pendingAssistance = "none";
+			clearPendingLocals();
 			ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离。`, "warning");
 			renderGlobalCard(ctx);
 			return undefined;
@@ -2873,11 +1131,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (cur.active_item_id !== item.id || cur.active_version !== localVersion) {
 				db.exec("ROLLBACK");
 				renderGlobalCard(ctx);
-				pendingItemId = null;
-				pendingFlipped = false;
-				pendingIsReview = false;
-				pendingDirection = "forward";
-				pendingAssistance = "none";
+				clearPendingLocals();
 				return undefined;
 			}
 			db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
@@ -2913,11 +1167,7 @@ export default function kaomojiEnglishTutorExtension(
 			throw err;
 		}
 
-		pendingItemId = null;
-		pendingFlipped = false;
-		pendingIsReview = false;
-		pendingDirection = "forward";
-		pendingAssistance = "none";
+		clearPendingLocals();
 		if (applied) {
 			recordRendered(getRuntimeState(db));
 			updateWidget(ctx, FACES.party, [
@@ -2955,6 +1205,7 @@ export default function kaomojiEnglishTutorExtension(
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
+		pendingLLMCallAt = Date.now();
 		updateWidget(ctx, FACES.teach, ["正在补充同类型卡片，喵…"]);
 		try {
 			let effectiveResolved = resolveModel(ctx);
@@ -3071,7 +1322,10 @@ export default function kaomojiEnglishTutorExtension(
 			return false;
 		} finally {
 			if (db) releaseGeneration(generationToken);
-			if (sessionGeneration === generation) pendingLLMCall = false;
+			if (sessionGeneration === generation) {
+				pendingLLMCall = false;
+				pendingLLMCallAt = 0;
+			}
 		}
 	}
 
@@ -3136,13 +1390,7 @@ export default function kaomojiEnglishTutorExtension(
 
 		// 2. Otherwise teach new items (LLM), up to the daily limit (0 = unlimited), single-owner.
 		if (config.dailyNewLimit === 0 || countTodayNew(db, now) < config.dailyNewLimit) {
-			if (pendingLLMCall) {
-				// If a previous LLM call hung and never reached its finally, force-reset
-				// after a timeout so generation is not permanently blocked.
-				if (Date.now() - pendingLLMCallAt < 180_000) return;
-				pendingLLMCall = false;
-				if (db) setStat(db, "last_gen_status", "hung_llm_reset");
-			}
+			if (pendingLLMCall && !resetHungLlmCall()) return;
 			await generateAndInsert(ctx, now);
 			return;
 		}
@@ -3315,12 +1563,15 @@ export default function kaomojiEnglishTutorExtension(
 			if (sessionGeneration !== generation) return;
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
-				if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
-				logGenStatus(`error: ${lastError}`);
-				deferPacing();
+			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
+			logGenStatus(`error: ${lastError}`);
+			deferPacing();
 		} finally {
 			if (db) releaseGeneration(generationToken);
-			if (sessionGeneration === generation) pendingLLMCall = false;
+			if (sessionGeneration === generation) {
+				pendingLLMCall = false;
+				pendingLLMCallAt = 0;
+			}
 		}
 	}
 
@@ -3610,11 +1861,7 @@ export default function kaomojiEnglishTutorExtension(
 			sessionId = "";
 		}
 		myId = myCoordinatorId(sessionId, instanceToken);
-		pendingItemId = null;
-		pendingFlipped = false;
-		pendingIsReview = false;
-		pendingDirection = "forward";
-		pendingAssistance = "none";
+		clearPendingLocals();
 		try {
 			db = openDb();
 		} catch (err) {
@@ -3627,7 +1874,6 @@ export default function kaomojiEnglishTutorExtension(
 			setStat(db, "pet_alive", new Date().toISOString());
 			setStat(db, "pet_config_model", `${config.provider}/${config.model}`);
 			touchClient(db, myId);
-			reapExpiredJobs(db, new Date());
 			// Rebuild the active global card so this session converges immediately.
 			if (activeItem(db)) {
 				renderGlobalCard(ctx);
@@ -3647,12 +1893,9 @@ export default function kaomojiEnglishTutorExtension(
 		stopPolling();
 		releaseCoordinator();
 		latestCtx = undefined;
-		pendingItemId = null;
-		pendingFlipped = false;
-		pendingIsReview = false;
-		pendingDirection = "forward";
-		pendingAssistance = "none";
+		clearPendingLocals();
 		pendingLLMCall = false;
+		pendingLLMCallAt = 0;
 		sessionId = "";
 		myId = "";
 		lastCoordinatorRenewal = 0;

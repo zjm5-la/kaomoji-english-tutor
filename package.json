@@ -11,7 +11,14 @@
   },
   "files": [
     "index.ts",
-    "jobs.ts",
+    "config.ts",
+    "conversation.ts",
+    "db.ts",
+    "fsrs.ts",
+    "llm.ts",
+    "render.ts",
+    "runtime-state.ts",
+    "sentence-cycle.ts",
     "pi-sdk-llm.ts",
     "README.md"
   ],
