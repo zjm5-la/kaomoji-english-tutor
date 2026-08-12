@@ -646,6 +646,8 @@ const SYNC_POLL_MS = 1000;
 const REPLACEMENT_GRACE_MS = 8000;
 /** Keep corrective feedback readable before automatically surfacing the next card. */
 const AGAIN_FEEDBACK_GRACE_MS = 15_000;
+const ANSWER_THINKING_INTERVAL_MS = 120;
+const ANSWER_THINKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 type RecallDirection = "forward" | "reverse";
 type AssistanceLevel = "none" | "hint" | "revealed";
@@ -1548,6 +1550,50 @@ function parseJsonCol<T>(raw: string | null): T | undefined {
 	}
 }
 
+function wordEditDistance(left: string, right: string): number {
+	const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= left.length; i++) {
+		const current = [i];
+		for (let j = 1; j <= right.length; j++) {
+			current[j] = Math.min(
+			current[j - 1] + 1,
+			previous[j] + 1,
+			previous[j - 1] + (left[i - 1].toLowerCase() === right[j - 1].toLowerCase() ? 0 : 1),
+			);
+		}
+		previous.splice(0, previous.length, ...current);
+	}
+	return previous[right.length];
+}
+
+function highlightWordChange(before: string, after: string): string {
+	let prefix = 0;
+	while (prefix < before.length && prefix < after.length && before[prefix].toLowerCase() === after[prefix].toLowerCase()) prefix++;
+	let suffix = 0;
+	while (
+		suffix < before.length - prefix && suffix < after.length - prefix &&
+		before[before.length - 1 - suffix].toLowerCase() === after[after.length - 1 - suffix].toLowerCase()
+	) suffix++;
+	const mark = (word: string) => {
+		const end = word.length - suffix;
+		return `${word.slice(0, prefix)}[${word.slice(prefix, end) || "∅"}]${word.slice(end)}`;
+	};
+	return `${mark(before)} → ${mark(after)}`;
+}
+
+function spellingComparisonLines(answer: string | null, correctedAnswer: string | undefined, errorTags: string[]): string[] {
+	if (!answer || !correctedAnswer || !errorTags.includes("spelling")) return [];
+	const before = answer.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) ?? [];
+	const after = correctedAnswer.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) ?? [];
+	if (before.length !== after.length) return [];
+	const changes = before.flatMap((word, index) => {
+		const corrected = after[index];
+		if (word.toLowerCase() === corrected.toLowerCase()) return [];
+		return wordEditDistance(word, corrected) <= 2 ? [highlightWordChange(word, corrected)] : [];
+	}).slice(0, 3);
+	return changes.length ? [`🔎 拼写对比：${changes.join("；")}`] : [];
+}
+
 interface SentenceExerciseView {
 	level: number;
 	kind: "sentence_cloze" | "sentence_production";
@@ -1738,6 +1784,7 @@ export default function kaomojiEnglishTutorExtension(
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
+	let answerThinkingTimer: ReturnType<typeof setInterval> | undefined;
 	let latestCtx: ExtensionContext | undefined;
 	/** Per-runtime identity; distinct even when two processes open the same logical session. */
 	const instanceToken = randomUUID();
@@ -1779,6 +1826,30 @@ export default function kaomojiEnglishTutorExtension(
 	function stopTimer() {
 		if (timer) clearTimeout(timer);
 		timer = undefined;
+	}
+
+	function stopAnswerThinking() {
+		if (answerThinkingTimer) clearInterval(answerThinkingTimer);
+		answerThinkingTimer = undefined;
+	}
+
+	function startAnswerThinking(ctx: ExtensionContext, expectedGeneration: number) {
+		stopAnswerThinking();
+		let frame = 0;
+		const render = () => {
+			if (sessionGeneration !== expectedGeneration || isCtxStale(ctx)) {
+				stopAnswerThinking();
+				return;
+			}
+			updateWidget(ctx, FACES.review, [
+				`${ANSWER_THINKING_FRAMES[frame % ANSWER_THINKING_FRAMES.length]} 正在判断你的答案…`,
+				...(db ? [statsLine(db)] : []),
+			]);
+			frame++;
+		};
+		render();
+		answerThinkingTimer = setInterval(render, ANSWER_THINKING_INTERVAL_MS);
+		answerThinkingTimer.unref?.();
 	}
 
 	function intervalMs(): number {
@@ -1947,10 +2018,11 @@ export default function kaomojiEnglishTutorExtension(
 			state.active_retry_count <= 0 || !state.active_review_cycle_id || state.active_exercise_id == null
 		) return undefined;
 		const attempt = db.prepare(
-			"SELECT verdict,feedback_json FROM attempts WHERE item_id = ? AND review_cycle_id = ? AND exercise_id = ? AND verdict IN ('partial','incorrect') ORDER BY completed_at DESC,id DESC LIMIT 1",
-		).get(item.id, state.active_review_cycle_id, state.active_exercise_id) as { verdict: "partial" | "incorrect"; feedback_json: string | null } | undefined;
+			"SELECT verdict,answer_text,error_tags_json,feedback_json FROM attempts WHERE item_id = ? AND review_cycle_id = ? AND exercise_id = ? AND verdict IN ('partial','incorrect') ORDER BY completed_at DESC,id DESC LIMIT 1",
+		).get(item.id, state.active_review_cycle_id, state.active_exercise_id) as { verdict: "partial" | "incorrect"; answer_text: string | null; error_tags_json: string | null; feedback_json: string | null } | undefined;
 		if (!attempt) return undefined;
 		const feedback = parseJsonCol<{ feedback?: string; correctedAnswer?: string }>(attempt.feedback_json);
+		const errorTags = parseJsonCol<string[]>(attempt.error_tags_json) ?? [];
 		const exercise = sentenceExercise(item);
 		if (!exercise) return undefined;
 		const lines = [
@@ -1958,6 +2030,7 @@ export default function kaomojiEnglishTutorExtension(
 				? `△ 差一点：${feedback?.feedback || "有一个小问题"}`
 				: `✗ 再试一次：${feedback?.feedback || "意思或表达还不对"}`,
 		];
+		lines.push(...spellingComparisonLines(attempt.answer_text, feedback?.correctedAnswer, errorTags));
 		if (state.active_retry_count === 1) lines.push(`提示：${exercise.hint}`);
 		if (state.active_retry_count >= 2) lines.push(`参考：${feedback?.correctedAnswer || exercise.reference}`);
 		lines.push(...renderCard(item, state.active_kind === "review", FACES.error, false, "forward"));
@@ -2331,9 +2404,19 @@ export default function kaomojiEnglishTutorExtension(
 			exerciseId: state.active_exercise_id,
 			kind: exercise.kind,
 		};
-		const result = await evaluateSentenceAttempt(llm, ctx, exercise, text, resolveModel(ctx));
-		if (attemptBase.sessionGeneration !== sessionGeneration) return true;
+		startAnswerThinking(ctx, attemptBase.sessionGeneration);
+		let result: SentenceEvaluation;
+		try {
+			result = await evaluateSentenceAttempt(llm, ctx, exercise, text, resolveModel(ctx));
+		} finally {
+			stopAnswerThinking();
+		}
+		if (attemptBase.sessionGeneration !== sessionGeneration) {
+			renderGlobalCard(ctx);
+			return true;
+		}
 		if (!result.available) {
+			renderGlobalCard(ctx);
 			ctx.ui.notify("暂时无法可靠判断这个句子；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
 			return true;
 		}
@@ -2406,9 +2489,19 @@ export default function kaomojiEnglishTutorExtension(
 		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
 		if (!exact) {
-			const result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction);
-			if (attemptBase.sessionGeneration !== sessionGeneration) return true;
+			startAnswerThinking(ctx, attemptBase.sessionGeneration);
+			let result: AnswerEvaluation;
+			try {
+				result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction);
+			} finally {
+				stopAnswerThinking();
+			}
+			if (attemptBase.sessionGeneration !== sessionGeneration) {
+				renderGlobalCard(ctx);
+				return true;
+			}
 			if (!result.available) {
+				renderGlobalCard(ctx);
 				ctx.ui.notify("暂时无法可靠判断这个答案；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
 				return true;
 			}
@@ -3492,6 +3585,7 @@ export default function kaomojiEnglishTutorExtension(
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionGeneration++;
+		stopAnswerThinking();
 		stopTimer();
 		lastDataVersion = null;
 		localVersion = -1;
@@ -3538,6 +3632,7 @@ export default function kaomojiEnglishTutorExtension(
 
 	pi.on("session_shutdown", async () => {
 		sessionGeneration++;
+		stopAnswerThinking();
 		await llm.dispose();
 		stopTimer();
 		stopPolling();

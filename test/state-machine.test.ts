@@ -331,6 +331,76 @@ test("sentence correction retries stay on the level and final FSRS uses the firs
 	}
 });
 
+test("answer shows a thinking animation while sentence evaluation is pending", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-answer-thinking" });
+	let releaseResponse!: () => void;
+	let responseStarted!: () => void;
+	const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { responseStarted = resolve; });
+	try {
+		registration.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage(JSON.stringify({
+					verdict: "correct",
+					feedback: "",
+					errorTags: [],
+					correctedAnswer: "The extension clears resources during shutdown.",
+				}));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "answer-thinking" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
+		const inFlight = harness.commands["kaomoji:answer"].handler("The extension cleans resources during shutdown.", harness.ctx);
+		await started;
+		assert.match(harness.widget().join(" "), /⠋ 正在判断你的答案/);
+		releaseResponse();
+		await inFlight;
+		assert.doesNotMatch(harness.widget().join(" "), /正在判断你的答案/, "animation stops after evaluation");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		releaseResponse?.();
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("sentence spelling feedback highlights the changed letter order", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-spelling-diff" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				verdict: "partial",
+				feedback: "拼写错误：claers 应为 clears。",
+				errorTags: ["spelling"],
+				correctedAnswer: "The extension clears resources during shutdown.",
+			})),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "spelling-diff" });
+		const db = openTestDb(); insertSentence(db); db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("The extension claers resources during shutdown.", harness.ctx);
+		assert.match(harness.widget().join(" "), /拼写对比：cl\[ae\]rs → cl\[ea\]rs/);
+		const reattached = await makeSession({ model, modelRegistry: registry, sessionId: "spelling-diff-reattached" });
+		assert.match(reattached.widget().join(" "), /拼写对比：cl\[ae\]rs → cl\[ea\]rs/, "highlight survives SQLite reattachment");
+		await reattached.handlers.session_shutdown({ reason: "quit" }, reattached.ctx);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("a natural L3 variant accepted by the SDK evaluator completes as Good", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-sentence-variant-faux" });
