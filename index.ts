@@ -1538,6 +1538,7 @@ function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: nu
 function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
 	const streak = Number(getStat(db, "streak_days") ?? 0);
 	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
+	if (remaining.total === 0) return "";
 	const breakdown = remaining.newCards > 0
 		? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
 		: `（复习 ${remaining.reviews}）`;
@@ -2195,7 +2196,11 @@ export default function kaomojiEnglishTutorExtension(
 			}
 		};
 		const width = Math.max(20, (process.stdout.columns || 120) - 2);
-		const out = lines.flatMap((line) => wrapTextWithAnsi(line, width));
+		const out = lines.filter(Boolean).flatMap((line) => wrapTextWithAnsi(line, width));
+		if (out.length === 0) {
+			ctx.ui.setWidget("kaomoji-english-tutor", undefined);
+			return;
+		}
 		ctx.ui.setWidget("kaomoji-english-tutor", out.map(accent), { placement: "belowEditor" });
 	}
 

@@ -1821,7 +1821,7 @@ test("persistent status stays compact while kaomoji:stats keeps detailed metrics
 		db.close();
 		await fake.fire();
 		const status = harness.widget().join(" ");
-		assert.match(status, /连续学习 0 天.*今日剩余卡片（复习 0）/);
+		assert.doesNotMatch(status, /连续学习|今日剩余卡片/);
 		assert.doesNotMatch(status, /需强化|今日新增|今日复习|已学/);
 		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
 		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));
