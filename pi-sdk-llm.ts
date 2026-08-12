@@ -23,6 +23,36 @@ export interface SdkCompletionRequest {
 
 export type PiSdkRuntimeFactory = (ctx: ExtensionContext, provider: string) => Promise<ModelRuntime>;
 
+export interface PiSdkLlmClientOptions {
+	completeTimeoutMs?: number;
+	abortTimeoutMs?: number;
+}
+
+const DEFAULT_COMPLETE_TIMEOUT_MS = 120_000;
+const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
+
+function clientClosedError(): Error {
+	return new Error("SDK_LLM_CLIENT_CLOSED");
+}
+
+function completionTimeoutError(): Error {
+	return new Error("SDK_LLM_TIMEOUT");
+}
+
+async function abortWithinDeadline(session: AgentSession, timeoutMs: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			session.abort(),
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 /**
  * Isolated Pi SDK transport for every tutor LLM call.
  *
@@ -37,10 +67,15 @@ export class PiSdkLlmClient {
 	private readonly runtimeApiKeys = new Map<string, string>();
 	private readonly activeSessions = new Set<AgentSession>();
 	private readonly runtimeFactory: PiSdkRuntimeFactory | undefined;
+	private readonly completeTimeoutMs: number;
+	private readonly abortTimeoutMs: number;
+	private readonly lifecycle = new AbortController();
 	private closed = false;
 
-	constructor(runtimeFactory?: PiSdkRuntimeFactory) {
+	constructor(runtimeFactory?: PiSdkRuntimeFactory, options: PiSdkLlmClientOptions = {}) {
 		this.runtimeFactory = runtimeFactory;
+		this.completeTimeoutMs = Math.max(1, options.completeTimeoutMs ?? DEFAULT_COMPLETE_TIMEOUT_MS);
+		this.abortTimeoutMs = Math.max(1, options.abortTimeoutMs ?? DEFAULT_ABORT_TIMEOUT_MS);
 	}
 
 	async complete(
@@ -48,7 +83,8 @@ export class PiSdkLlmClient {
 		resolved: SdkModelRef,
 		request: SdkCompletionRequest,
 	): Promise<string> {
-		if (this.closed) throw new Error("SDK_LLM_CLIENT_CLOSED");
+		if (this.closed) throw clientClosedError();
+		const deadline = Date.now() + this.completeTimeoutMs;
 
 		const hostModel = ctx.modelRegistry.find(resolved.provider, resolved.model);
 		if (!hostModel) {
@@ -56,16 +92,16 @@ export class PiSdkLlmClient {
 			(err as Error & { code?: string }).code = "MODEL_NOT_FOUND";
 			throw err;
 		}
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(hostModel);
-		if (!auth.ok || !auth.apiKey) {
+		const auth = await this.waitFor(ctx.modelRegistry.getApiKeyAndHeaders(hostModel), deadline);
+		if (!auth.ok) {
 			const err = new Error("NO_API_KEY");
 			(err as Error & { code?: string }).code = "NO_API_KEY";
 			throw err;
 		}
 
-		const runtime = await this.runtimeFor(ctx, resolved.provider);
-		if (this.runtimeApiKeys.get(resolved.provider) !== auth.apiKey) {
-			await runtime.setRuntimeApiKey(resolved.provider, auth.apiKey);
+		const runtime = await this.waitFor(this.runtimeFor(ctx, resolved.provider), deadline);
+		if (auth.apiKey && this.runtimeApiKeys.get(resolved.provider) !== auth.apiKey) {
+			await this.waitFor(runtime.setRuntimeApiKey(resolved.provider, auth.apiKey), deadline);
 			this.runtimeApiKeys.set(resolved.provider, auth.apiKey);
 		}
 
@@ -97,9 +133,9 @@ export class PiSdkLlmClient {
 			systemPromptOverride: () => request.systemPrompt,
 			appendSystemPromptOverride: () => [],
 		});
-		await resourceLoader.reload();
+		await this.waitFor(resourceLoader.reload(), deadline);
 
-		const { session } = await createAgentSession({
+		const sessionCreation = createAgentSession({
 			cwd: ctx.cwd,
 			agentDir: getAgentDir(),
 			model,
@@ -110,9 +146,25 @@ export class PiSdkLlmClient {
 			sessionManager: SessionManager.inMemory(ctx.cwd),
 			settingsManager,
 		});
+		let session: AgentSession;
+		try {
+			({ session } = await this.waitFor(sessionCreation, deadline));
+		} catch (err) {
+			// A session created after timeout/dispose is an orphan. Keep a rejection
+			// handler attached and dispose it as soon as creation eventually settles.
+			void sessionCreation.then(async ({ session: orphan }) => {
+				try { await abortWithinDeadline(orphan, this.abortTimeoutMs); } catch { /* already settled */ }
+				orphan.dispose();
+			}).catch(() => {});
+			throw err;
+		}
+		if (this.closed) {
+			session.dispose();
+			throw clientClosedError();
+		}
 		this.activeSessions.add(session);
 		try {
-			await session.prompt(request.prompt, { expandPromptTemplates: false });
+			await this.waitFor(session.prompt(request.prompt, { expandPromptTemplates: false }), deadline);
 			const error = session.agent.state.errorMessage;
 			if (error) throw new Error(error);
 			let last: { content?: Array<{ type?: string; text?: string }>; stopReason?: string; errorMessage?: string } | undefined;
@@ -132,18 +184,51 @@ export class PiSdkLlmClient {
 			const text = textParts.join(" ").trim();
 			if (!text) throw new Error("EMPTY_RESPONSE");
 			return text;
+		} catch (err) {
+			try { await abortWithinDeadline(session, this.abortTimeoutMs); } catch { /* already settled */ }
+			throw err;
 		} finally {
 			if (this.activeSessions.delete(session)) session.dispose();
 		}
 	}
 
 	async dispose(): Promise<void> {
-		this.closed = true;
+		if (!this.closed) {
+			this.closed = true;
+			this.lifecycle.abort();
+		}
 		const sessions = [...this.activeSessions];
-		await Promise.allSettled(sessions.map((session) => session.abort()));
+		await Promise.allSettled(sessions.map((session) => abortWithinDeadline(session, this.abortTimeoutMs)));
 		for (const session of sessions) {
 			if (this.activeSessions.delete(session)) session.dispose();
 		}
+	}
+
+	private waitFor<T>(operation: Promise<T>, deadline: number): Promise<T> {
+		if (this.closed || this.lifecycle.signal.aborted) return Promise.reject(clientClosedError());
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return Promise.reject(completionTimeoutError());
+		return new Promise<T>((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let settled = false;
+			const cleanup = () => {
+				if (timer) clearTimeout(timer);
+				this.lifecycle.signal.removeEventListener("abort", onAbort);
+			};
+			const finish = (callback: () => void) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				callback();
+			};
+			const onAbort = () => finish(() => reject(clientClosedError()));
+			this.lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+			timer = setTimeout(() => finish(() => reject(completionTimeoutError())), remaining);
+			operation.then(
+				(value) => finish(() => resolve(value)),
+				(error) => finish(() => reject(error)),
+			);
+		});
 	}
 
 	private runtimeFor(ctx: ExtensionContext, provider: string): Promise<ModelRuntime> {
@@ -151,6 +236,12 @@ export class PiSdkLlmClient {
 		if (!pending) {
 			pending = this.createRuntime(ctx, provider);
 			this.runtimes.set(provider, pending);
+			pending.catch(() => {
+				if (this.runtimes.get(provider) === pending) {
+					this.runtimes.delete(provider);
+					this.runtimeApiKeys.delete(provider);
+				}
+			});
 		}
 		return pending;
 	}
@@ -158,11 +249,21 @@ export class PiSdkLlmClient {
 	private async createRuntime(ctx: ExtensionContext, provider: string): Promise<ModelRuntime> {
 		if (this.runtimeFactory) return this.runtimeFactory(ctx, provider);
 		const runtime = await ModelRuntime.create();
-		const getRegisteredProviderConfig = (ctx.modelRegistry as typeof ctx.modelRegistry & {
-			getRegisteredProviderConfig?: (providerId: string) => unknown;
-		}).getRegisteredProviderConfig;
-		const providerConfig = getRegisteredProviderConfig?.call(ctx.modelRegistry, provider);
-		if (providerConfig) runtime.registerProvider(provider, providerConfig as never);
+		const getRegisteredNativeProvider = (ctx.modelRegistry as typeof ctx.modelRegistry & {
+			getRegisteredNativeProvider?: (providerId: string) => unknown;
+		}).getRegisteredNativeProvider;
+		const nativeProvider = getRegisteredNativeProvider?.call(ctx.modelRegistry, provider);
+		if (nativeProvider) {
+			runtime.registerNativeProvider(
+				nativeProvider as Parameters<ModelRuntime["registerNativeProvider"]>[0],
+			);
+		} else {
+			const getRegisteredProviderConfig = (ctx.modelRegistry as typeof ctx.modelRegistry & {
+				getRegisteredProviderConfig?: (providerId: string) => unknown;
+			}).getRegisteredProviderConfig;
+			const providerConfig = getRegisteredProviderConfig?.call(ctx.modelRegistry, provider);
+			if (providerConfig) runtime.registerProvider(provider, providerConfig as never);
+		}
 		return runtime;
 	}
 }

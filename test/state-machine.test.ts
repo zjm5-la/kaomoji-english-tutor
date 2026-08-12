@@ -396,7 +396,7 @@ test("consecutive skips preserve FIFO replacement obligations", { concurrency: f
 		await fake.fire();
 		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /clear a timer/);
+		assert.match(harness.widget().join(" "), /clear a timer/, "queued new card surfaces after deferred replacement generation");
 		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const raw = (check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value;
@@ -406,6 +406,201 @@ test("consecutive skips preserve FIFO replacement obligations", { concurrency: f
 		assert.deepEqual(statuses.map((row) => row.status), ["mastered", "mastered"]);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
+		fake.restore();
+	}
+});
+
+test("a due review is activated before any replacement LLM call", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-priority" });
+	let llmCalls = 0;
+	try {
+		registration.setResponses([async () => {
+			llmCalls++;
+			return fauxAssistantMessage(JSON.stringify({ ready: false, reason: "unused" }));
+		}]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-priority" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','known','熟词',?,?,1)")
+			.run(now, new Date(Date.now() + 86_400_000).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','due','到期',?,?,1)")
+			.run(now, new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1, next_check_at=? WHERE id=1")
+			.run(new Date(0).toISOString());
+		db.close();
+		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		check.close();
+		assert.equal(state.active_item_id, 2);
+		assert.equal(llmCalls, 0, "due review must not wait for replacement generation");
+		assert.deepEqual(queue, ["word"], "replacement obligation stays queued");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("successful replacement is one-for-one, critic-approved, and quota-free", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-ready" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "deadline", phonetic: "/ˈdedlaɪn/", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-ready" });
+		const db = openTestDb();
+		insertDueWord(db, "timer", "定时器");
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		const check = openTestDb();
+		const items = check.prepare("SELECT text,shown,status,introduction_kind,introduced_at FROM items ORDER BY id").all() as any[];
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		const plannedToday = Number((check.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind='planned' AND introduced_at IS NOT NULL").get() as any).n);
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(items.length, 2, "one skipped card creates exactly one replacement");
+		assert.deepEqual(
+			{ text: items[1].text, shown: items[1].shown, kind: items[1].introduction_kind, introduced: Boolean(items[1].introduced_at) },
+			{ text: "deadline", shown: 1, kind: "replacement", introduced: true },
+		);
+		assert.equal(plannedToday, 1, "replacement does not consume planned quota");
+		assert.deepEqual(queue, [], "FIFO obligation is consumed only after insertion");
+		assert.equal(active.active_item_id, 2);
+		assert.equal(registration.state.callCount, 2, "replacement generator and independent critic both ran");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("replacement critic rejection preserves the FIFO obligation and inserts nothing", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-reject" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-reject" });
+		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		const check = openTestDb();
+		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(registration.state.callCount, 2);
+		assert.equal(count, 1);
+		assert.deepEqual(queue, ["word"]);
+		assert.equal(active.active_item_id, null);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("conversation changes during replacement critique make the result stale", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-conversation-stale" });
+	let releaseCritic!: () => void;
+	let criticStarted!: () => void;
+	const gate = new Promise<void>((resolve) => { releaseCritic = resolve; });
+	const started = new Promise<void>((resolve) => { criticStarted = resolve; });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+			})),
+			async () => { criticStarted(); await gate; return fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })); },
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-conversation-stale" });
+		let conversation = "old topic";
+		harness.ctx.sessionManager.getBranch = () => [{ type: "message", message: { role: "user", content: [{ type: "text", text: conversation }] } }];
+		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
+		await fake.fire();
+		const inFlight = harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await started;
+		conversation = "new topic";
+		releaseCritic();
+		await inFlight;
+		const check = openTestDb();
+		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		check.close();
+		assert.equal(count, 1, "stale critic result inserts no replacement");
+		assert.deepEqual(queue, ["word"], "stale result cannot consume the FIFO obligation");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		releaseCritic?.();
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("a review becoming due during replacement critique prevents replacement activation", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-late-due" });
+	let releaseCritic!: () => void;
+	let criticStarted!: () => void;
+	const gate = new Promise<void>((resolve) => { releaseCritic = resolve; });
+	const started = new Promise<void>((resolve) => { criticStarted = resolve; });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+			})),
+			async () => { criticStarted(); await gate; return fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })); },
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-late-due" });
+		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
+		await fake.fire();
+		const inFlight = harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await started;
+		const during = openTestDb();
+		during.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','overdue','已到期',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		during.close();
+		releaseCritic();
+		await inFlight;
+		const check = openTestDb();
+		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(count, 2, "replacement is not inserted ahead of a newly due review");
+		assert.deepEqual(queue, ["word"]);
+		assert.equal(active.active_item_id, null);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		releaseCritic?.();
+		registration.unregister();
 		fake.restore();
 	}
 });
@@ -716,7 +911,10 @@ test("single coordinator commits one lesson batch", { concurrency: false }, asyn
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-faux" });
 	try {
-		registration.setResponses([fauxAssistantMessage(lessonResponse())]);
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse()),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		const a = await makeSession({ model, modelRegistry: registry, sessionId: "lesson-a" });
@@ -730,7 +928,7 @@ test("single coordinator commits one lesson batch", { concurrency: false }, asyn
 		const state = db.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
 		db.close();
 		assert.equal(registration.state.callCount, 2);
-		assert.equal(count, 5);
+		assert.equal(count, 3);
 		assert.equal(state.active_item_id, 1);
 		assert.equal(state.active_kind, "teach");
 		await fake.firePoll();
@@ -794,8 +992,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const runtimeCols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 5, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5]);
+			assert.deepEqual({ ...meta }, { schema_version: 6, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -843,7 +1041,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 5);
+		assert.equal(meta.schema_version, 6);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -928,7 +1126,7 @@ test("today remaining counts due cards plus only the available new-card quota", 
 		const planned = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind='planned' AND introduced_at >= ?").get(localStart) as any).n);
 		const queued = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=0").get() as any).n);
 		const tomorrow = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1).toISOString();
-		const due = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND status='learning' AND due_at < ?").get(tomorrow) as any).n);
+		const due = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND due_at < ?").get(tomorrow) as any).n);
 		after.close();
 		assert.deepEqual({ planned, queued }, { planned: 1, queued: 2 });
 		assert.match(
@@ -936,6 +1134,74 @@ test("today remaining counts due cards plus only the available new-card quota", 
 			new RegExp(`今日剩余 ${due + 1} 张卡片`),
 			"status includes cards still due later today plus one quota-eligible new card",
 		);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("today remaining includes hidden quota-free replacements after planned quota is full", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const harness = await makeSession({ sessionId: "remaining-hidden-replacement" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at,introduction_kind) VALUES('word','used','已用',?,?,1,?,'planned')")
+			.run(now, "2099-01-01T00:00:00.000Z", now);
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind) VALUES('word','replacement','补卡',?,?,0,'replacement')")
+			.run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind) VALUES('word','planned','计划卡',?,?,0,'planned')")
+			.run(now, new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET next_check_at=? WHERE id=1").run("2099-01-01T00:00:00.000Z");
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /今日剩余 1 张卡片/);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("dailyNewLimit zero allows every queued planned card to surface", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "quota-unlimited" });
+		const db = openTestDb();
+		for (const [text, meaning] of [["one", "一"], ["two", "二"], ["three", "三"]]) insertDueWord(db, text, meaning);
+		db.close();
+		for (const text of ["one", "two", "three"]) {
+			await fake.fire(fake.active().find((timer) => timer.delay === 0) ?? fake.active()[0]);
+			assert.match(harness.widget().join(" "), new RegExp(text));
+			if (text !== "three") await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		}
+		const check = openTestDb();
+		const shown = Number((check.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND introduction_kind='planned' AND introduced_at IS NOT NULL").get() as any).n);
+		check.close();
+		assert.equal(shown, 3);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("a matured Skip card due today is counted and claimable", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const harness = await makeSession({ sessionId: "matured-skip-due" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,status) VALUES('word','matured','到期熟词',?,?,1,'mastered')")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /到期熟词/);
+		assert.match(harness.widget().join(" "), /今日剩余 1 张卡片/);
+		const check = openTestDb();
+		const active = check.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...active }, { active_item_id: 1, active_kind: "review" });
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -967,7 +1233,10 @@ test("generated lesson items carry unique content fingerprints", { concurrency: 
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-fp-faux" });
 	try {
-		registration.setResponses([fauxAssistantMessage(lessonResponse("fingerprint"))]);
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("fingerprint")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "fp-a" });
@@ -988,7 +1257,10 @@ test("word/phrase items link to a lexical sense; sentences do not", { concurrenc
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-sense-faux" });
 	try {
-		registration.setResponses([fauxAssistantMessage(lessonResponse("senses"))]);
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("senses")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "sense-a" });
@@ -1036,6 +1308,33 @@ test("quality gate rejects lessons the critic flags and commits nothing", { conc
 	}
 });
 
+test("critic bad JSON fails closed and commits no lesson", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-critic-bad-json" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("bad-critic-json")),
+			fauxAssistantMessage("not-json"),
+			fauxAssistantMessage(JSON.stringify({ ready: false, reason: "defer revision" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "critic-bad-json" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const status = String((db.prepare("SELECT value FROM stats WHERE key='last_gen_status'").get() as any).value);
+		db.close();
+		assert.equal(count, 0);
+		assert.match(status, /critic_unavailable/);
+		assert.equal(registration.state.callCount, 2, "unavailable critic defers without wasting a revision call");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("revision loop recovers a lesson after an initial critic rejection", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-rev-faux" });
@@ -1060,6 +1359,48 @@ test("revision loop recovers a lesson after an initial critic rejection", { conc
 		assert.equal(state.active_item_id, 1, "revised lesson activated");
 	} finally {
 		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("fallback session model is reused for the critic after configured generator failure", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const primary = registerFauxProvider({ provider: "kaomoji-primary-failure" });
+	const fallback = registerFauxProvider({ provider: "kaomoji-session-fallback" });
+	try {
+		fallback.setResponses([
+			fauxAssistantMessage(lessonResponse("fallback")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved by fallback" })),
+		]);
+		const primaryModel = primary.getModel();
+		const fallbackModel = fallback.getModel();
+		const models = [primaryModel, fallbackModel];
+		let primaryAuthCalls = 0;
+		const registry = {
+			getAvailable: () => models,
+			find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+			hasConfiguredAuth: () => true,
+			getApiKeyAndHeaders: async (model: any) => {
+				if (model.provider === primaryModel.provider) {
+					primaryAuthCalls++;
+					throw new Error("primary unavailable");
+				}
+				return { ok: true, apiKey: "test-key" };
+			},
+		};
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3, provider: primaryModel.provider, model: primaryModel.id });
+		await makeSession({ model: fallbackModel, modelRegistry: registry, sessionId: "model-fallback" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		db.close();
+		assert.ok(primaryAuthCalls >= 1, "configured provider was attempted first");
+		assert.equal(fallback.state.callCount, 2, "fallback handles generation and independent critique");
+		assert.equal(count, 3);
+	} finally {
+		primary.unregister();
+		fallback.unregister();
 		fake.restore();
 	}
 });
@@ -1090,7 +1431,7 @@ test("active recall: a correct answer is judged and recorded", { concurrency: fa
 	}
 });
 
-test("active recall: a wrong answer reveals the correct text and records incorrect", { concurrency: false }, async () => {
+test("active recall without model: a wrong answer stays pending with zero writes", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -1100,13 +1441,50 @@ test("active recall: a wrong answer reveals the correct text and records incorre
 		db.close();
 		await fake.fire();
 		await harness.commands["kaomoji:answer"].handler("word", harness.ctx);
-		assert.match(harness.widget().join(" "), /答案是：world/);
+		assert.ok(harness.notifications().some((m) => /无法可靠判断/.test(m)), "warning shown for unavailable evaluator");
 		const check = openTestDb();
-		const att = check.prepare("SELECT verdict FROM attempts WHERE item_id = 1").get() as any;
+		const att = check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id = 1").get() as any;
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const item = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const mastery = Number((check.prepare("SELECT COUNT(*) AS n FROM mastery_state WHERE item_id=1").get() as any).n);
 		check.close();
-		assert.equal(att.verdict, "incorrect");
+		assert.equal(att.n, 0, "zero attempts when evaluator unavailable");
+		assert.equal(active.active_item_id, 1, "card stays pending");
+		assert.deepEqual({ ...item }, { reviews: 0, fsrs_state: "" });
+		assert.equal(mastery, 0);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
+		fake.restore();
+	}
+});
+
+test("bad evaluator JSON leaves word card pending with zero authoritative writes", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-eval-bad-json" });
+	try {
+		registration.setResponses([fauxAssistantMessage("not-json")]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "eval-bad-json" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','world','世界',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("word", harness.ctx);
+		const check = openTestDb();
+		const item = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
+		const mastery = Number((check.prepare("SELECT COUNT(*) AS n FROM mastery_state").get() as any).n);
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...item }, { reviews: 0, fsrs_state: "" });
+		assert.equal(attempts, 0);
+		assert.equal(mastery, 0);
+		assert.equal(active.active_item_id, 1);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
 		fake.restore();
 	}
 });
@@ -1129,10 +1507,15 @@ test("LLM evaluation marks a near-miss answer as partial with feedback", { concu
 		await harness.commands["kaomoji:answer"].handler("apple", harness.ctx);
 		assert.match(harness.widget().join(" "), /差一点/);
 		const check = openTestDb();
-		const att = check.prepare("SELECT verdict, feedback_json FROM attempts WHERE item_id = 1").get() as any;
+		const att = check.prepare("SELECT verdict, feedback_json, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
+		const item = check.prepare("SELECT reviews FROM items WHERE id=1").get() as any;
+		const mastery = check.prepare("SELECT consecutive_again FROM mastery_state WHERE item_id=1").get() as any;
 		check.close();
 		assert.equal(att.verdict, "partial");
+		assert.equal(att.explicit_rating, "again");
 		assert.match(att.feedback_json, /少了复数/);
+		assert.equal(item.reviews, 1);
+		assert.equal(mastery.consecutive_again, 1);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		registration.unregister();
@@ -1231,7 +1614,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 5, "schema migrated to v5");
+	assert.equal(meta.schema_version, 6, "schema migrated to v6");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -1305,7 +1688,10 @@ test("lesson generation stamps content_fingerprint and lexical_sense_id", { conc
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-fp" });
 	try {
-		registration.setResponses([fauxAssistantMessage(lessonResponse())]);
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse()),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		const s = await makeSession({ model, modelRegistry: registry, sessionId: "fp" });
@@ -1319,7 +1705,11 @@ test("lesson generation stamps content_fingerprint and lexical_sense_id", { conc
 		for (const it of items) {
 			assert.ok(it.content_fingerprint, `${it.type} has content_fingerprint`);
 			assert.equal(it.introduction_kind, "planned", `${it.type} stamped introduction_kind=planned`);
-			assert.ok(it.introduced_at, `${it.type} has introduced_at`);
+		}
+		// Only the first card (displayed) has introduced_at; queued cards do not.
+		assert.ok(items[0].introduced_at, "first item has introduced_at");
+		for (let i = 1; i < items.length; i++) {
+			assert.equal(items[i].introduced_at, null, `queued item ${i} has no introduced_at`);
 		}
 		const word = items.find((i) => i.type === "word");
 		const phrase = items.find((i) => i.type === "phrase");
@@ -1339,7 +1729,10 @@ test("duplicate content fingerprint is rejected at commit", { concurrency: false
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-dup" });
 	try {
-		registration.setResponses([fauxAssistantMessage(lessonResponse())]);
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse()),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		const s = await makeSession({ model, modelRegistry: registry, sessionId: "dup" });
@@ -1542,7 +1935,7 @@ test("stale async answer cannot record or rate the next global card", { concurre
 			},
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
 		const a = await makeSession({ model, modelRegistry: registry, sessionId: "stale-answer-a" });
 		const b = await makeSession({ model, modelRegistry: registry, sessionId: "stale-answer-b" });
 		const db = openTestDb();
@@ -1555,8 +1948,8 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		const inFlight = a.commands["kaomoji:answer"].handler("alph", a.ctx);
 		await started;
 		await b.commands["kaomoji:good"].handler("", b.ctx); // B rates alpha.
-		assert.equal(fake.active()[0].delay, 0);
-		await fake.fire(); // B advances the global slot to beta.
+		assert.ok(fake.active().some((timer) => timer.delay === 0), "next due card is scheduled immediately");
+		await fake.fire(fake.active().find((timer) => timer.delay === 0)); // B advances the global slot to beta.
 		releaseResponse();
 		await inFlight;
 		const check = openTestDb();
@@ -1564,9 +1957,12 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		const attemptCount = (check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n;
 		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id = 1").get() as any;
 		check.close();
-		assert.deepEqual(items.map((row) => ({ ...row })), [{ text: "alpha", reviews: 1 }, { text: "beta", reviews: 0 }]);
+		assert.deepEqual(items.map((row) => ({ ...row })), [
+			{ text: "alpha", reviews: 1 },
+			{ text: "beta", reviews: 0 },
+		]);
+		assert.equal(active.active_item_id, 2, "beta remains the authoritative next card");
 		assert.equal(attemptCount, 0, "stale LLM result writes no attempt");
-		assert.equal(active.active_item_id, 2, "beta remains the active card");
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 	} finally {
@@ -1684,6 +2080,151 @@ test("Anki-style: rating immediately surfaces the next due card", { concurrency:
 		const w = a.widget().join(" ");
 		assert.ok(/阿尔法|贝塔/.test(w), "next due card surfaced without waiting");
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("lesson items leave introduced_at NULL until first display", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-intro-test" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("intro-test")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "intro-test" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const items = db.prepare("SELECT introduced_at FROM items ORDER BY id").all() as any[];
+		db.close();
+		assert.equal(items.length, 3, "three lesson items");
+		assert.ok(items[0].introduced_at, "first item stamped at display");
+		assert.equal(items[1].introduced_at, null, "second item not yet displayed");
+		assert.equal(items[2].introduced_at, null, "third item not yet displayed");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("corrupt FSRS state quarantines the card without silent reset", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ sessionId: "corrupt-test" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,fsrs_state) VALUES('word','bad','坏',?,?,1,'NOT_JSON')").run(now, new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1 WHERE id=1").run();
+		db.close();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		const check = openTestDb();
+		const item = check.prepare("SELECT fsrs_status, fsrs_error FROM items WHERE id=1").get() as any;
+		const corrupt = check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any;
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(item.fsrs_status, "corrupt");
+		assert.ok(item.fsrs_error, "error code recorded");
+		assert.equal(corrupt.n, 1, "one diagnostic row");
+		assert.equal(active.active_item_id, null, "active slot cleared");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("non-object and invalid-date FSRS states are quarantined without throwing", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const validDate = new Date().toISOString();
+		const cases = [
+			{ state: "null", error: /not_object/ },
+			{
+				state: JSON.stringify({ due: "not-a-date", last_review: "not-a-date", stability: 1, difficulty: 1, elapsed_days: 0, scheduled_days: 1, reps: 1, lapses: 0, state: 1 }),
+				error: /invalid_date/,
+			},
+			{
+				state: JSON.stringify({ due: validDate, last_review: validDate, stability: -1, difficulty: 1, elapsed_days: 0, scheduled_days: 1, reps: 1, lapses: 0, state: 2 }),
+				error: /invalid_field:fsrs_range/,
+			},
+			{
+				state: JSON.stringify({ due: validDate, last_review: validDate, stability: 1, difficulty: 1, elapsed_days: 0, scheduled_days: 1, reps: 1, lapses: 0, state: 999 }),
+				error: /invalid_field:state/,
+			},
+		];
+		for (const [index, fixture] of cases.entries()) {
+			const harness = await createHarness({ sessionId: `corrupt-structure-${index}` });
+			const db = openTestDb();
+			const now = new Date().toISOString();
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,fsrs_state) VALUES('word',?,?,?, ?,1,?)")
+				.run(`bad-${index}`, "坏", now, new Date(0).toISOString(), fixture.state);
+			db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1 WHERE id=1").run();
+			db.close();
+			await harness.commands["kaomoji:good"].handler("", harness.ctx);
+			const check = openTestDb();
+			const item = check.prepare("SELECT fsrs_status,fsrs_error FROM items WHERE id=1").get() as any;
+			const count = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
+			check.close();
+			assert.equal(item.fsrs_status, "corrupt");
+			assert.match(item.fsrs_error, fixture.error);
+			assert.equal(count, 1);
+			await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+		}
+	} finally {
+		fake.restore();
+	}
+});
+
+test("two sessions quarantine the same corrupt FSRS item only once", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const a = await makeSession({ sessionId: "corrupt-race-a" });
+		const b = await makeSession({ sessionId: "corrupt-race-b" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,fsrs_state) VALUES('word','bad','坏',?,?,1,'NOT_JSON')").run(now, new Date(0).toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1 WHERE id=1").run();
+		db.close();
+		await Promise.all([
+			a.commands["kaomoji:good"].handler("", a.ctx),
+			b.commands["kaomoji:good"].handler("", b.ctx),
+		]);
+		const check = openTestDb();
+		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
+		const state = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(count, 1);
+		assert.equal(state.active_item_id, null);
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("word/phrase evaluator unavailable keeps card pending with zero writes", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "eval-pending" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','hello','你好',?,?,1)").run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:answer"].handler("wrong", harness.ctx);
+		assert.ok(harness.notifications().some((m) => /无法可靠判断/.test(m)));
+		const check = openTestDb();
+		const att = check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any;
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(att.n, 0, "zero attempts");
+		assert.equal(active.active_item_id, 1, "card stays pending");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
 	}

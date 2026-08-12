@@ -2,7 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { FSRS, Rating, Card } from "fsrs.js";
+import { FSRS, Rating, Card, State } from "fsrs.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -134,7 +134,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 5;
+const SCHEMA_TARGET_VERSION = 6;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -316,6 +316,11 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 			"active_retry_count INTEGER NOT NULL DEFAULT 0",
 			"active_assistance_level TEXT NOT NULL DEFAULT 'none'",
 		]) addColumnIfMissing(db, "runtime_state", col);
+	},
+	// v6: indexes for the now-shared scheduling and first-display predicates.
+	(db: DatabaseSync) => {
+		db.exec("CREATE INDEX IF NOT EXISTS items_due_shown_idx ON items(due_at, shown, id) WHERE content_status = 'approved'");
+		db.exec("CREATE INDEX IF NOT EXISTS items_introduction_idx ON items(introduction_kind, introduced_at) WHERE introduction_kind = 'planned'");
 	},
 ];
 
@@ -499,9 +504,13 @@ function ensureLexicalSense(db: DatabaseSync, type: string, text: string, meanin
 
 function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
 	return db
-		.prepare("SELECT * FROM items WHERE due_at <= ? ORDER BY due_at ASC, id ASC LIMIT 1")
+		.prepare(`SELECT * FROM items WHERE due_at <= ? ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 		.get(now.toISOString()) as ItemRow | undefined;
 }
+
+/** Shared predicate for items eligible to be surfaced by the scheduler.
+ * Excludes corrupt, quarantined, or legacy-duplicate content. */
+const SCHEDULABLE = "AND (fsrs_status = 'ok' OR fsrs_status IS NULL) AND content_status = 'approved' AND legacy_duplicate_of IS NULL";
 
 function insertItem(
 	db: DatabaseSync,
@@ -512,12 +521,13 @@ function insertItem(
 	example: string | null,
 	example_cn: string | null,
 	now: Date,
-	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"] },
+	extra?: { levels?: string[]; levels_cn?: string[]; chunks?: string[]; keyWords?: GeneratedItem["keyWords"]; introductionKind?: "planned" | "replacement" },
 ): number {
 	const senseId = ensureLexicalSense(db, type, text, meaning, now);
 	const ts = now.toISOString();
+	const introductionKind = extra?.introductionKind ?? "planned";
 	const result = db.prepare(
-		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?)",
+		"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
 	).run(
 		type,
 		text,
@@ -533,20 +543,9 @@ function insertItem(
 		extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
 		contentFingerprint(type, text, meaning),
 		senseId,
-		ts,
+		introductionKind,
 	);
 	return Number(result.lastInsertRowid);
-}
-
-/** Insert companion word cards for sentence keyWords (skipping duplicates). */
-function insertCompanionWords(db: DatabaseSync, keyWords: GeneratedItem["keyWords"], now: Date) {
-	for (const kw of keyWords ?? []) {
-		if (!kw?.text || !kw?.meaning) continue;
-		const dup = db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?")
-			.get(contentFingerprint("word", kw.text, kw.meaning));
-		if (dup) continue;
-		insertItem(db, "word", kw.text, kw.phonetic || null, kw.meaning, null, null, now);
-	}
 }
 
 function markShown(db: DatabaseSync, id: number) {
@@ -795,34 +794,119 @@ function latestMasteredItem(db: DatabaseSync, type: GeneratedItem["type"]): Item
 
 const scheduler = new FSRS();
 
-/** Rebuild a Card from its stored JSON state (dates come back as strings). */
-function restoreCard(stateJson: string): Card {
+/** Rebuild a Card from its stored JSON state (dates come back as strings).
+ * Empty state is a valid new Card; non-empty malformed state is corruption. */
+function restoreCard(stateJson: string): { card: Card } | { corrupt: true; error: string } {
+	if (!stateJson.trim()) return { card: new Card() };
+	let parsed: Card;
 	try {
-		const parsed = JSON.parse(stateJson) as Card;
-		const card = new Card();
-		card.due = new Date(parsed.due);
-		card.last_review = new Date(parsed.last_review);
-		card.stability = parsed.stability;
-		card.difficulty = parsed.difficulty;
-		card.elapsed_days = parsed.elapsed_days;
-		card.scheduled_days = parsed.scheduled_days;
-		card.reps = parsed.reps;
-		card.lapses = parsed.lapses;
-		card.state = parsed.state;
-		return card;
-	} catch {
-		return new Card();
+		parsed = JSON.parse(stateJson) as Card;
+	} catch (err) {
+		return { corrupt: true, error: `json_parse: ${(err as Error).message}` };
+	}
+	if (parsed == null || typeof parsed !== "object") {
+		return { corrupt: true, error: "not_object" };
+	}
+	const required: Array<[string, unknown]> = [
+		["due", parsed.due],
+		["stability", parsed.stability],
+		["difficulty", parsed.difficulty],
+		["elapsed_days", parsed.elapsed_days],
+		["scheduled_days", parsed.scheduled_days],
+		["reps", parsed.reps],
+		["lapses", parsed.lapses],
+		["state", parsed.state],
+	];
+	for (const [name, value] of required) {
+		if (value == null) return { corrupt: true, error: `missing_field:${name}` };
+		if (name !== "due" && (typeof value !== "number" || !Number.isFinite(value))) {
+			return { corrupt: true, error: `invalid_field:${name}` };
+		}
+	}
+	if (![State.New, State.Learning, State.Review, State.Relearning].includes(parsed.state)) {
+		return { corrupt: true, error: "invalid_field:state" };
+	}
+	for (const [name, value] of [["elapsed_days", parsed.elapsed_days], ["scheduled_days", parsed.scheduled_days], ["reps", parsed.reps], ["lapses", parsed.lapses]] as const) {
+		if (!Number.isInteger(value) || value < 0) return { corrupt: true, error: `invalid_field:${name}` };
+	}
+	if (parsed.stability < 0 || parsed.difficulty < 0 || parsed.difficulty > 10) {
+		return { corrupt: true, error: "invalid_field:fsrs_range" };
+	}
+	if (parsed.state !== State.New && (parsed.stability <= 0 || parsed.difficulty < 1)) {
+		return { corrupt: true, error: "invalid_field:review_range" };
+	}
+	const due = new Date(parsed.due);
+	const lastReview = parsed.last_review ? new Date(parsed.last_review) : new Date(parsed.due);
+	if (Number.isNaN(due.getTime())) return { corrupt: true, error: "invalid_date:due" };
+	if (Number.isNaN(lastReview.getTime())) return { corrupt: true, error: "invalid_date:last_review" };
+	const card = new Card();
+	card.due = due;
+	card.last_review = lastReview;
+	card.stability = parsed.stability;
+	card.difficulty = parsed.difficulty;
+	card.elapsed_days = parsed.elapsed_days;
+	card.scheduled_days = parsed.scheduled_days;
+	card.reps = parsed.reps;
+	card.lapses = parsed.lapses;
+	card.state = parsed.state;
+	return { card };
+}
+
+/** Advance a card only after an explicit user rating.
+ * Passing null state creates the first schedule for a brand-new item.
+ * Returns corrupt when the stored FSRS blob is malformed; callers must quarantine. */
+function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } | { corrupt: true; error: string } {
+	if (!stateJson) {
+		const info = scheduler.repeat(new Card(), now)[rating];
+		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
+	}
+	const restored = restoreCard(stateJson);
+	if ("corrupt" in restored) return restored;
+	try {
+		const info = scheduler.repeat(restored.card, now)[rating];
+		if (!info?.card || Number.isNaN(info.card.due.getTime())) {
+			return { corrupt: true, error: "scheduler_invalid_due" };
+		}
+		for (const value of [info.card.stability, info.card.difficulty, info.card.elapsed_days, info.card.scheduled_days, info.card.reps, info.card.lapses]) {
+			if (!Number.isFinite(value)) return { corrupt: true, error: "scheduler_invalid_field" };
+		}
+		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
+	} catch (err) {
+		return { corrupt: true, error: `scheduler_error:${(err as Error).message}` };
 	}
 }
 
-/**
- * Advance a card only after an explicit user rating.
- * Passing null state creates the first schedule for a brand-new item.
- */
-function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } {
-	const card = stateJson ? restoreCard(stateJson) : new Card();
-	const info = scheduler.repeat(card, now)[rating];
-	return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
+/** Atomically quarantine a corrupt FSRS item: preserve the raw blob, mark it corrupt,
+ * insert one diagnostic row, and clear the active card slot. */
+function quarantineCorruptFsrs(db: DatabaseSync, itemId: number, rawFsrsState: string, error: string, now: Date): void {
+	const ts = now.toISOString();
+	const errCode = error.slice(0, 80);
+	try {
+		db.exec("BEGIN IMMEDIATE");
+		const marked = db.prepare("UPDATE items SET fsrs_status = 'corrupt', fsrs_error = ?, fsrs_corrupt_at = ? WHERE id = ? AND fsrs_status IS NOT 'corrupt'")
+			.run(errCode, ts, itemId);
+		if (Number(marked.changes) > 0) {
+			db.prepare(
+				"INSERT INTO fsrs_corruptions (item_id, raw_fsrs_state, error_code, detected_at, resolution) VALUES (?, ?, ?, ?, NULL)",
+			).run(itemId, rawFsrsState, errCode, ts);
+		}
+		// Clear the active card slot so the corrupt item is not re-surfaced.
+		const cur = getRuntimeState(db);
+		if (cur.active_item_id === itemId) {
+			setRuntimeState(db, {
+				active_item_id: null,
+				active_kind: null,
+				active_direction: "forward",
+				active_version: cur.active_version + 1,
+				...EMPTY_SENTENCE_CYCLE,
+				next_check_at: now.toISOString(),
+			});
+		}
+		db.exec("COMMIT");
+	} catch (err) {
+		try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+		console.error(`[kaomoji-english-tutor] FSRS quarantine failed for item ${itemId}: ${err}`);
+	}
 }
 
 // -- Conversation extraction ----------------------------------------------
@@ -1082,14 +1166,15 @@ interface CritiqueIssue {
 }
 
 interface CritiqueVerdict {
+	available: boolean;
 	pass: boolean;
 	issues: CritiqueIssue[];
 	summary: string;
 }
 
 /**
- * Independent quality gate. Fail-open on model/auth/runtime errors so a missing
- * or broken critic never blocks lesson generation — it only adds a gate when it works.
+ * Independent quality gate. Fail-closed on model/auth/runtime/bad-JSON errors
+ * so a broken critic defers insertion rather than approving unreviewed content.
  */
 async function critiqueLesson(
 	llm: PiSdkLlmClient,
@@ -1099,12 +1184,10 @@ async function critiqueLesson(
 	known: string[],
 	config: PetConfig,
 ): Promise<CritiqueVerdict> {
-	const failOpen = (summary: string): CritiqueVerdict => ({ pass: true, issues: [], summary });
-	const outline = lesson.items.map((it) =>
-		it.type === "sentence"
-			? `sentence: "${it.text}" -> ${it.meaning} (levels: ${it.levels?.length ?? 0})`
-			: `${it.type}: "${it.text}" -> ${it.meaning}`,
-	).join("\n");
+	const failClosed = (summary: string): CritiqueVerdict => ({ available: false, pass: false, issues: [], summary });
+	// Pass the complete bounded lesson structure (not just an outline) so the critic
+	// can judge examples, levels, chunks, and keywords.
+	const lessonJson = JSON.stringify(lesson);
 
 	const prompt = [
 		"你是「英语小宠物」的内容审查员。审查下面备课是否适合中级学习者，只输出 JSON。",
@@ -1113,14 +1196,13 @@ async function critiqueLesson(
 		"- 英语单词/词组/句子必须正确、自然",
 		"- 中文释义准确，不得机翻味",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
-		"- 长句至少 15 词、含从句；levels 必须逐级递进、不得突变",
+		"- 长句至少 15 词、含从句；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致",
+		"- 单词必须自然出现在句子中",
 		"- 不得为凑结构硬造不自然句子",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
 		"",
-		`<lesson topic="${lesson.topic}">`,
-		outline,
-		"</lesson>",
-].join("\n");
+		`<lesson>${lessonJson}</lesson>`,
+	].join("\n");
 
 	let text: string;
 	try {
@@ -1131,31 +1213,33 @@ async function critiqueLesson(
 			thinkingLevel: config.thinkingLevel,
 		});
 	} catch {
-		return failOpen("critic call failed");
+		return failClosed("critic call failed");
 	}
 
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
 	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return failOpen("critic bad json");
+	if (start < 0 || end <= start) return failClosed("critic bad json");
 	try {
 		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { pass?: unknown; issues?: unknown; summary?: unknown };
 		return {
+			available: true,
 			pass: parsed.pass === true,
 			issues: Array.isArray(parsed.issues) ? (parsed.issues as CritiqueIssue[]).slice(0, 20) : [],
 			summary: typeof parsed.summary === "string" ? parsed.summary : "",
 		};
 	} catch {
-		return failOpen("critic unparseable");
+		return failClosed("critic unparseable");
 	}
 }
 
 interface AnswerEvaluation {
+	available: boolean;
 	verdict: "correct" | "partial" | "incorrect";
 	feedback: string;
 }
 
-/** LLM evaluation for a near-miss answer. Fail-closed to incorrect when unavailable. */
+/** LLM evaluation for a near-miss answer. Provider/model/bad-JSON failures leave the card pending with zero writes. */
 async function evaluateAttempt(
 	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
@@ -1164,8 +1248,8 @@ async function evaluateAttempt(
 	resolved: { provider: string; model: string } | undefined,
 	direction: "forward" | "reverse" = "forward",
 ): Promise<AnswerEvaluation> {
-	const failClosed = (feedback = ""): AnswerEvaluation => ({ verdict: "incorrect", feedback });
-	if (!resolved) return failClosed();
+	const unavailable = (): AnswerEvaluation => ({ available: false, verdict: "incorrect", feedback: "" });
+	if (!resolved) return unavailable();
 	const isReverse = direction === "reverse";
 	const target = isReverse ? item.meaning : item.text;
 	const answerLang = isReverse ? "中文" : "英文";
@@ -1188,18 +1272,18 @@ async function evaluateAttempt(
 			maxTokens: 200,
 		});
 	} catch {
-		return failClosed();
+		return unavailable();
 	}
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
 	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return failClosed();
+	if (start < 0 || end <= start) return unavailable();
 	try {
 		const parsed = JSON.parse(cleaned.slice(start, end + 1)) as { verdict?: unknown; feedback?: unknown };
 		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
-		return { verdict, feedback: typeof parsed.feedback === "string" ? parsed.feedback : "" };
+		return { available: true, verdict, feedback: typeof parsed.feedback === "string" ? parsed.feedback : "" };
 	} catch {
-		return failClosed();
+		return unavailable();
 	}
 }
 
@@ -1412,16 +1496,21 @@ const TYPE_LABELS: Record<string, string> = {
 
 function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): number {
 	const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+	// Due reviews (shown items due today or earlier).
 	const due = Number((db.prepare(
-		"SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND status = 'learning' AND due_at < ?",
+		`SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
-	const queuedNew = Number((db.prepare(
-		"SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND due_at < ?",
+	// Queued replacements are quota-free; planned cards consume the remaining daily quota.
+	const queuedReplacement = Number((db.prepare(
+		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND introduction_kind = 'replacement' AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
-	const remainingNew = dailyNewLimit === 0
-		? queuedNew
-		: Math.min(queuedNew, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
-	return due + remainingNew;
+	const queuedPlanned = Number((db.prepare(
+		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND (introduction_kind = 'planned' OR introduction_kind IS NULL) AND due_at < ? ${SCHEDULABLE}`,
+	).get(tomorrow) as { n: number }).n);
+	const remainingPlanned = dailyNewLimit === 0
+		? queuedPlanned
+		: Math.min(queuedPlanned, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
+	return due + queuedReplacement + remainingPlanned;
 }
 
 function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
@@ -1969,7 +2058,7 @@ export default function kaomojiEnglishTutorExtension(
 		return undefined;
 	}
 
-	function updateWidget(ctx: ExtensionContext, face: string, lines: string[]) {
+	function updateWidget(ctx: ExtensionContext, _face: string, lines: string[]) {
 		if (isCtxStale(ctx)) return;
 		if (!ctx.hasUI) return;
 		if (!config.showWidget) {
@@ -1991,15 +2080,20 @@ export default function kaomojiEnglishTutorExtension(
 	/** Whether an already-stored review/new card can be claimed right now. */
 	function hasReadyQueuedCard(now: Date): boolean {
 		if (!db) return false;
-		const dueReview = db.prepare("SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 LIMIT 1")
+		const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`)
 			.get(now.toISOString());
 		if (dueReview) return true;
+		if (pendingReplacementTypes(db).length > 0) return true;
+		// Replacement queued-new is always claimable (quota-free).
+		const replacementNew = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} LIMIT 1`)
+			.get(now.toISOString());
+		if (replacementNew) return true;
 		if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) return false;
-		return Boolean(db.prepare("SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 LIMIT 1").get(now.toISOString()));
+		return Boolean(db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString()));
 	}
 
 	/** Atomically select, mark, and activate the next due card. */
-	function claimDueItem(now: Date): ItemRow | undefined {
+	function claimDueItem(now: Date, reviewsOnly = false): ItemRow | undefined {
 		if (!db) return undefined;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -2009,18 +2103,30 @@ export default function kaomojiEnglishTutorExtension(
 				return undefined;
 			}
 			// Review cards take priority over queued-new cards.
-			let due = db.prepare("SELECT * FROM items WHERE due_at <= ? AND shown = 1 ORDER BY due_at ASC, id ASC LIMIT 1")
+			let due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 				.get(now.toISOString()) as ItemRow | undefined;
 			let isReview = true;
+			if (!due && reviewsOnly) {
+				db.exec("ROLLBACK");
+				return undefined;
+			}
 			if (!due) {
-				// Enforce the planned first-display quota (0 = unlimited, for compatibility).
-				if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
-					db.exec("ROLLBACK");
-					return undefined;
-				}
-				due = db.prepare("SELECT * FROM items WHERE due_at <= ? AND shown = 0 ORDER BY due_at ASC, id ASC LIMIT 1")
+				// Replacement queued-new cards are quota-free and take priority over planned.
+				const replacement = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 					.get(now.toISOString()) as ItemRow | undefined;
-				isReview = false;
+				if (replacement) {
+					due = replacement;
+					isReview = false;
+				} else {
+					// Enforce the planned first-display quota (0 = unlimited, for compatibility).
+					if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
+						db.exec("ROLLBACK");
+						return undefined;
+					}
+					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind = 'planned' OR introduction_kind IS NULL) ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
+						.get(now.toISOString()) as ItemRow | undefined;
+					isReview = false;
+				}
 			}
 			if (!due) {
 				db.exec("ROLLBACK");
@@ -2028,8 +2134,9 @@ export default function kaomojiEnglishTutorExtension(
 			}
 			if (!isReview) {
 				markShown(db, due.id);
-				db.prepare("UPDATE items SET introduced_at = ?, introduction_kind = 'planned' WHERE id = ?")
+				db.prepare("UPDATE items SET introduced_at = ?, introduction_kind = COALESCE(introduction_kind, 'planned') WHERE id = ?")
 					.run(now.toISOString(), due.id);
+				bumpStat(db, "total_learned", 1);
 				touchStreak(db, now);
 			}
 			const direction: RecallDirection = due.type !== "sentence" && isReview && Math.random() >= 0.5 ? "reverse" : "forward";
@@ -2268,6 +2375,11 @@ export default function kaomojiEnglishTutorExtension(
 		let feedback = "";
 		if (!exact) {
 			const result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction);
+			if (attemptBase.sessionGeneration !== sessionGeneration) return true;
+			if (!result.available) {
+				ctx.ui.notify("暂时无法可靠判断这个答案；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
+				return true;
+			}
 			verdict = result.verdict;
 			feedback = result.feedback;
 		}
@@ -2465,6 +2577,20 @@ export default function kaomojiEnglishTutorExtension(
 
 		// Full rating: one-shot, atomic, applies at most once globally.
 		const next = scheduleNext(item.fsrs_state, now, rating);
+		if ("corrupt" in next) {
+			if (db) quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
+			if (!isCtxStale(ctx)) {
+				ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离，不会重复出现。原始数据已保留。`, "warning");
+				renderGlobalCard(ctx);
+			}
+			scheduleTimer(0);
+			return true;
+		}
 		let applied = false;
 		let hasImmediateNext = false;
 		try {
@@ -2593,6 +2719,17 @@ export default function kaomojiEnglishTutorExtension(
 		if (!item) return undefined;
 		const now = new Date();
 		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
+		if ("corrupt" in next) {
+			quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
+			pendingItemId = null;
+			pendingFlipped = false;
+			pendingIsReview = false;
+			pendingDirection = "forward";
+			pendingAssistance = "none";
+			ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离。`, "warning");
+			renderGlobalCard(ctx);
+			return undefined;
+		}
 		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
 		const due = next.due < minDue ? minDue : next.due;
 		let applied = false;
@@ -2686,19 +2823,20 @@ export default function kaomojiEnglishTutorExtension(
 		pendingLLMCall = true;
 		updateWidget(ctx, FACES.teach, ["正在补充同类型卡片，喵…"]);
 		try {
-			const resolved = resolveModel(ctx);
-			if (!resolved) throw new Error("NO_MODEL");
+			let effectiveResolved = resolveModel(ctx);
+			if (!effectiveResolved) throw new Error("NO_MODEL");
 			let decision: ReplacementDecision;
 			try {
-				decision = await generateReplacement(llm, ctx, resolved, conversation, replacementKnownList(db), config, skipped);
+				decision = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped);
 			} catch (err) {
-				if (!resolved.fromSession && ctx.model &&
-					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)) {
+				if (!effectiveResolved.fromSession && ctx.model &&
+					(ctx.model.provider !== effectiveResolved.provider || ctx.model.id !== effectiveResolved.model)) {
 					if (sessionGeneration !== generation || !db) return false;
+					effectiveResolved = { provider: ctx.model.provider, model: ctx.model.id, fromSession: true };
 					decision = await generateReplacement(
 						llm,
 						ctx,
-						{ provider: ctx.model.provider, model: ctx.model.id, fromSession: true },
+						effectiveResolved,
 						conversation,
 						replacementKnownList(db),
 						config,
@@ -2719,13 +2857,29 @@ export default function kaomojiEnglishTutorExtension(
 			}
 
 			const item = decision.item;
+			// Independent critic on replacement content (same fail-closed semantics as lessons).
+			const replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config);
+			if (sessionGeneration !== generation || !db) return false;
+			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
+			if (!replacementVerdict.pass) {
+				if (replacementVerdict.available) lastRejectedReplacementKey = rejectionKey;
+				updateWidget(ctx, FACES.idle, [
+					replacementVerdict.available ? "补充卡内容质量未达标，保留队列稍后再试…" : "补充卡审查暂时不可用，保留队列稍后重试…",
+					statsLine(db),
+				]);
+				if (config.verbose) ctx.ui.notify(`补充卡被审查拒绝：${replacementVerdict.summary}`, "info");
+				return false;
+			}
+
 			const now = new Date();
 			let inserted: ItemRow | undefined;
 			let duplicate = false;
 			db.exec("BEGIN IMMEDIATE");
 			try {
 				const state = getRuntimeState(db);
-				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== type) {
+				const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString());
+				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== type || dueReview) {
 					db.exec("ROLLBACK");
 					return false;
 				}
@@ -2740,12 +2894,13 @@ export default function kaomojiEnglishTutorExtension(
 						levels_cn: item.levels_cn,
 						chunks: item.chunks,
 						keyWords: item.keyWords,
+						introductionKind: "replacement",
 					});
-					insertCompanionWords(db, item.keyWords, now);
 					bumpStat(db, "total_learned", 1);
 					touchStreak(db, now);
 					if (!consumeReplacement(db, type)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
 					markShown(db, id);
+					db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(now.toISOString(), id);
 					setRuntimeState(db, {
 						active_item_id: id,
 						active_kind: "teach",
@@ -2805,8 +2960,14 @@ export default function kaomojiEnglishTutorExtension(
 			return;
 		}
 
-		// A skipped card reserves one same-type replacement (priority over
-		// surfacing when a session is actively generating it).
+		// Already-shown due reviews always win; never make them wait on replacement LLM work.
+		const dueReview = claimDueItem(now, true);
+		if (dueReview) {
+			if (!showItem(ctx, dueReview)) renderGlobalCard(ctx);
+			return;
+		}
+
+		// A skipped card reserves one same-type replacement after due reviews.
 		const replacementType = pendingReplacementTypes(db)[0];
 		let replacementWaiting = false;
 		if (replacementType) {
@@ -2839,8 +3000,8 @@ export default function kaomojiEnglishTutorExtension(
 		}
 		if (replacementWaiting) return;
 
-		// 2. Otherwise teach new items (LLM), up to the daily limit, single-owner.
-		if (countTodayNew(db, now) < config.dailyNewLimit) {
+		// 2. Otherwise teach new items (LLM), up to the daily limit (0 = unlimited), single-owner.
+		if (config.dailyNewLimit === 0 || countTodayNew(db, now) < config.dailyNewLimit) {
 			if (pendingLLMCall) {
 				// If a previous LLM call hung and never reached its finally, force-reset
 				// after a timeout so generation is not permanently blocked.
@@ -2864,9 +3025,11 @@ export default function kaomojiEnglishTutorExtension(
 	}
 
 	async function generateAndInsert(ctx: ExtensionContext, _now: Date) {
-		const conversation = manualTeachTopic || buildConversation(ctx.sessionManager.getBranch());
+		const conversationSnapshot = buildConversation(ctx.sessionManager.getBranch());
+		const conversation = manualTeachTopic || conversationSnapshot;
 		const isManual = manualTeachTopic !== "";
 		manualTeachTopic = "";
+		const conversationUnchanged = () => buildConversation(ctx.sessionManager.getBranch()) === conversationSnapshot;
 		if (!conversation.trim()) {
 			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 			logGenStatus("empty_conversation");
@@ -2887,30 +3050,29 @@ export default function kaomojiEnglishTutorExtension(
 		pendingLLMCallAt = Date.now();
 		if (db) updateWidget(ctx, FACES.teach, ["备课中，喵…"]);
 		try {
-			const resolved = resolveModel(ctx);
-			if (!resolved) throw new Error("NO_MODEL");
+			let effectiveResolved = resolveModel(ctx);
+			if (!effectiveResolved) throw new Error("NO_MODEL");
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(llm, ctx, resolved, conversation, db ? knownList(db) : [], config);
+				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
-				if (!resolved.fromSession && ctx.model &&
-					(ctx.model.provider !== resolved.provider || ctx.model.id !== resolved.model)) {
-					const fallback: ResolvedModel = {
+				if (!effectiveResolved.fromSession && ctx.model &&
+					(ctx.model.provider !== effectiveResolved.provider || ctx.model.id !== effectiveResolved.model)) {
+					effectiveResolved = {
 						provider: ctx.model.provider,
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(llm, ctx, fallback, conversation, db ? knownList(db) : [], config);
+					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config);
 					if (sessionGeneration !== generation) return;
-					resolvedModelName = `${fallback.provider}/${fallback.model}（当前会话·降级）`;
+					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
 				} else {
 					throw err;
 				}
 			}
-			if (sessionGeneration !== generation || !db ||
-				buildConversation(ctx.sessionManager.getBranch()) !== conversation) return;
+			if (sessionGeneration !== generation || !db || !conversationUnchanged()) return;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return;
 			if (!decision.ready) {
 				lastRejectedConversation = conversation;
@@ -2923,28 +3085,32 @@ export default function kaomojiEnglishTutorExtension(
 
 			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			let verdict = await critiqueLesson(llm, ctx, resolved, lesson, db ? knownList(db) : [], config);
+			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
-			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && !verdict.pass; attempt++) {
-				const revised = await generateLesson(llm, ctx, resolved, conversation, db ? knownList(db) : [], config, verdict.issues);
+			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
 				lesson = revised;
-				verdict = await critiqueLesson(llm, ctx, resolved, lesson, db ? knownList(db) : [], config);
+				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			}
 			if (!verdict.pass) {
-				lastRejectedConversation = conversation;
-				updateWidget(ctx, FACES.idle, ["内容质量未达标，稍后再试…", statsLine(db)]);
-				logGenStatus(`critic_rejected: ${verdict.summary || ""}`);
+				if (verdict.available) lastRejectedConversation = conversation;
+				updateWidget(ctx, FACES.idle, [
+					verdict.available ? "内容质量未达标，稍后再试…" : "内容审查暂时不可用，稍后重试…",
+					statsLine(db),
+				]);
+				logGenStatus(`${verdict.available ? "critic_rejected" : "critic_unavailable"}: ${verdict.summary || ""}`);
 				deferPacing();
 				if (config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
 				return;
 			}
+			if (!conversationUnchanged()) return;
 			const insertedAt = new Date();
 			let insertedFirst: ItemRow | undefined;
 			db.exec("BEGIN IMMEDIATE");
@@ -2952,7 +3118,7 @@ export default function kaomojiEnglishTutorExtension(
 				const state = getRuntimeState(db);
 				if (!ownsGeneration(state, generationToken, insertedAt) ||
 					state.active_item_id != null ||
-					countTodayNew(db, insertedAt) >= config.dailyNewLimit ||
+					(config.dailyNewLimit > 0 && countTodayNew(db, insertedAt) >= config.dailyNewLimit) ||
 					pendingReplacementTypes(db).length > 0 ||
 					getDueItem(db, insertedAt)) {
 					db.exec("ROLLBACK");
@@ -2975,12 +3141,12 @@ export default function kaomojiEnglishTutorExtension(
 						keyWords: it.keyWords,
 					});
 					firstId ??= id;
-					insertCompanionWords(db, it.keyWords, insertedAt);
 				}
 				if (firstId == null) throw new Error("LESSON_INSERT_FAILED");
-				bumpStat(db, "total_learned", lesson.items.length);
+				bumpStat(db, "total_learned", 1);
 				touchStreak(db, insertedAt);
 				markShown(db, firstId);
+				db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(insertedAt.toISOString(), firstId);
 				setRuntimeState(db, {
 					active_item_id: firstId,
 					active_kind: "teach",
@@ -3015,7 +3181,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (sessionGeneration !== generation) return;
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
-				if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`]);
+				if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
 				logGenStatus(`error: ${lastError}`);
 				deferPacing();
 		} finally {
@@ -3039,6 +3205,13 @@ export default function kaomojiEnglishTutorExtension(
 		}
 		if (!skipped || !db) {
 			ctx.ui.notify("当前没有可跳过的卡片", "info");
+			return;
+		}
+		// A due review must never wait for replacement generation.
+		resetPacing(db);
+		const dueReview = claimDueItem(new Date(), true);
+		if (dueReview) {
+			if (!showItem(ctx, dueReview)) renderGlobalCard(ctx);
 			return;
 		}
 		const nextType = pendingReplacementTypes(db)[0];
