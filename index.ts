@@ -628,6 +628,8 @@ const GENERATION_LEASE_MS = 5 * 60_000;
 const SYNC_POLL_MS = 1000;
 /** Grace window a session has to own an in-flight replacement generation. */
 const REPLACEMENT_GRACE_MS = 8000;
+/** Keep corrective feedback readable before automatically surfacing the next card. */
+const AGAIN_FEEDBACK_GRACE_MS = 15_000;
 
 type RecallDirection = "forward" | "reverse";
 type AssistanceLevel = "none" | "hint" | "revealed";
@@ -2344,6 +2346,10 @@ export default function kaomojiEnglishTutorExtension(
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
 		if (item.type === "sentence") return answerSentencePending(ctx, item, rawText, state);
+		if (state.active_kind !== "review") {
+			ctx.ui.notify("这是首次展示的新卡，请先用 /kaomoji:flip 翻面查看释义，再选择 /kaomoji:good 或 /kaomoji:skip", "info");
+			return true;
+		}
 		const text = rawText.trim();
 		if (!text) {
 			const promptText = pendingDirection === "reverse"
@@ -2653,7 +2659,7 @@ export default function kaomojiEnglishTutorExtension(
 				touchStreak(db, now);
 				hasImmediateNext = hasReadyQueuedCard(now);
 				const nextCheck = hasImmediateNext
-					? now.toISOString()
+					? new Date(now.getTime() + (rating === Rating.Again ? AGAIN_FEEDBACK_GRACE_MS : 0)).toISOString()
 					: new Date(now.getTime() + intervalMs()).toISOString();
 				setRuntimeState(db, {
 					active_item_id: null,

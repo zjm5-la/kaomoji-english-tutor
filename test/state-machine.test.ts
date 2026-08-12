@@ -182,6 +182,39 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 	}
 });
 
+test("answer on a newly taught word does not grade the visible English prompt", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-new-word-answer" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ verdict: "incorrect", feedback: "Expected the English word." })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "new-word-answer" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','condition','（判断）条件',?,?)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /单词：condition/, "new-card face already shows the English word");
+		await harness.commands["kaomoji:answer"].handler("条件", harness.ctx);
+		assert.ok(harness.notifications().some((message) => /新卡.*翻面/.test(message)), "answer explains the new-card interaction");
+		const check = openTestDb();
+		const item = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
+		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=1").get() as any).n);
+		const state = check.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual({ ...item }, { reviews: 0, fsrs_state: "" });
+		assert.equal(attempts, 0, "new-card answer creates no authoritative attempt");
+		assert.deepEqual({ ...state }, { active_item_id: 1, active_kind: "teach" }, "new card stays active");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("progressive sentence requires written output and touches FSRS only after L3", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
@@ -2061,7 +2094,28 @@ test("a sentence hint invalidates an in-flight clean evaluation", { concurrency:
 	}
 });
 
-test("Anki-style: rating immediately surfaces the next due card", { concurrency: false }, async () => {
+test("wrong-answer teaching remains visible before the next due card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "again-feedback" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','alpha','阿尔法',?,?,1)").run(now, new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /没关系，待会儿再考你一次/, "Again feedback is rendered");
+		assert.equal(fake.active().length, 1);
+		assert.ok(fake.active()[0].delay >= 14_900 && fake.active()[0].delay <= 15_000, "feedback gets a readable grace period");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("Anki-style: correct rating immediately surfaces the next due card", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
@@ -2073,7 +2127,7 @@ test("Anki-style: rating immediately surfaces the next due card", { concurrency:
 		db.close();
 		await fake.fire(); // surface first due card
 		assert.match(a.widget().join(" "), /阿尔法|贝塔/, "first card shown");
-		await a.commands["kaomoji:good"].handler("", a.ctx); // rate -> scheduleTimer(0)
+		await a.commands["kaomoji:good"].handler("", a.ctx); // correct rating -> scheduleTimer(0)
 		assert.equal(fake.active().length, 1);
 		assert.equal(fake.active()[0].delay, 0, "command handler must not overwrite the immediate timer");
 		await fake.fire(); // immediate next-card tick
