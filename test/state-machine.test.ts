@@ -1025,8 +1025,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const runtimeCols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 6, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6]);
+			assert.deepEqual({ ...meta }, { schema_version: 7, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -1074,11 +1074,51 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 6);
+		assert.equal(meta.schema_version, 7);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
 		assert.deepEqual({ ...card }, { text: "preserved", meaning: "保留" });
+		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("v7 restores fractional elapsed_days false-positive quarantines without losing history", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const first = await createHarness({ sessionId: "migration-v7-source" });
+		await first.handlers.session_shutdown({ reason: "quit" }, first.ctx);
+		let db = openTestDb();
+		const state = JSON.stringify({
+			due: "2026-08-12T00:52:51.430Z",
+			stability: 1.1801865605280295,
+			difficulty: 6.632799999999999,
+			elapsed_days: 2.4368512962962963,
+			scheduled_days: 0,
+			reps: 5,
+			lapses: 1,
+			state: 3,
+			last_review: "2026-08-12T00:47:51.430Z",
+		});
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state,fsrs_status,fsrs_error,fsrs_corrupt_at) VALUES('sentence','preserved state','保留状态',?,?,1,5,?,'corrupt','invalid_field:elapsed_days',?)")
+			.run(new Date().toISOString(), "2026-08-12T03:02:04.451Z", state, new Date().toISOString());
+		db.prepare("INSERT INTO fsrs_corruptions(item_id,raw_fsrs_state,error_code,detected_at,resolution) VALUES(1,?,'invalid_field:elapsed_days',?,NULL)")
+			.run(state, new Date().toISOString());
+		db.prepare("DELETE FROM schema_migrations WHERE version=7").run();
+		db.prepare("UPDATE schema_meta SET schema_version=6 WHERE id=1").run();
+		db.close();
+
+		const upgraded = await makeSession({ sessionId: "migration-v7-target" });
+		db = openTestDb();
+		const item = db.prepare("SELECT reviews,fsrs_state,fsrs_status,fsrs_error,fsrs_corrupt_at FROM items WHERE id=1").get() as any;
+		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
+		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
+		db.close();
+		assert.equal(meta.schema_version, 7);
+		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
+		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
@@ -1647,7 +1687,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 6, "schema migrated to v6");
+	assert.equal(meta.schema_version, 7, "schema migrated to v7");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -2161,6 +2201,43 @@ test("lesson items leave introduced_at NULL until first display", { concurrency:
 		assert.equal(items[2].introduced_at, null, "third item not yet displayed");
 	} finally {
 		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("fractional elapsed_days produced by fsrs.js remains schedulable", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ sessionId: "fractional-elapsed-days" });
+		const db = openTestDb();
+		const lastReview = new Date(Date.now() - 2.5 * 24 * 60 * 60 * 1000).toISOString();
+		const state = JSON.stringify({
+			due: new Date(0).toISOString(),
+			stability: 1.18,
+			difficulty: 6.63,
+			elapsed_days: 2.5,
+			scheduled_days: 1,
+			reps: 5,
+			lapses: 1,
+			state: 3,
+			last_review: lastReview,
+		});
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word','valid','有效',?,?,1,5,?)")
+			.run(lastReview, new Date(0).toISOString(), state);
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1 WHERE id=1").run();
+		db.close();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		const check = openTestDb();
+		const item = check.prepare("SELECT reviews,fsrs_status,fsrs_error FROM items WHERE id=1").get() as any;
+		const corruptions = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
+		check.close();
+		assert.equal(item.reviews, 6, "valid FSRS state advances normally");
+		assert.equal(item.fsrs_status, "ok");
+		assert.equal(item.fsrs_error, null);
+		assert.equal(corruptions, 0);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
 		fake.restore();
 	}
 });

@@ -134,7 +134,7 @@ function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 6;
+const SCHEMA_TARGET_VERSION = 7;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -321,6 +321,22 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	(db: DatabaseSync) => {
 		db.exec("CREATE INDEX IF NOT EXISTS items_due_shown_idx ON items(due_at, shown, id) WHERE content_status = 'approved'");
 		db.exec("CREATE INDEX IF NOT EXISTS items_introduction_idx ON items(introduction_kind, introduced_at) WHERE introduction_kind = 'planned'");
+	},
+	// v7: restore states falsely quarantined because fsrs.js emits fractional elapsed_days.
+	(db: DatabaseSync) => {
+		const rows = db.prepare(
+			"SELECT c.id AS corruption_id, c.item_id, c.raw_fsrs_state FROM fsrs_corruptions c JOIN items i ON i.id = c.item_id WHERE c.resolution IS NULL AND c.error_code = 'invalid_field:elapsed_days' AND i.fsrs_status = 'corrupt' AND i.fsrs_state = c.raw_fsrs_state",
+		).all() as { corruption_id: number; item_id: number; raw_fsrs_state: string }[];
+		for (const row of rows) {
+			if ("corrupt" in restoreCard(row.raw_fsrs_state)) continue;
+			const restored = db.prepare(
+				"UPDATE items SET fsrs_status = 'ok', fsrs_error = NULL, fsrs_corrupt_at = NULL WHERE id = ? AND fsrs_status = 'corrupt' AND fsrs_state = ?",
+			).run(row.item_id, row.raw_fsrs_state);
+			if (Number(restored.changes) > 0) {
+				db.prepare("UPDATE fsrs_corruptions SET resolution = 'restored:v7_fractional_elapsed_days_false_positive' WHERE id = ?")
+					.run(row.corruption_id);
+			}
+		}
 	},
 ];
 
@@ -828,7 +844,8 @@ function restoreCard(stateJson: string): { card: Card } | { corrupt: true; error
 	if (![State.New, State.Learning, State.Review, State.Relearning].includes(parsed.state)) {
 		return { corrupt: true, error: "invalid_field:state" };
 	}
-	for (const [name, value] of [["elapsed_days", parsed.elapsed_days], ["scheduled_days", parsed.scheduled_days], ["reps", parsed.reps], ["lapses", parsed.lapses]] as const) {
+	if (parsed.elapsed_days < 0) return { corrupt: true, error: "invalid_field:elapsed_days" };
+	for (const [name, value] of [["scheduled_days", parsed.scheduled_days], ["reps", parsed.reps], ["lapses", parsed.lapses]] as const) {
 		if (!Number.isInteger(value) || value < 0) return { corrupt: true, error: `invalid_field:${name}` };
 	}
 	if (parsed.stability < 0 || parsed.difficulty < 0 || parsed.difficulty > 10) {
