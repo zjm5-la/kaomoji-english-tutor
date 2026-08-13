@@ -19,6 +19,7 @@
 
 - **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句。新卡只在首次真正展示时消耗每日额度；Skip 补卡严格一换一、额度外，并让位于已到期复习
+- **适应难度**：从近 60 天答题记录确定性聚合学习者画像（句法/词汇档位、首轮通过率、辅助依赖、薄弱点），推导客观难度预算（句长区间、句法复杂度、词汇层次、生词上限、爬坡方向）。备课与独立 critic 都接入同一预算；句长/生词数超出预算会被审查客观打回。冷启动先验为 B1（即原行为）
 - **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具。生成内容和补卡只有通过独立 critic 才会写入
 - **渐进句子输出**：同一张句子卡从 L1 单词填空 → L2 主干英文 → L3 完整自然表达；每级都用 `/kaomoji:answer` 真正输入英文，标准句只是参考，不要求逐字复刻
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；单词/词组答对自动 Good、答错或部分正确自动 Again，模型暂时无法可靠判断时不记录成绩。句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again；损坏的 FSRS 数据会保留原文并隔离，不会静默重置
@@ -54,7 +55,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:flip` | 在问题面和答案面之间切换 |
 | `/kaomoji:answer <答案>` | 单词/词组双向回忆，或提交句子渐进输出；系统本地匹配或调用 SDK LLM 判定 |
 | `/kaomoji:hint` | 显示当前单词/词组回忆提示，或句子当前级别的英文首字提示 |
-| `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率 |
+| `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率，以及学习者画像（档位/置信度/首轮通过率/辅助/薄弱点）与当前难度预算 |
 | `/kaomoji:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
 | `/kaomoji:good` | 手动评分为记得；句子卡不能跳过真实输出 |
 | `/kaomoji:again` | 手动评分为忘了；句子在任意级别都可结束本轮并从 L1 重新调度 |
@@ -144,7 +145,7 @@ Or add to `settings.json`:
 | `/kaomoji:flip` | Toggle question and answer sides |
 | `/kaomoji:answer <answer>` | Submit bidirectional word/phrase recall or progressive written sentence output; checked locally or by the SDK evaluator |
 | `/kaomoji:hint` | Show the current word/phrase recall hint or the sentence level's initial-letter hint |
-| `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, and answer accuracy |
+| `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, answer accuracy, plus the learner profile (bands/confidence/first-pass rates/assistance/error focus) and current difficulty budget |
 | `/kaomoji:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
 | `/kaomoji:good` | Manually rate remembered; cannot bypass required sentence output |
 | `/kaomoji:again` | Manually rate forgotten; from any sentence level, end the cycle and schedule the next attempt from L1 |

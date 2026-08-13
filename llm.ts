@@ -3,6 +3,7 @@ import type { PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import type { ItemRow } from "./db.ts";
 import type { SentenceExerciseView } from "./render.ts";
+import { coldStartProfile, deriveBudget, formatAdaptiveBlock, type AdaptiveContext } from "./learner-profile.ts";
 
 // -- LLM lesson generation ------------------------------------------------
 
@@ -78,12 +79,12 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 	return item;
 }
 
-function validSentenceTraining(item: GeneratedItem): boolean {
+function validSentenceTraining(item: GeneratedItem, minWords = 15): boolean {
 	if (item.type !== "sentence" || !item.levels || !item.levels_cn || !item.chunks || !item.keyWords) return false;
 	const fullWords = item.text.trim().split(/\s+/).length;
 	const middleWords = item.levels[1]?.trim().split(/\s+/).length ?? 0;
 	return (
-		fullWords >= 15 &&
+		fullWords >= minWords &&
 		item.levels.length === 3 &&
 		new Set(item.levels.map((level) => level.trim())).size === 3 &&
 		item.levels_cn.length === 3 &&
@@ -131,7 +132,10 @@ export async function generateLesson(
 	known: string[],
 	config: PetConfig,
 	feedback?: CritiqueIssue[],
+	adaptive?: AdaptiveContext,
 ): Promise<LessonDecision> {
+	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const budget = ctxAdaptive.budget;
 	const prompt = [
 		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
 		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
@@ -139,17 +143,17 @@ export async function generateLesson(
 		"",
 		"备课条件：",
 		"- 只要会话中出现过真实、常用的英语表达（单词、词组、完整句子），就可以备课",
-		"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得中级学习者掌握的英语",
+		"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得当前学习者掌握的英语",
 		"- 只有纯寒暄、单字命令、无意义占位或环境通知才返回 ready=false",
 		"- 有英语内容就倾向 ready=true，不要因为话题不够像传统英语课而拒绝",
 		"",
 		"学习项要求：",
-		"- 内容要真实常用，宁简单不冷僻，适合中级学习者",
+		"- 内容要真实常用，贴近主题的实际使用场景，难度须贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
 		"- 教学项必须关联：word 的 text 必须自然出现在 sentence 的 text 中；phrase 尽量出现在 sentence 中，形成一个统一的教学单元",
-		"- sentence 的 text 必须是真正的长句：至少 15 个单词，包含从句或插入成分；禁止用简单句或短句充数",
-		"- 长句结构要多样化：定语从句、状语从句、宾语从句、插入语、分词短语、同位语等轮换使用，避免总是使用 which 定语从句",
-		"- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（2-3 个生词）",
+		`- sentence 的 text 词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构严格遵循预算的句法约束（见下方 difficulty_budget）`,
+		"- 句子必须是真实、有意义、贴合主题的渐进长句；不得为凑词数或结构堆砌空洞、重复或无意义的内容",
+		`- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（生词，数量不超过 ${budget.maxKeyWords} 个）`,
 		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
 		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
 		"- 只输出 JSON，不要任何其他文字：",
@@ -159,6 +163,8 @@ export async function generateLesson(
 			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
 				...feedback.map((i) => `- [${i.severity}] ${i.category}: ${i.description}`)]
 			: []),
+		"",
+		formatAdaptiveBlock(ctxAdaptive.profile, budget),
 		"",
 		"<conversation>",
 		conversation,
@@ -198,13 +204,14 @@ export async function generateLesson(
 
 	// Sentence cards need levels/chunks/keyWords for progressive training.
 	// Models sometimes omit them — backfill with a dedicated follow-up call.
+	const minWords = budget.wordRange[0];
 	for (const it of items) {
-		if (it.type === "sentence" && !validSentenceTraining(it)) {
-			await completeSentenceData(llm, ctx, resolved, config, it);
+		if (it.type === "sentence" && !validSentenceTraining(it, minWords)) {
+			await completeSentenceData(llm, ctx, resolved, config, it, budget.maxKeyWords);
 		}
 	}
 	const sentence = items.find((item) => item.type === "sentence")!;
-	if (!validSentenceTraining(sentence)) throw new Error("INVALID_SENTENCE_TRAINING");
+	if (!validSentenceTraining(sentence, minWords)) throw new Error("INVALID_SENTENCE_TRAINING");
 
 	return { ready: true, topic: String(parsed.topic ?? ""), items };
 }
@@ -233,23 +240,61 @@ export async function critiqueLesson(
 	lesson: { topic: string; items: GeneratedItem[] },
 	known: string[],
 	config: PetConfig,
+	adaptive?: AdaptiveContext,
 ): Promise<CritiqueVerdict> {
 	const failClosed = (summary: string): CritiqueVerdict => ({ available: false, pass: false, issues: [], summary });
+	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const budget = ctxAdaptive.budget;
+
+	// Deterministic objective gate: sentence word count and keyWords must respect
+	// the budget. This fails before any LLM call so an out-of-budget sentence can
+	// never be approved, regardless of the model critic's verdict.
+	const budgetBlockers: CritiqueIssue[] = [];
+	for (const item of lesson.items) {
+		if (item.type !== "sentence") continue;
+		const words = item.text.trim().split(/\s+/).filter(Boolean).length;
+		const [minWords, maxWords] = budget.wordRange;
+		if (words < minWords || words > maxWords) {
+			budgetBlockers.push({
+				severity: "blocker",
+				category: "budget",
+				description: `句子词数 ${words} 不在预算区间 [${minWords}, ${maxWords}] 内`,
+			});
+		}
+		if (item.keyWords && item.keyWords.length > budget.maxKeyWords) {
+			budgetBlockers.push({
+				severity: "blocker",
+				category: "budget",
+				description: `生词数 ${item.keyWords.length} 超过预算上限 ${budget.maxKeyWords}`,
+			});
+		}
+	}
+	if (budgetBlockers.length) {
+		return {
+			available: true,
+			pass: false,
+			issues: budgetBlockers,
+			summary: "内容超出难度预算（客观检查失败）",
+		};
+	}
+
 	// Pass the complete bounded lesson structure (not just an outline) so the critic
 	// can judge examples, levels, chunks, and keywords.
 	const lessonJson = JSON.stringify(lesson);
 
 	const prompt = [
-		"你是「英语小宠物」的内容审查员。审查下面备课是否适合中级学习者，只输出 JSON。",
-		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression","description":"..."}], "summary":"一句话"}',
+		"你是「英语小宠物」的内容审查员。审查下面备课是否适合当前学习者水平，只输出 JSON。",
+		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
 		"- 中文释义准确，不得机翻味",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
-		"- 长句至少 15 词、含从句；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致",
+		`- 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}、生词≤${budget.maxKeyWords}、句法结构遵循 difficulty_budget）；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致`,
 		"- 单词必须自然出现在句子中",
 		"- 不得为凑结构硬造不自然句子",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
+		"",
+		formatAdaptiveBlock(ctxAdaptive.profile, budget),
 		"",
 		`<lesson>${lessonJson}</lesson>`,
 	].join("\n");
@@ -428,7 +473,10 @@ export async function generateReplacement(
 	known: string[],
 	config: PetConfig,
 	skipped: ItemRow,
+	adaptive?: AdaptiveContext,
 ): Promise<ReplacementDecision> {
+	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const budget = ctxAdaptive.budget;
 	const itemSchema = skipped.type === "sentence"
 		? '{"type":"sentence","text":"完整长句","meaning":"中文翻译","levels":["L1主干","L2扩展","与text相同的L3"],"levels_cn":["L1翻译","L2翻译","L3翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"释义"}]}'
 		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
@@ -439,9 +487,11 @@ export async function generateReplacement(
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
 		skipped.type === "sentence"
-			? "句子必须至少 15 个单词；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文。"
-			: "内容要真实常用，贴近当前会话主题，适合中级学习者。",
+			? `句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，遵循预算的句法约束；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文；生词不超过 ${budget.maxKeyWords} 个。`
+			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
+		"",
+		formatAdaptiveBlock(ctxAdaptive.profile, budget),
 		"",
 		"<conversation>",
 		conversation,
@@ -467,10 +517,11 @@ export async function generateReplacement(
 	if (parsed.ready !== true) throw new Error("INVALID_READY");
 	const item = parseGeneratedItem(parsed.item, skipped.type);
 	if (!item) throw new Error("EMPTY_REPLACEMENT");
-	if (item.type === "sentence" && !validSentenceTraining(item)) {
-		await completeSentenceData(llm, ctx, resolved, config, item);
+	const minWords = budget.wordRange[0];
+	if (item.type === "sentence" && !validSentenceTraining(item, minWords)) {
+		await completeSentenceData(llm, ctx, resolved, config, item, budget.maxKeyWords);
 	}
-	if (item.type === "sentence" && !validSentenceTraining(item)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
+	if (item.type === "sentence" && !validSentenceTraining(item, minWords)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
 	return { ready: true, item };
 }
 
@@ -481,11 +532,12 @@ async function completeSentenceData(
 	resolved: ResolvedModel,
 	config: PetConfig,
 	item: GeneratedItem,
+	maxKeyWords = 3,
 ) {
 	const prompt = [
 		"为下面的英文句子生成长句训练数据，只输出 JSON：",
 		'{"levels":["主干短句（去掉所有修饰成分，同一语义）","主干+一个修饰成分","与原文完全相同的完整长句"],"levels_cn":["主干短句的中文翻译","加一个成分后的中文翻译","完整长句的中文翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}',
-		"要求：levels 最后一级必须与原文完全相同；三个级别互不相同，每级只增加一个主要意群，L2 词数约为 L3 的 50%-75%；levels_cn 与 levels 一一对应，使用自然地道的中文；chunks 是原文的意群切分（3-5 个）；keyWords 是句中 2-3 个可能生僻的词（含音标和中文释义）。",
+		`要求：levels 最后一级必须与原文完全相同；三个级别互不相同，每级只增加一个主要意群，L2 词数约为 L3 的 50%-75%；levels_cn 与 levels 一一对应，使用自然地道的中文；chunks 是原文的意群切分（3-5 个）；keyWords 是句中可能生僻的词（含音标和中文释义），最多 ${maxKeyWords} 个。`,
 		"",
 		"<sentence>",
 		item.text,
@@ -523,5 +575,5 @@ async function completeSentenceData(
 	}
 	if (levelsCn?.length === 3) item.levels_cn = levelsCn;
 	if (chunks) item.chunks = chunks;
-	if (keyWords) item.keyWords = keyWords;
+	if (keyWords) item.keyWords = keyWords.slice(0, maxKeyWords);
 }

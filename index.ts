@@ -15,6 +15,7 @@ import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, renderCard, sentenceExercise, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
+import { computeLearnerProfile, deriveBudget, formatProfileStatsLine, type AdaptiveContext } from "./learner-profile.ts";
 
 export { contentFingerprint };
 
@@ -1017,7 +1018,7 @@ export default function kaomojiEnglishTutorExtension(
 					).run(now.toISOString(), cur.active_review_cycle_id);
 					if (Number(linked.changes) === 0) {
 						db.prepare(
-							"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, assistance_level, status, explicit_rating, started_at, completed_at, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sentence_self_report', ?, 'self_report', 'again', ?, ?, ?)",
+							"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, assistance_level, status, explicit_rating, started_at, completed_at, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sentence_self_report', 'forward', ?, 'self_report', 'again', ?, ?, ?)",
 						).run(
 							randomUUID(), item.id, cur.active_exercise_id, cur.active_review_cycle_id,
 							"sentence_self_report:" + cur.active_review_cycle_id + ":" + expectedVersion,
@@ -1203,6 +1204,14 @@ export default function kaomojiEnglishTutorExtension(
 		const generationToken = claimGeneration();
 		if (!generationToken) return false;
 
+		// One profile+budget snapshot per generation, after the generation claim and
+		// before any LLM await; the same snapshot feeds the generator, fallback,
+		// and critic so adaptive decisions stay consistent within this attempt.
+		const adaptive: AdaptiveContext = (() => {
+			const profile = computeLearnerProfile(db, new Date());
+			return { profile, budget: deriveBudget(profile) };
+		})();
+
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
 		pendingLLMCallAt = Date.now();
@@ -1212,7 +1221,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (!effectiveResolved) throw new Error("NO_MODEL");
 			let decision: ReplacementDecision;
 			try {
-				decision = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped);
+				decision = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped, adaptive);
 			} catch (err) {
 				if (!effectiveResolved.fromSession && ctx.model &&
 					(ctx.model.provider !== effectiveResolved.provider || ctx.model.id !== effectiveResolved.model)) {
@@ -1226,6 +1235,7 @@ export default function kaomojiEnglishTutorExtension(
 						replacementKnownList(db),
 						config,
 						skipped,
+						adaptive,
 					);
 				} else {
 					throw err;
@@ -1243,7 +1253,7 @@ export default function kaomojiEnglishTutorExtension(
 
 			const item = decision.item;
 			// Independent critic on replacement content (same fail-closed semantics as lessons).
-			const replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config);
+			const replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive);
 			if (sessionGeneration !== generation || !db) return false;
 			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
@@ -1427,6 +1437,14 @@ export default function kaomojiEnglishTutorExtension(
 		const generationToken = claimGeneration();
 		if (!generationToken) { logGenStatus("no_gen_token"); return; }
 
+		// One profile+budget snapshot per generation, after the generation claim and
+		// before any LLM await; the same snapshot feeds the initial generator,
+		// fallback, revisions, and critic so adaptive decisions stay consistent.
+		const adaptive: AdaptiveContext | null = db ? (() => {
+			const profile = computeLearnerProfile(db, new Date());
+			return { profile, budget: deriveBudget(profile) };
+		})() : null;
+
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
 		pendingLLMCallAt = Date.now();
@@ -1437,7 +1455,7 @@ export default function kaomojiEnglishTutorExtension(
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config);
+				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
 				if (!effectiveResolved.fromSession && ctx.model &&
@@ -1447,7 +1465,7 @@ export default function kaomojiEnglishTutorExtension(
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config);
+					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined);
 					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
 				} else {
@@ -1467,17 +1485,17 @@ export default function kaomojiEnglishTutorExtension(
 
 			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config);
+			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
 			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
-				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues);
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
 				lesson = revised;
-				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config);
+				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			}
@@ -1840,6 +1858,8 @@ export default function kaomojiEnglishTutorExtension(
 			const rate = attempts > 0 ? Math.round((correct / attempts) * 100) : 0;
 			const stageLine = stages.length ? stages.map((s) => `${s.stage}:${s.n}`).join(" · ") : "暂无";
 			ctx.ui.notify(`掌握阶段：${stageLine}；需强化：${reinforce}；答题 ${attempts} 次，正确率 ${rate}%`, "info");
+			const profile = computeLearnerProfile(db, new Date());
+			ctx.ui.notify(formatProfileStatsLine(profile, deriveBudget(profile)), "info");
 		},
 	});
 

@@ -809,6 +809,26 @@ function lessonResponse(topic = "concurrency") {
 	});
 }
 
+/** A lesson whose 20-word sentence is out of the cold-start B1 budget [12,18] (too long). */
+function longLessonResponse(topic = "out-of-budget") {
+	const sentence = "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.";
+	return JSON.stringify({
+		ready: true,
+		topic,
+		items: [
+			{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化", example: "We persist the data.", example_cn: "我们持久化数据。" },
+			{ type: "phrase", text: "difficulty budget", phonetic: "", meaning: "难度预算", example: "The budget guides the lesson.", example_cn: "预算指导备课。" },
+			{
+				type: "sentence", text: sentence, phonetic: "", meaning: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。", example: "", example_cn: "",
+				levels: ["The profile recomputes a fresh budget each time.", "The profile recomputes a fresh difficulty budget each time it stores an attempt.", sentence],
+				levels_cn: ["画像每次重算一个新预算。", "画像每次保存答题后重算一个新难度预算。", "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。"],
+				chunks: ["Because the system stores every learner attempt", "with its direction", "the profile recomputes a fresh difficulty budget each time now"],
+				keyWords: [{ text: "recompute", phonetic: "/ˌriːkəmˈpjuːt/", meaning: "重算" }, { text: "budget", phonetic: "/ˈbʌdʒɪt/", meaning: "预算" }],
+			},
+		],
+	});
+}
+
 function fauxModelRegistry(registration: ReturnType<typeof registerFauxProvider>) {
 	const model = registration.getModel();
 	return {
@@ -1096,10 +1116,11 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const tableNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
 			const itemCols = (db.prepare("PRAGMA table_info(items)").all() as any[]).map((r) => r.name);
 			const runtimeCols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((r) => r.name);
+			const attemptCols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 7, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7]);
+			assert.deepEqual({ ...meta }, { schema_version: 8, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -1109,6 +1130,7 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			for (const c of ["active_direction", "active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 				assert.ok(runtimeCols.includes(c), `runtime_state.${c} exists`);
 			}
+			assert.ok(attemptCols.includes("direction"), "attempts.direction exists");
 			assert.ok(idxNames.includes("items_content_fingerprint_uq"), "fingerprint unique index exists");
 		};
 		checkSchema();
@@ -1147,7 +1169,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 7);
+		assert.equal(meta.schema_version, 8);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -1189,9 +1211,39 @@ test("v7 restores fractional elapsed_days false-positive quarantines without los
 		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 7);
+		assert.equal(meta.schema_version, 8);
 		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
 		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
+		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("v8 upgrades an existing v7 database and preserves directionless attempts", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const first = await createHarness({ sessionId: "migration-v8-source" });
+		await first.handlers.session_shutdown({ reason: "quit" }, first.ctx);
+		let db = openTestDb();
+		insertDueWord(db, "preserved", "保留");
+		db.exec("ALTER TABLE attempts DROP COLUMN direction");
+		db.prepare(
+			"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, assistance_level, status, verdict, explicit_rating, started_at, completed_at, rated_at) VALUES ('legacy-attempt', 1, NULL, 'legacy-cycle', 'legacy-claim', 1, 1, 'recall', 'none', 'evaluated', 'correct', 'good', ?, ?, ?)",
+		).run(new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
+		db.prepare("DELETE FROM schema_migrations WHERE version = 8").run();
+		db.prepare("UPDATE schema_meta SET schema_version = 7 WHERE id = 1").run();
+		db.close();
+
+		const upgraded = await makeSession({ sessionId: "migration-v8-target" });
+		db = openTestDb();
+		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
+		const cols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((row) => row.name);
+		const attempt = db.prepare("SELECT verdict, direction FROM attempts WHERE id = 'legacy-attempt'").get() as any;
+		db.close();
+		assert.equal(meta.schema_version, 8);
+		assert.ok(cols.includes("direction"), "direction migrated");
+		assert.deepEqual({ ...attempt }, { verdict: "correct", direction: null });
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
@@ -1473,6 +1525,41 @@ test("quality gate rejects lessons the critic flags and commits nothing", { conc
 	}
 });
 
+test("deterministic budget gate rejects an out-of-budget generated lesson with zero writes", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-budget-gate" });
+	try {
+		// Cold-start DB -> B1 budget [12,18]. Each generated lesson has a 20-word
+		// sentence (too long): validSentenceTraining passes (>=12), but the
+		// deterministic critic gate rejects it before any LLM critic call.
+		registration.setResponses([
+			fauxAssistantMessage(longLessonResponse("too-long-1")),
+			fauxAssistantMessage(longLessonResponse("too-long-2")),
+			fauxAssistantMessage(longLessonResponse("too-long-3")),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "budget-gate" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const state = db.prepare("SELECT active_item_id, generation_token FROM runtime_state WHERE id=1").get() as any;
+		const status = String((db.prepare("SELECT value FROM stats WHERE key='last_gen_status'").get() as any).value);
+		db.close();
+		assert.equal(count, 0, "out-of-budget lesson writes nothing");
+		assert.equal(state.active_item_id, null, "no active card after deterministic rejection");
+		assert.equal(state.generation_token, null, "generation lease released");
+		assert.match(status, /critic_rejected/, "deterministic gate reject recorded as critic_rejected");
+		// Only the 3 generation calls ran; the LLM critic was never consulted because
+		// the deterministic gate short-circuited every critiqueLesson.
+		assert.equal(registration.state.callCount, 3, "no LLM critic call for the deterministic gate");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("critic bad JSON fails closed and commits no lesson", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-critic-bad-json" });
@@ -1585,11 +1672,12 @@ test("active recall: a correct answer is judged and recorded", { concurrency: fa
 		assert.equal(fake.active().length, 1, "normal pacing timer remains when the queue is empty");
 		assert.ok(fake.active()[0].delay > 590_000, "feedback is not overwritten by a 0ms idle tick");
 		const check = openTestDb();
-		const att = check.prepare("SELECT verdict, kind, answer_text FROM attempts WHERE item_id = 1").get() as any;
+		const att = check.prepare("SELECT verdict, kind, answer_text, direction FROM attempts WHERE item_id = 1").get() as any;
 		check.close();
 		assert.equal(att.verdict, "correct");
 		assert.equal(att.kind, "recall");
 		assert.equal(att.answer_text, "hello");
+		assert.equal(att.direction, "forward");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -1779,7 +1867,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 7, "schema migrated to v7");
+	assert.equal(meta.schema_version, 8, "schema migrated to v8");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -1843,6 +1931,9 @@ test("persistent status stays compact while kaomoji:stats keeps detailed metrics
 		assert.doesNotMatch(status, /需强化|今日新增|今日复习|已学/);
 		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
 		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));
+		// The profile/budget transparency line includes band, confidence, evidence counts, and the budget range.
+		assert.ok(harness.notifications().some((message) => /画像：句法 B1\(证据0,低\)/.test(message)), "stats shows syntax band with evidence");
+		assert.ok(harness.notifications().some((message) => /预算 12-18词\/拉伸/.test(message)), "stats shows the cold-start budget range");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -2016,10 +2107,10 @@ test("active recall: reverse direction asks for the Chinese meaning", { concurre
 		await harness.commands["kaomoji:answer"].handler("你好", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/, "correct Chinese answer auto-rates Good");
 		const check = openTestDb();
-		const att = check.prepare("SELECT verdict, answer_text, assistance_level FROM attempts WHERE item_id = 1").get() as any;
+		const att = check.prepare("SELECT verdict, answer_text, assistance_level, direction FROM attempts WHERE item_id = 1").get() as any;
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.deepEqual({ ...att }, { verdict: "correct", answer_text: "你好", assistance_level: "hint" });
+		assert.deepEqual({ ...att }, { verdict: "correct", answer_text: "你好", assistance_level: "hint", direction: "reverse" });
 		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 1 });
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -2166,11 +2257,11 @@ test("stale sentence evaluator result writes no retry or rating after another se
 		await inFlight;
 		const check = openTestDb();
 		const item = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
-		const attempts = check.prepare("SELECT kind,explicit_rating FROM attempts").all() as any[];
+		const attempts = check.prepare("SELECT kind,direction,explicit_rating FROM attempts").all() as any[];
 		const state = check.prepare("SELECT active_item_id,active_review_cycle_id FROM runtime_state WHERE id=1").get() as any;
 		check.close();
 		assert.deepEqual({ ...item }, { progress: 0, reviews: 1 });
-		assert.deepEqual(attempts.map((attempt) => ({ ...attempt })), [{ kind: "sentence_self_report", explicit_rating: "again" }]);
+		assert.deepEqual(attempts.map((attempt) => ({ ...attempt })), [{ kind: "sentence_self_report", direction: "forward", explicit_rating: "again" }]);
 		assert.deepEqual({ ...state }, { active_item_id: null, active_review_cycle_id: null });
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);

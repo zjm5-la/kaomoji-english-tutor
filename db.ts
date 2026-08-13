@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 7;
+const SCHEMA_TARGET_VERSION = 8;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -163,6 +163,7 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 				review_cycle_id TEXT NOT NULL, claim_key TEXT NOT NULL UNIQUE,
 				question_version INTEGER NOT NULL, evaluation_version INTEGER NOT NULL,
 				kind TEXT NOT NULL, answer_text TEXT, assistance_level TEXT NOT NULL,
+				direction TEXT CHECK (direction IN ('forward','reverse')),
 				status TEXT NOT NULL CHECK (status IN ('evaluating','evaluated','superseded','stale','abandoned','self_report')),
 				evaluation_owner TEXT, evaluation_token TEXT, evaluation_until TEXT,
 				verdict TEXT, error_tags_json TEXT, feedback_json TEXT,
@@ -313,6 +314,14 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 				).run(row.corruption_id);
 			}
 		}
+	},
+	// v8: persist the recall direction with each attempt (learner-profile signal).
+	(db: DatabaseSync) => {
+		addColumnIfMissing(
+			db,
+			"attempts",
+			"direction TEXT CHECK (direction IN ('forward','reverse'))",
+		);
 	},
 ];
 

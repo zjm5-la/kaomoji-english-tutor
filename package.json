@@ -19,6 +19,7 @@
     "render.ts",
     "runtime-state.ts",
     "sentence-cycle.ts",
+    "learner-profile.ts",
     "pi-sdk-llm.ts",
     "README.md"
   ],
