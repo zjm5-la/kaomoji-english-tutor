@@ -15,6 +15,7 @@ import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
+import { dbFilePath, isSyncEnabled, pullIfNewer, pushSnapshot } from "./sync.ts";
 import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, type AdaptiveContext } from "./learner-profile.ts";
 
 export { contentFingerprint };
@@ -159,6 +160,16 @@ export default function kaomojiEnglishTutorExtension(
 		return Math.max(0, config.intervalMinutes) * 60_000;
 	}
 
+	async function syncAfterTick() {
+		if (!db) return;
+		try {
+			const r = await pushSnapshot(db);
+			if (r.status === "pushed") appendGenLog(db, `sync_pushed: ${r.localTs ?? ""}`);
+			else if (r.status === "remote_newer") appendGenLog(db, "sync_remote_newer: 云端有更新的进度，/reload 后自动拉取");
+			else if (r.status === "error") appendGenLog(db, `sync_error: ${r.message ?? ""}`);
+		} catch { /* sync must never break the tick */ }
+	}
+
 	function scheduleTimer(delay = intervalMs()) {
 		stopTimer();
 		if (!latestCtx || config.intervalMinutes <= 0 || db == null || activeItem(db) != null) return;
@@ -169,7 +180,7 @@ export default function kaomojiEnglishTutorExtension(
 		const effectiveDelay = pacingDelay > 0 ? pacingDelay : delay;
 		timer = setTimeout(() => {
 			timer = undefined;
-			void runTimerTick();
+			void runTimerTick().then(syncAfterTick, syncAfterTick);
 		}, Math.max(0, effectiveDelay));
 		timer.unref?.();
 	}
@@ -1893,6 +1904,19 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
+	pi.registerCommand("kaomoji:sync", {
+		description: "立即将学习数据推送到云端同步仓库",
+		handler: async (_args, ctx) => {
+			if (!db) { ctx.ui.notify("数据库不可用", "error"); return; }
+			if (!isSyncEnabled()) { ctx.ui.notify("未配置同步仓库：~/.pi/agent/kaomoji-english-tutor-sync", "warning"); return; }
+			const r = await pushSnapshot(db, { ignoreThrottle: true });
+			if (r.status === "pushed") ctx.ui.notify("学习数据已推送到云端 ✓", "info");
+			else if (r.status === "unchanged") ctx.ui.notify("没有需要推送的新进度", "info");
+			else if (r.status === "remote_newer") ctx.ui.notify("云端有更新的进度，/reload 后会自动拉取覆盖本地（旧本地库会备份为 .bak）", "warning");
+			else ctx.ui.notify(`同步失败：${r.message ?? r.status}`, "error");
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		sessionGeneration++;
 		stopAnswerThinking();
@@ -1912,11 +1936,18 @@ export default function kaomojiEnglishTutorExtension(
 		}
 		myId = myCoordinatorId(sessionId, instanceToken);
 		clearPendingLocals();
+		// Cloud sync: pull a newer remote snapshot before opening the local DB.
+		const syncPull = await pullIfNewer(dbFilePath());
 		try {
 			db = openDb();
 		} catch (err) {
 			console.error(`[kaomoji-english-tutor] Failed to open DB: ${err}`);
 			db = null;
+		}
+		if (db && (syncPull.status === "pulled" || syncPull.status === "error")) {
+			appendGenLog(db, syncPull.status === "pulled"
+				? `sync_pulled: ${syncPull.remoteTs}`
+				: `sync_pull_error: ${syncPull.message ?? ""}`);
 		}
 		resolveModel(ctx);
 		if (db) {
@@ -1951,6 +1982,12 @@ export default function kaomojiEnglishTutorExtension(
 		lastCoordinatorRenewal = 0;
 		lastDataVersion = null;
 		localVersion = -1;
+		// Cloud sync: best-effort final push so a machine switch picks up this progress.
+		if (db) {
+			try {
+				await pushSnapshot(db, { ignoreThrottle: true });
+			} catch { /* shutdown must not fail on sync */ }
+		}
 		closeDb();
 	});
 
