@@ -3,7 +3,7 @@ import type { PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import type { ItemRow } from "./db.ts";
 import type { SentenceExerciseView } from "./render.ts";
-import { coldStartProfile, deriveBudget, formatAdaptiveBlock, type AdaptiveContext } from "./learner-profile.ts";
+import { coldStartProfile, deriveBudget, formatAdaptiveBlock, normalizeErrorTag, type AdaptiveContext } from "./learner-profile.ts";
 
 // -- LLM lesson generation ------------------------------------------------
 
@@ -449,7 +449,8 @@ export async function evaluateSentenceAttempt(
 		"你是严格但鼓励性的英语写作导师。评价学生英文，只输出 JSON。",
 		...task,
 		`学生答案：${answer}`,
-		'输出：{"verdict":"correct|partial|incorrect","feedback":"一个最小中文修正","errorTags":["grammar|collocation|meaning|missing_target|word_order|spelling"],"correctedAnswer":"自然修正版"}',
+		'输出：{"verdict":"correct|partial|incorrect","feedback":"一个最小中文修正","errorTags":["grammar|collocation|meaning|missing_target|word_order|spelling|preposition|tense|article|word_choice"],"correctedAnswer":"自然修正版"}',
+		"errorTags 只能从上面列表中选择，拿不准就用 other。",
 		"correct：语义满足中文意图且英文自然；自然变体应接受。",
 		"partial：意图基本正确，仅有一个或少量可修正问题。",
 		"incorrect：核心意思错误、无法理解、写成中文，或填空目标明显错误。",
@@ -471,7 +472,7 @@ export async function evaluateSentenceAttempt(
 		const parsed = JSON.parse(json) as Record<string, unknown>;
 		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
 		const errorTags = Array.isArray(parsed.errorTags)
-			? parsed.errorTags.filter((tag): tag is string => typeof tag === "string").slice(0, 5)
+			? [...new Set(parsed.errorTags.filter((tag): tag is string => typeof tag === "string").map((tag) => normalizeErrorTag(tag)))].slice(0, 5)
 			: [];
 		return {
 			available: true,

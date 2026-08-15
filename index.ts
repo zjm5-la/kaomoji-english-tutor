@@ -8,15 +8,15 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, dueDirection, directionFsrsState, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
-import { quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
+import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, pullIfNewer, pushSnapshot } from "./sync.ts";
-import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, type AdaptiveContext } from "./learner-profile.ts";
+import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, smoothBudget, type AdaptiveContext } from "./learner-profile.ts";
 
 export { contentFingerprint };
 
@@ -371,8 +371,8 @@ export default function kaomojiEnglishTutorExtension(
 			pendingIsReview = isReview;
 			pendingDirection = state.active_direction;
 			if (changed) {
-				pendingFlipped = item.type === "sentence" && state.active_assistance_level === "revealed";
-				pendingAssistance = item.type === "sentence" ? state.active_assistance_level : "none";
+				pendingFlipped = state.active_assistance_level === "revealed";
+				pendingAssistance = state.active_assistance_level;
 			}
 			const correction = sentenceCorrectionLines(item, state);
 			const face = correction ? FACES.error : isReview ? FACES.review : FACES.teach;
@@ -566,7 +566,7 @@ export default function kaomojiEnglishTutorExtension(
 				bumpStat(db, "total_learned", 1);
 				touchStreak(db, now);
 			}
-			const direction: RecallDirection = due.type !== "sentence" && isReview && Math.random() >= 0.5 ? "reverse" : "forward";
+			const direction: RecallDirection = due.type !== "sentence" && isReview ? dueDirection(db, due.id, now) : "forward";
 			setRuntimeState(db, {
 				active_item_id: due.id,
 				active_kind: isReview ? "review" : "teach",
@@ -595,7 +595,7 @@ export default function kaomojiEnglishTutorExtension(
 		pendingFlipped = false;
 		pendingIsReview = isReview;
 		pendingDirection = state.active_direction;
-		pendingAssistance = item.type === "sentence" ? state.active_assistance_level : "none";
+		pendingAssistance = state.active_assistance_level;
 		recordRendered(state);
 		const face = isReview ? FACES.review : FACES.teach;
 		const lines = renderCard(item, isReview, face, false, pendingDirection);
@@ -634,6 +634,11 @@ export default function kaomojiEnglishTutorExtension(
 					.run(item.id, state.active_version);
 				state = getRuntimeState(db);
 				recordRendered(state);
+			} else {
+				// Word/phrase: persist the reveal so it survives reload/reattach (P0-2).
+				db.prepare("UPDATE runtime_state SET active_assistance_level = 'revealed', active_version = active_version + 1 WHERE id = 1 AND active_item_id = ?")
+					.run(item.id);
+				recordRendered(getRuntimeState(db));
 			}
 		}
 		const face = pendingIsReview ? FACES.review : FACES.teach;
@@ -872,6 +877,10 @@ export default function kaomojiEnglishTutorExtension(
 			}).join("")
 			: item.text.split(/\s+/).map((word) => word[0] + "_".repeat(Math.max(0, word.length - 1))).join(" ");
 		if (pendingAssistance === "none") pendingAssistance = "hint";
+		// Persist assistance so the scheduling policy survives reload/reattach (P0-2).
+		db.prepare("UPDATE runtime_state SET active_assistance_level = CASE WHEN active_assistance_level = 'none' THEN 'hint' ELSE active_assistance_level END, active_version = active_version + 1 WHERE id = 1 AND active_item_id = ?")
+			.run(item.id);
+		recordRendered(getRuntimeState(db));
 		ctx.ui.notify(`提示：${hint}`, "info");
 		return true;
 	}
@@ -994,9 +1003,17 @@ export default function kaomojiEnglishTutorExtension(
 		}
 
 		// Full rating: one-shot, atomic, applies at most once globally.
-		const next = scheduleNext(item.fsrs_state, now, rating);
+		// Word/phrase: assistance-aware effective rating + per-direction schedule (P0-1/P0-2).
+		const isRecall = item.type !== "sentence";
+		const effective = isRecall
+			? effectiveRecallRating({ rating, assistance: assistanceLevel, manual: !attempt })
+			: rating;
+		const stateForSchedule = isRecall
+			? (directionFsrsState(db, item.id, expectedDirection) ?? item.fsrs_state)
+			: item.fsrs_state;
+		const next = scheduleNext(stateForSchedule, now, effective);
 		if ("corrupt" in next) {
-			if (db) quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
+			if (db) quarantineCorruptFsrs(db, item.id, stateForSchedule ?? "", next.error, now);
 			clearPendingLocals();
 			if (!isCtxStale(ctx)) {
 				ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离，不会重复出现。原始数据已保留。`, "warning");
@@ -1024,7 +1041,7 @@ export default function kaomojiEnglishTutorExtension(
 				}
 				if (attempt) {
 					if (item.type !== "sentence") ensureRecallExercise(item);
-					insertEvaluatedAttempt(db, attempt, rating === Rating.Good ? "good" : "again", now);
+					insertEvaluatedAttempt(db, attempt, effective === Rating.Good ? "good" : effective === Rating.Hard ? "hard" : "again", now);
 				} else if (item.type === "sentence" && cur.active_review_cycle_id) {
 					const linked = db.prepare(
 						"UPDATE attempts SET explicit_rating = 'again', rated_at = ? WHERE id = (SELECT id FROM attempts WHERE review_cycle_id = ? AND explicit_rating IS NULL ORDER BY completed_at DESC, id DESC LIMIT 1)",
@@ -1041,22 +1058,44 @@ export default function kaomojiEnglishTutorExtension(
 							selfReportExercise ? sentenceQuestionText(selfReportExercise) : null,
 						);
 					}
+				} else if (item.type !== "sentence") {
+					// Manual word/phrase self-report: recorded separately (kind=recall_self_report)
+					// with the conservatively applied rating; never objective evidence.
+					db.prepare(
+						"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, assistance_level, status, explicit_rating, started_at, completed_at, rated_at, question_text) VALUES (?, ?, NULL, ?, ?, ?, ?, 'recall_self_report', ?, ?, 'self_report', ?, ?, ?, ?, ?)",
+					).run(
+						randomUUID(), item.id, randomUUID(), `recall_self_report:${item.id}:${expectedVersion}`,
+						expectedVersion, expectedVersion, expectedDirection, assistanceLevel,
+						effective === Rating.Again ? "again" : "hard",
+						now.toISOString(), now.toISOString(), now.toISOString(),
+						recallQuestionText(item, expectedDirection),
+					);
 				}
-				advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
-				// Assisted Good still advances FSRS, but cannot create unassisted mastery evidence.
+				if (isRecall) {
+					advanceReviewDirectional(db, item.id, expectedDirection, next.state, next.due, item.reviews + 1, now);
+				} else {
+					advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
+				}
+				// Mastery evidence follows the objective verdict, not the scheduled rating:
+				// a hint-assisted correct stays assisted evidence even when scheduled Hard;
+				// manual self-reports are not objective evidence at all.
 				const m = db.prepare("SELECT stage, unassisted_good, assisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { stage: string; unassisted_good: number; assisted_good: number; consecutive_again: number } | undefined;
 				const prevStage = m?.stage ?? "exposure";
 				const assisted = assistanceLevel !== "none";
-				const newGood = rating === Rating.Good
-					? (assisted ? Number(m?.unassisted_good ?? 0) : Number(m?.unassisted_good ?? 0) + 1)
-					: 0;
-				const newAssistedGood = rating === Rating.Good && assisted
-					? Number(m?.assisted_good ?? 0) + 1
-					: Number(m?.assisted_good ?? 0);
-				const newAgain = rating === Rating.Again ? Number(m?.consecutive_again ?? 0) + 1 : 0;
-				const stage = rating === Rating.Good && assisted
-					? prevStage
-					: computeMasteryStage(prevStage, newGood, rating === Rating.Again);
+				const objectiveCorrect = attempt != null && attempt.verdict === "correct";
+				const newGood = effective === Rating.Again
+					? 0
+					: Number(m?.unassisted_good ?? 0) + (objectiveCorrect && !assisted ? 1 : 0);
+				// Assisted evidence counts hint-level only; answering after a reveal is not recall.
+				const newAssistedGood = Number(m?.assisted_good ?? 0) + (objectiveCorrect && assistanceLevel === "hint" ? 1 : 0);
+				const newAgain = effective === Rating.Again
+					? Number(m?.consecutive_again ?? 0) + 1
+					: effective === Rating.Good ? 0 : Number(m?.consecutive_again ?? 0);
+				const stage = effective === Rating.Again
+					? computeMasteryStage(prevStage, newGood, true)
+					: objectiveCorrect && !assisted
+						? computeMasteryStage(prevStage, newGood, false)
+						: prevStage;
 				const exerciseKind = attempt?.kind ?? (item.type === "sentence" ? "sentence_self_report" : "recall");
 				if (m) {
 					db.prepare("UPDATE mastery_state SET stage = ?, unassisted_good = ?, assisted_good = ?, consecutive_again = ?, last_exercise_kind = ?, updated_at = ? WHERE item_id = ?")
@@ -1069,7 +1108,7 @@ export default function kaomojiEnglishTutorExtension(
 				touchStreak(db, now);
 				hasImmediateNext = hasReadyQueuedCard(now);
 				const nextCheck = hasImmediateNext
-					? new Date(now.getTime() + (rating === Rating.Again ? AGAIN_FEEDBACK_GRACE_MS : 0)).toISOString()
+					? new Date(now.getTime() + (effective === Rating.Again ? AGAIN_FEEDBACK_GRACE_MS : 0)).toISOString()
 					: new Date(now.getTime() + intervalMs()).toISOString();
 				setRuntimeState(db, {
 					active_item_id: null,
@@ -1102,14 +1141,25 @@ export default function kaomojiEnglishTutorExtension(
 			return true;
 		}
 		recordRendered(getRuntimeState(db));
-		if (rating === Rating.Good) {
+		const downgradeNote = effective !== rating
+			? assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
+			: assistanceLevel === "hint" ? "（用了提示，按困难安排）"
+			: "（自评兜底，按困难保守安排）"
+			: "";
+		if (effective === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				...(recallNote ? [recallNote] : []),
 				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个${TYPE_LABELS[item.type] ?? "学习项"}`,
 				statsLine(db),
 			]);
+		} else if (effective === Rating.Hard) {
+			updateWidget(ctx, FACES.review, [
+				...(recallNote ? [recallNote] : []),
+				`${FACES.review} 记了个大概${downgradeNote}，下次 ${next.due.slice(0, 10)} 再见这个${TYPE_LABELS[item.type] ?? "学习项"}`,
+				statsLine(db),
+			]);
 		} else {
-			const lines = [...(recallNote ? [recallNote] : []), `${FACES.error} 没关系，待会儿再考你一次 ${item.text}`];
+			const lines = [...(recallNote ? [recallNote] : []), `${FACES.error} 没关系${downgradeNote}，待会儿再考你一次 ${item.text}`];
 			const mastery = db.prepare("SELECT consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { consecutive_again: number } | undefined;
 			if (Number(mastery?.consecutive_again ?? 0) >= 2) {
 				lines.push(`💪 反复忘了，仔细看：${item.example || item.text}${item.example_cn ? `（${item.example_cn}）` : ""}`);
@@ -1130,16 +1180,35 @@ export default function kaomojiEnglishTutorExtension(
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return undefined;
 		const now = new Date();
-		const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
-		if ("corrupt" in next) {
-			quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
-			clearPendingLocals();
-			ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离。`, "warning");
-			renderGlobalCard(ctx);
-			return undefined;
-		}
 		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
-		const due = next.due < minDue ? minDue : next.due;
+		// Skip claims the whole word is known: push out BOTH directions (P0-1).
+		const isRecall = item.type !== "sentence";
+		const perDirection: { direction: "forward" | "reverse"; state: string; due: string }[] = [];
+		let sentenceNext: { state: string; due: string } | undefined;
+		if (isRecall) {
+			for (const dir of ["forward", "reverse"] as const) {
+				const raw = directionFsrsState(db, item.id, dir) ?? (item.fsrs_state || null);
+				const st = scheduleNext(raw, now, Rating.Easy);
+				if ("corrupt" in st) {
+					quarantineCorruptFsrs(db, item.id, raw ?? "", st.error, now);
+					clearPendingLocals();
+					ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离。`, "warning");
+					renderGlobalCard(ctx);
+					return undefined;
+				}
+				perDirection.push({ direction: dir, state: st.state, due: st.due < minDue ? minDue : st.due });
+			}
+		} else {
+			const next = scheduleNext(item.fsrs_state, now, Rating.Easy);
+			if ("corrupt" in next) {
+				quarantineCorruptFsrs(db, item.id, item.fsrs_state, next.error, now);
+				clearPendingLocals();
+				ctx.ui.notify(`该卡片 FSRS 数据损坏，已隔离。`, "warning");
+				renderGlobalCard(ctx);
+				return undefined;
+			}
+			sentenceNext = { state: next.state, due: next.due < minDue ? minDue : next.due };
+		}
 		let applied = false;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -1150,11 +1219,16 @@ export default function kaomojiEnglishTutorExtension(
 				clearPendingLocals();
 				return undefined;
 			}
-			db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
-				next.state,
-				due,
-				item.id,
-			);
+			if (isRecall) {
+				for (const d of perDirection) advanceReviewDirectional(db, item.id, d.direction, d.state, d.due, item.reviews + 1, now);
+				db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
+			} else {
+				db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
+					sentenceNext!.state,
+					sentenceNext!.due,
+					item.id,
+				);
+			}
 			bumpStat(db, "total_skipped", 1);
 			enqueueReplacement(db, item.type);
 			// Give this instance a short grace to generate the replacement without
@@ -1471,7 +1545,7 @@ export default function kaomojiEnglishTutorExtension(
 		// fallback, revisions, and critic so adaptive decisions stay consistent.
 		const adaptive: AdaptiveContext | null = db ? (() => {
 			const profile = computeLearnerProfile(db, new Date());
-			return { profile, budget: deriveBudget(profile) };
+			return { profile, budget: smoothBudget(db, deriveBudget(profile)) };
 		})() : null;
 		const recentLog = db ? formatAttemptLogBlock(recentAttemptLog(db)) : undefined;
 

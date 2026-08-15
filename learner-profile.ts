@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { getStat, setStat } from "./db.ts";
 
 // -- Learner profile & difficulty budget (P2) -----------------------------
 //
@@ -117,22 +118,66 @@ interface StreamAggregate {
 	firstPassSuccess: number;
 	/** assistance_level != 'none'. */
 	assisted: number;
-	errorTags: Map<string, number>;
+	/** Normalized tag -> distinct item/cycle keys (same-item retries count once). */
+	errorTags: Map<string, Set<string>>;
 }
 
 function emptyStream(): StreamAggregate {
 	return { evidence: 0, correct: 0, firstPassSuccess: 0, assisted: 0, errorTags: new Map() };
 }
 
-function pushAttempt(stream: StreamAggregate, row: RawEvaluated): void {
+function pushAttempt(stream: StreamAggregate, row: RawEvaluated, itemKey: string): void {
 	stream.evidence++;
 	if (row.verdict === "correct") stream.correct++;
 	if (row.verdict === "correct" && row.assistance_level === "none") stream.firstPassSuccess++;
 	if (row.assistance_level !== "none") stream.assisted++;
-	addErrorTags(stream.errorTags, row.error_tags_json);
+	addErrorTags(stream.errorTags, row.error_tags_json, itemKey);
 }
 
-function addErrorTags(map: Map<string, number>, raw: string | null): void {
+/** Canonical evaluator error tags (P1). Unknown/legacy tags collapse to "other". */
+export const ERROR_TAG_WHITELIST: readonly string[] = [
+	"grammar", "collocation", "meaning", "missing_target", "word_order",
+	"spelling", "preposition", "tense", "article", "word_choice", "other",
+];
+
+const ERROR_TAG_ALIASES: Record<string, string> = {
+	typo: "spelling",
+	spell: "spelling",
+	spelling_mistake: "spelling",
+	"拼写": "spelling",
+	"语法": "grammar",
+	syntax: "grammar",
+	verb_tense: "tense",
+	tenses: "tense",
+	"时态": "tense",
+	prepositions: "preposition",
+	prep: "preposition",
+	"介词": "preposition",
+	articles: "article",
+	"冠词": "article",
+	vocabulary: "word_choice",
+	wordchoice: "word_choice",
+	"word-choice": "word_choice",
+	word_selection: "word_choice",
+	wordorder: "word_order",
+	"word-order": "word_order",
+	missing_keyword: "missing_target",
+	missing_word: "missing_target",
+	usage: "meaning",
+	wrong_meaning: "meaning",
+	"词义": "meaning",
+};
+
+const ERROR_TAG_SET = new Set(ERROR_TAG_WHITELIST);
+
+/** Normalize one evaluator tag onto the whitelist (case/space/alias-insensitive). */
+export function normalizeErrorTag(tag: string): string {
+	const t = tag.trim().toLowerCase().replace(/[\s-]+/g, "_");
+	const mapped = ERROR_TAG_ALIASES[t] ?? t;
+	return ERROR_TAG_SET.has(mapped) ? mapped : "other";
+}
+
+function addErrorTags(map: Map<string, Set<string>>, raw: string | null, itemKey: string): void {
 	if (!raw) return;
 	let tags: unknown;
 	try {
@@ -143,8 +188,10 @@ function addErrorTags(map: Map<string, number>, raw: string | null): void {
 	if (!Array.isArray(tags)) return;
 	for (const tag of tags) {
 		if (typeof tag === "string" && tag.trim()) {
-			const key = tag.trim();
-			map.set(key, (map.get(key) ?? 0) + 1);
+			const key = normalizeErrorTag(tag);
+			const set = map.get(key) ?? new Set<string>();
+			set.add(itemKey);
+			map.set(key, set);
 		}
 	}
 }
@@ -170,6 +217,7 @@ function confidenceFromEvidence(evidence: number): Confidence {
 }
 
 interface RawEvaluated {
+	item_id?: number;
 	verdict: string | null;
 	assistance_level: string;
 	error_tags_json: string | null;
@@ -248,13 +296,17 @@ function mergeStream(into: StreamAggregate, from: StreamAggregate): void {
 	into.evidence += from.evidence;
 	into.correct += from.correct;
 	into.assisted += from.assisted;
-	for (const [tag, count] of from.errorTags) into.errorTags.set(tag, (into.errorTags.get(tag) ?? 0) + count);
+	for (const [tag, keys] of from.errorTags) {
+		const set = into.errorTags.get(tag) ?? new Set<string>();
+		for (const key of keys) set.add(key);
+		into.errorTags.set(tag, set);
+	}
 }
 
 function aggregateRecall(db: DatabaseSync, direction: "forward" | "reverse", cutoff: string): StreamAggregate {
 	const rows = db
 		.prepare(
-			"SELECT verdict, assistance_level, error_tags_json, rowid FROM attempts " +
+			"SELECT item_id, verdict, assistance_level, error_tags_json, rowid FROM attempts " +
 				"WHERE status = 'evaluated' AND verdict IN ('correct','partial','incorrect') " +
 				"AND kind = 'recall' AND direction = ? AND completed_at IS NOT NULL AND completed_at >= ? " +
 				"ORDER BY completed_at DESC, rowid DESC LIMIT " + STREAM_BOUND,
@@ -262,7 +314,7 @@ function aggregateRecall(db: DatabaseSync, direction: "forward" | "reverse", cut
 		.all(direction, cutoff) as unknown as RawEvaluated[];
 	const stream = emptyStream();
 	for (const row of rows) {
-		pushAttempt(stream, { verdict: row.verdict, assistance_level: row.assistance_level ?? "none", error_tags_json: row.error_tags_json });
+		pushAttempt(stream, { verdict: row.verdict, assistance_level: row.assistance_level ?? "none", error_tags_json: row.error_tags_json }, `item:${row.item_id}`);
 	}
 	return stream;
 }
@@ -295,9 +347,10 @@ function aggregateSentenceFirstPass(db: DatabaseSync, cutoff: string): { all: St
 	const all = emptyStream();
 	const byStage = new Map<string, StreamAggregate>();
 	for (const row of bounded) {
-		pushAttempt(all, row);
+		// Distinct-count key: one review cycle = one sample, retries cannot amplify a tag.
+		pushAttempt(all, row, `cycle:${row.review_cycle_id}`);
 		const stage = byStage.get(row.stage) ?? emptyStream();
-		pushAttempt(stage, row);
+		pushAttempt(stage, row, `cycle:${row.review_cycle_id}`);
 		byStage.set(row.stage, stage);
 	}
 	return { all, byStage };
@@ -348,12 +401,12 @@ function deriveVocabBand(forward: StreamAggregate, forwardAssist: number | null)
 	return { band, confidence: confidenceFromEvidence(forward.evidence), evidence: forward.evidence, rate };
 }
 
-function topErrorFocus(tags: Map<string, number>): ErrorFocusTag[] {
+function topErrorFocus(tags: Map<string, Set<string>>): ErrorFocusTag[] {
 	return [...tags.entries()]
-		.filter(([, count]) => count >= 2)
-		.sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
-		.slice(0, 3)
-		.map(([tag, count]) => ({ tag, count }));
+		.map(([tag, keys]) => ({ tag, count: keys.size }))
+		.filter((t) => t.count >= 2)
+		.sort((a, b) => (b.count - a.count) || a.tag.localeCompare(b.tag))
+		.slice(0, 3);
 }
 
 /** Pure derivation of the objective difficulty budget from a profile. */
@@ -364,9 +417,16 @@ export function deriveBudget(profile: LearnerProfile): DifficultyBudget {
 	const maxKeyWords = MAX_KEY_WORDS_BY_BAND[syntaxBand];
 	const sentenceRate = profile.sentence.rate;
 	const assist = profile.assistance.rate;
-	let ramp: Ramp = "stretch";
-	if (sentenceRate !== null && sentenceRate < 0.6) ramp = "consolidate";
-	else if (assist !== null && assist > 0.35) ramp = "consolidate";
+	// Conservative default (P0-3): no/low evidence never defaults to stretch.
+	// Stretch requires sufficient unassisted sentence evidence on both axes.
+	let ramp: Ramp = "consolidate";
+	if (
+		profile.sentence.evidence >= 5 &&
+		sentenceRate !== null && sentenceRate >= 0.6 &&
+		assist !== null && assist <= 0.35
+	) {
+		ramp = "stretch";
+	}
 	return {
 		syntaxBand,
 		vocabBand,
@@ -376,6 +436,47 @@ export function deriveBudget(profile: LearnerProfile): DifficultyBudget {
 		vocabulary: VOCAB_LEVEL_BY_BAND[vocabBand],
 		ramp,
 		errorFocus: profile.errorFocus,
+	};
+}
+
+const BAND_ORDER: Band[] = ["B0", "B1", "B2", "B3"];
+
+/**
+ * Persisted hysteresis over deriveBudget (P0-3): demotion applies immediately,
+ * promotion moves at most one band per call, and stretch engages only after two
+ * consecutive stretch signals. State lives in stats, so all local sessions and
+ * restarts share the same smoothed budget.
+ */
+export function smoothBudget(db: DatabaseSync, next: DifficultyBudget): DifficultyBudget {
+	let prev: { syntaxBand: Band; vocabBand: Band } | null = null;
+	try {
+		const raw = getStat(db, "adaptive_budget_smooth");
+		if (raw) {
+			const parsed = JSON.parse(raw) as { syntaxBand?: Band; vocabBand?: Band };
+			if (parsed.syntaxBand && parsed.vocabBand) prev = { syntaxBand: parsed.syntaxBand, vocabBand: parsed.vocabBand };
+		}
+	} catch { /* corrupt snapshot: restart smoothing */ }
+	const step = (p: Band, n: Band): Band => {
+		const pi = BAND_ORDER.indexOf(p);
+		const ni = BAND_ORDER.indexOf(n);
+		if (ni <= pi) return n; // demotion is immediate
+		return BAND_ORDER[pi + 1]; // promotion: one band per generation
+	};
+	const syntaxBand = prev ? step(prev.syntaxBand, next.syntaxBand) : next.syntaxBand;
+	const vocabBand = prev ? step(prev.vocabBand, next.vocabBand) : next.vocabBand;
+	const streak = next.ramp === "stretch" ? Number(getStat(db, "adaptive_stretch_streak") ?? 0) + 1 : 0;
+	const ramp: Ramp = next.ramp === "stretch" && streak >= 2 ? "stretch" : "consolidate";
+	setStat(db, "adaptive_budget_smooth", JSON.stringify({ syntaxBand, vocabBand }));
+	setStat(db, "adaptive_stretch_streak", String(streak));
+	return {
+		...next,
+		syntaxBand,
+		vocabBand,
+		wordRange: WORD_RANGE_BY_BAND[syntaxBand],
+		maxKeyWords: MAX_KEY_WORDS_BY_BAND[syntaxBand],
+		structure: STRUCTURE_BY_BAND[syntaxBand],
+		vocabulary: VOCAB_LEVEL_BY_BAND[vocabBand],
+		ramp,
 	};
 }
 
@@ -432,7 +533,7 @@ export function formatProfileStatsLine(profile: LearnerProfile, budget: Difficul
 	const rateEv = (r: DimensionRate) => `${pct(r.rate)}(证据${r.evidence})`;
 	return [
 		`画像：句法 ${dim(profile.syntax)}`,
-		`词汇 ${dim(profile.vocab)}`,
+		`词汇 ${dim(profile.vocab)}（B0–B3 为内部难度档，非 CEFR 评级）`,
 		`句子首轮 ${rateEv(profile.sentence)}`,
 		`中→英 ${rateEv(profile.recallForward)}`,
 		`英→中 ${rateEv(profile.recallReverse)}`,

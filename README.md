@@ -19,12 +19,12 @@
 
 - **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
 - **按需备课**：宠物从最近对话中识别主题。模型判定信息不足后，如果会话没有变化就不会重复请求；条件满足后生成 1 个单词、1 个词组和 1 个渐进长句。新卡只在首次真正展示时消耗每日额度；Skip 补卡严格一换一、额度外，并让位于已到期复习
-- **适应难度**：从近 60 天答题记录确定性聚合学习者画像（句法/词汇档位、首轮通过率、辅助依赖、薄弱点），推导客观难度预算（句长区间、句法复杂度、词汇层次、生词上限、爬坡方向）。备课与独立 critic 都接入同一预算；句长/生词数超出预算会被审查客观打回。冷启动先验为 B1（即原行为）
+- **适应难度**：从近 60 天答题记录确定性聚合学习者画像（句法/词汇档位、首轮通过率、辅助依赖、归一化薄弱点），推导客观难度预算（句长区间、句法复杂度、词汇层次、生词上限、爬坡方向）。备课与独立 critic 都接入同一预算；句长/生词数超出预算会被审查客观打回。冷启动先验为 B1；零/低证据时默认巩固而非拉伸，预算经迟滞平滑（升档每次备课最多一档、降档立即、拉伸需连续两次信号）。B0–B3 为未校准的内部难度档，不是 CEFR 测量
 - **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具。生成内容和补卡只有通过独立 critic 才会写入
 - **渐进句子输出**：同一张句子卡从 L1 单词填空 → L2 主干英文 → L3 完整自然表达；每级都用 `/kaomoji:answer` 真正输入英文，标准句只是参考，不要求逐字复刻
-- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；单词/词组答对自动 Good、答错或部分正确自动 Again，模型暂时无法可靠判断时不记录成绩。句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again；损坏的 FSRS 数据会保留原文并隔离，不会静默重置
+- **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度。单词/词组的中→英产出与英→中识别是两个独立技能，分别持有 FSRS 状态与到期时间（迁移自动把旧状态回填到两个方向）；卡片到期时选择真正到期的方向，同到期先考产出，避免识别先看到英文泄露默写答案。辅助感知调度：无辅助答对=Good、提示后答对至多 Hard、翻面后答对=Again；手动 `/kaomoji:good` 作为自评单独记录并保守调度（至多 Hard），不冒充客观证据。模型暂时无法可靠判断时不记录成绩。句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again；损坏的 FSRS 数据会保留原文并隔离，不会静默重置
 - **出题日志**：每次作答把题目快照、答案、判定与反馈写入 attempts 表，争议可审计；备课/补卡时注入最近作答记录，作为把握学生近况与避免争议出题的依据。释义字段只保留可回忆的最小释义，作用说明放例句，critic 发现混入直接打回。备课与补卡的每次决策（等待/打回/去重/报错/成功，含原因）写入环形日志（最近 20 条），`/kaomoji:stats` 显示最近几条，「为什么没出卡」可追溯
-- **卡片交互**：单词/词组复习随机进行中→英或英→中回忆；英→中识别方向接受同义表达与语体差异（如“已”与“已经”），中→英默写保持拼写严格；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度
+- **卡片交互**：单词/词组复习按方向到期时间进行中→英或英→中回忆；英→中识别方向接受同义表达与语体差异（如“已”与“已经”），中→英默写保持拼写严格；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度，单词/词组的提示与翻面同样影响调度并跨会话生效
 - **精简状态**：常驻 widget 只显示连续学习天数和今日剩余卡片；掌握阶段、强化需求和正确率通过 `/kaomoji:stats` 查看
 - **持久化**：学习记录、句子输出 cycle、重试和辅助状态存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
 - **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；句子级别、纠错、提示、翻面及首次回忆结果也会跨会话/reload 恢复，任一会话提交后其他会话自动同步
@@ -58,7 +58,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `/kaomoji:hint` | 显示当前单词/词组回忆提示，或句子当前级别的英文首字提示 |
 | `/kaomoji:stats` | 显示掌握阶段分布、强化需求、答题正确率，以及学习者画像（档位/置信度/首轮通过率/辅助/薄弱点）与当前难度预算 |
 | `/kaomoji:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
-| `/kaomoji:good` | 手动评分为记得；句子卡不能跳过真实输出 |
+| `/kaomoji:good` | 手动自评记得：单独记录为自评，调度保守（至多 Hard），不产生客观掌握证据；句子卡不能跳过真实输出 |
 | `/kaomoji:again` | 手动评分为忘了；句子在任意级别都可结束本轮并从 L1 重新调度 |
 | `/kaomoji:skip` | 标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
 
@@ -113,9 +113,9 @@ A kaomoji pet that lives in a widget below the editor, prepares lessons from you
 - **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 progressive sentence. Planned cards consume quota only on first display; Skip replacements are strictly one-for-one, quota-free, and yield to due reviews
 - **Unified Pi SDK transport**: lesson generation, independent critique, revision, replacements, sentence-data completion, and answer evaluation all run through isolated in-memory Pi SDK sessions with no discovered extensions, skills, project context, or file tools. Lessons and replacements are inserted only after independent critic approval
 - **Progressive sentence output**: one sentence moves from an L1 word cloze to L2 core-clause writing and L3 natural full-sentence production; every level requires `/kaomoji:answer`, and the reference is not treated as the only valid wording
-- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase answers auto-rate when evaluation is reliable; unavailable evaluation writes no score. A sentence allows corrective retries but commits one Good/Again based on the first-recall path; corrupt FSRS state is preserved and quarantined instead of silently reset
+- **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase Chinese→English production and English→Chinese recognition are distinct skills with independent FSRS states and due times (legacy state migrates into both directions); a due card surfaces its actually-due direction, ties favor production so recognition cannot leak the answer. Assistance-aware scheduling: unassisted correct = Good, correct after a hint = at most Hard, correct after a flip/reveal = Again; manual `/kaomoji:good` is recorded separately as a self-report and scheduled conservatively (at most Hard), never as objective evidence. Unavailable evaluation writes no score. A sentence allows corrective retries but commits one Good/Again based on the first-recall path; corrupt FSRS state is preserved and quarantined instead of silently reset
 - **Question log**: every attempt persists the question snapshot, answer, verdict, and feedback in the attempts table, so disputes are auditable; recent attempts are injected into lesson/replacement generation as evidence of learner state and past question-design issues. Meaning fields keep only the minimal recallable translation — usage notes belong to examples, and the critic rejects violations. Every lesson/replacement decision (waiting / rejected / duplicate / error / success, with reason) lands in a 20-entry ring log; `/kaomoji:stats` shows the latest few, making "why no new cards" answerable
-- **Card interaction**: word/phrase direction is randomized Chinese→English or English→Chinese; Chinese-meaning recall accepts synonymous and register variants (e.g. 已 vs 已经) while English production stays spelling-strict. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again
+- **Card interaction**: word/phrase direction follows per-direction due times (Chinese→English or English→Chinese); Chinese-meaning recall accepts synonymous and register variants (e.g. 已 vs 已经) while English production stays spelling-strict. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again, and word/phrase hint/reveal equally affect scheduling, persisting across sessions
 - **Compact status**: the persistent widget only shows learning streak and cards remaining today; `/kaomoji:stats` keeps mastery, reinforcement, and accuracy details
 - **Persistent**: learning history, sentence cycles, retries, and assistance live in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
 - **Multi-session consistency**: concurrent Pi sessions share one current card; sentence level, correction, hint/reveal state, and first-recall outcome survive session changes/reload and synchronize automatically
@@ -149,7 +149,7 @@ Or add to `settings.json`:
 | `/kaomoji:hint` | Show the current word/phrase recall hint or the sentence level's initial-letter hint |
 | `/kaomoji:stats` | Show mastery-stage distribution, reinforcement needs, answer accuracy, plus the learner profile (bands/confidence/first-pass rates/assistance/error focus) and current difficulty budget |
 | `/kaomoji:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
-| `/kaomoji:good` | Manually rate remembered; cannot bypass required sentence output |
+| `/kaomoji:good` | Manual self-report of knowing: recorded separately and scheduled conservatively (at most Hard), never objective mastery evidence; cannot bypass required sentence output |
 | `/kaomoji:again` | Manually rate forgotten; from any sentence level, end the cycle and schedule the next attempt from L1 |
 | `/kaomoji:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |
 | `/kaomoji:sync` | Push learning data to the cloud sync repo now |

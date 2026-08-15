@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 9;
+const SCHEMA_TARGET_VERSION = 10;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -328,7 +328,38 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	(db: DatabaseSync) => {
 		addColumnIfMissing(db, "attempts", "question_text TEXT");
 	},
+	// v10: per-direction FSRS state for word/phrase recall (recognition and
+	// production are different skills and must not share one schedule).
+	(db: DatabaseSync) => {
+		migrateDirectionState(db);
+	},
 ];
+
+/**
+ * Create direction_state and backfill both directions from the legacy single
+ * FSRS state for already-rated word/phrase items. Idempotent (INSERT OR IGNORE),
+ * safe to re-run; sentences stay on the legacy single state.
+ */
+export function migrateDirectionState(db: DatabaseSync): void {
+	const ts = new Date().toISOString();
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS direction_state (
+			item_id INTEGER NOT NULL,
+			direction TEXT NOT NULL CHECK (direction IN ('forward','reverse')),
+			fsrs_state TEXT NOT NULL DEFAULT '',
+			due_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (item_id, direction)
+		);
+	`);
+	for (const dir of ["forward", "reverse"]) {
+		db.prepare(
+			`INSERT OR IGNORE INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at)
+			 SELECT id, ?, fsrs_state, due_at, ? FROM items
+			 WHERE type IN ('word','phrase') AND fsrs_state <> ''`,
+		).run(dir, ts);
+	}
+}
 
 function runMigrations(db: DatabaseSync): void {
 	db.exec(`
@@ -658,6 +689,69 @@ export function advanceReview(
 	db.prepare(
 		"UPDATE items SET fsrs_state = ?, due_at = ?, reviews = ? WHERE id = ?",
 	).run(fsrsState, dueAt, reviews, id);
+}
+
+/**
+ * Pick which recall direction a word/phrase review should use: the due
+ * direction with the earliest due_at; ties and all fallbacks prefer forward
+ * (production first, so a recognition exposure cannot prime a same-day
+ * production answer).
+ */
+export function dueDirection(db: DatabaseSync, itemId: number, now: Date): "forward" | "reverse" {
+	const rows = db
+		.prepare("SELECT direction, due_at FROM direction_state WHERE item_id = ?")
+		.all(itemId) as { direction: "forward" | "reverse"; due_at: string }[];
+	if (rows.length === 0) return "forward";
+	const iso = now.toISOString();
+	const due = rows.filter((r) => r.due_at <= iso);
+	const candidates = due.length > 0 ? due : rows;
+	candidates.sort(
+		(a, b) => a.due_at.localeCompare(b.due_at) || (a.direction === "forward" ? -1 : 1),
+	);
+	return candidates[0].direction;
+}
+
+/** Read one direction's stored FSRS blob; null when no row exists yet. */
+export function directionFsrsState(db: DatabaseSync, itemId: number, direction: "forward" | "reverse"): string | null {
+	const row = db
+		.prepare("SELECT fsrs_state FROM direction_state WHERE item_id = ? AND direction = ?")
+		.get(itemId, direction) as { fsrs_state: string } | undefined;
+	return row?.fsrs_state ?? null;
+}
+
+/**
+ * Advance one direction of a word/phrase item. The untested sibling direction
+ * is created fresh, first surfacing alongside the rated direction's new due.
+ * items.fsrs_state mirrors the forward (production) state and items.due_at is
+ * the minimum over both directions, so legacy readers stay consistent.
+ */
+export function advanceReviewDirectional(
+	db: DatabaseSync,
+	id: number,
+	direction: "forward" | "reverse",
+	fsrsState: string,
+	dueAt: string,
+	reviews: number,
+	now: Date,
+) {
+	const ts = now.toISOString();
+	const sibling = direction === "forward" ? "reverse" : "forward";
+	db.prepare(
+		"INSERT OR IGNORE INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, '', ?, ?)",
+	).run(id, sibling, dueAt, ts);
+	db.prepare(
+		`INSERT INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(item_id, direction) DO UPDATE SET fsrs_state = excluded.fsrs_state, due_at = excluded.due_at, updated_at = excluded.updated_at`,
+	).run(id, direction, fsrsState, dueAt, ts);
+	const fwd = db
+		.prepare("SELECT fsrs_state FROM direction_state WHERE item_id = ? AND direction = 'forward'")
+		.get(id) as { fsrs_state: string } | undefined;
+	const minDue = db
+		.prepare("SELECT MIN(due_at) AS d FROM direction_state WHERE item_id = ?")
+		.get(id) as { d: string };
+	db.prepare(
+		"UPDATE items SET fsrs_state = ?, due_at = ?, reviews = ? WHERE id = ?",
+	).run(fwd?.fsrs_state ?? "", minDue.d, reviews, id);
 }
 
 export function countTodayNew(db: DatabaseSync, now: Date): number {

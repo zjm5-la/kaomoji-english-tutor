@@ -30,7 +30,7 @@ export function ensureSentenceExercise(db: DatabaseSync, item: ItemRow, exercise
 export function insertEvaluatedAttempt(
 	db: DatabaseSync,
 	attempt: PendingAttempt,
-	explicitRating: "good" | "again" | null,
+	explicitRating: "good" | "hard" | "again" | null,
 	now: Date,
 ): void {
 	const reviewCycleId = attempt.reviewCycleId ?? randomUUID();

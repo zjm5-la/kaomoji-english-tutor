@@ -105,7 +105,7 @@ function insertSentenceAttempt(handle: DbHandle, opts: SentenceOpts): void {
 
 // -- Tests ----------------------------------------------------------------
 
-test("cold start: empty DB yields a B1 prior with null rates and a stretch budget", () => {
+test("cold start: empty DB yields a B1 prior with null rates and a conservative budget", () => {
 	const handle = freshDb();
 	try {
 		const profile = computeLearnerProfile(handle.db, NOW);
@@ -123,7 +123,7 @@ test("cold start: empty DB yields a B1 prior with null rates and a stretch budge
 		const budget = deriveBudget(profile);
 		assert.deepEqual(budget.wordRange, [12, 18]);
 		assert.equal(budget.maxKeyWords, 2);
-		assert.equal(budget.ramp, "stretch");
+		assert.equal(budget.ramp, "consolidate", "zero evidence must not default to stretch");
 		assert.equal(budget.syntaxBand, "B1");
 		assert.equal(budget.vocabBand, "B1");
 	} finally {
@@ -342,26 +342,37 @@ test("syntax band: B0 on weak L2, B2 on solid L3, B3 on strong unassisted L3", (
 	}
 });
 
-test("error tags are parsed fail-soft and ranked count-desc then tag-asc, count>=2, max 3", () => {
+test("error tags: distinct-item counting, ranked count-desc then tag-asc, count>=2, max 3", () => {
 	const handle = freshDb();
 	try {
-		const item = insertWord(handle);
-		// grammar x4, collocation x3, word_order x2, spelling x1 (below threshold).
-		insertRecall(handle, { itemId: item, direction: "forward", verdict: "partial", errorTags: ["grammar", "collocation"], completedAt: iso(0) });
-		insertRecall(handle, { itemId: item, direction: "forward", verdict: "partial", errorTags: ["grammar"], completedAt: iso(1) });
-		insertRecall(handle, { itemId: item, direction: "forward", verdict: "partial", errorTags: ["grammar", "collocation", "spelling"], completedAt: iso(2) });
-		insertRecall(handle, { itemId: item, direction: "forward", verdict: "partial", errorTags: ["word_order", "collocation", "grammar"], completedAt: iso(3) });
-		insertRecall(handle, { itemId: item, direction: "forward", verdict: "partial", errorTags: ["word_order"], completedAt: iso(4) });
+		// Same item repeating a tag counts ONCE (no retry amplification): all of
+		// this item's tags stay at distinct-count 1 and fall below the threshold.
+		const one = insertWord(handle);
+		insertRecall(handle, { itemId: one, direction: "forward", verdict: "partial", errorTags: ["grammar", "collocation"], completedAt: iso(0) });
+		insertRecall(handle, { itemId: one, direction: "forward", verdict: "partial", errorTags: ["grammar"], completedAt: iso(1) });
+		insertRecall(handle, { itemId: one, direction: "forward", verdict: "partial", errorTags: ["grammar", "collocation", "spelling"], completedAt: iso(2) });
+		assert.deepEqual(computeLearnerProfile(handle.db, NOW).errorFocus, []);
+		// Distinct items raise the count: grammar 4 items > collocation 3 > word_order 2.
+		for (let i = 0; i < 3; i++) {
+			const it = insertWord(handle);
+			insertRecall(handle, { itemId: it, direction: "forward", verdict: "partial", errorTags: ["grammar", "collocation"], completedAt: iso(10 + i) });
+		}
+		const itG = insertWord(handle);
+		insertRecall(handle, { itemId: itG, direction: "forward", verdict: "partial", errorTags: ["grammar"], completedAt: iso(13) });
+		for (let i = 0; i < 2; i++) {
+			const it = insertWord(handle);
+			insertRecall(handle, { itemId: it, direction: "forward", verdict: "partial", errorTags: ["word_order"], completedAt: iso(20 + i) });
+		}
 		// Malformed JSON is ignored, not fatal.
 		handle.db
 			.prepare(
 				"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, assistance_level, status, verdict, error_tags_json, started_at, completed_at) " +
 					"VALUES (?, ?, NULL, ?, ?, 1, 1, 'recall', 'forward', 'none', 'evaluated', 'partial', 'not-json', ?, ?)",
 			)
-			.run(randomUUID(), item, randomUUID(), randomUUID(), iso(5), iso(5));
+			.run(randomUUID(), one, randomUUID(), randomUUID(), iso(30), iso(30));
 		const { errorFocus } = computeLearnerProfile(handle.db, NOW);
-		// grammar(4) > collocation(3) > word_order(2); spelling(1) dropped; malformed ignored.
-		assert.deepEqual(errorFocus.map((t) => `${t.tag}:${t.count}`), ["grammar:4", "collocation:3", "word_order:2"]);
+		// Distinct items: grammar = one + 3 + itG = 5, collocation = one + 3 = 4, word_order = 2.
+		assert.deepEqual(errorFocus.map((t) => `${t.tag}:${t.count}`), ["grammar:5", "collocation:4", "word_order:2"]);
 	} finally {
 		handle.close();
 	}
@@ -726,6 +737,101 @@ test("gen log survives corrupt JSON and overlong status", () => {
 		const log = getGenLog(handle.db);
 		assert.equal(log.length, 1);
 		assert.equal(log[0].s.length, 200);
+	} finally {
+		handle.close();
+	}
+});
+
+// -- P0-3: conservative ramp + smoothing hysteresis ------------------------
+
+test("ramp stretches only with sufficient unassisted sentence evidence", () => {
+	const handle = freshDb();
+	try {
+		const itemId = insertWord(handle);
+		const ex = insertSentenceExercise(handle, itemId, "L3");
+		// 8/10 first-pass correct, unassisted -> stretch allowed.
+		for (let i = 0; i < 8; i++) insertSentenceAttempt(handle, { itemId, exerciseId: ex, cycleId: `ok${i}`, verdict: "correct", startedAt: iso(i) });
+		for (let i = 0; i < 2; i++) insertSentenceAttempt(handle, { itemId, exerciseId: ex, cycleId: `no${i}`, verdict: "incorrect", startedAt: iso(100 + i) });
+		assert.equal(deriveBudget(computeLearnerProfile(handle.db, NOW)).ramp, "stretch");
+	} finally {
+		handle.close();
+	}
+	// Same rates but too little evidence (4 samples) -> conservative.
+	const thin = freshDb();
+	try {
+		const itemId = insertWord(thin);
+		const ex = insertSentenceExercise(thin, itemId, "L3");
+		for (let i = 0; i < 4; i++) insertSentenceAttempt(thin, { itemId, exerciseId: ex, cycleId: `t${i}`, verdict: "correct", startedAt: iso(i) });
+		assert.equal(deriveBudget(computeLearnerProfile(thin.db, NOW)).ramp, "consolidate");
+	} finally {
+		thin.close();
+	}
+});
+
+test("smoothBudget: promotion steps one band at a time, demotion is immediate", async () => {
+	const { smoothBudget } = await import("../learner-profile.ts");
+	const handle = freshDb();
+	try {
+		const base = deriveBudget(coldStartProfile()); // B1/B1 consolidate
+		// First call persists the snapshot unchanged.
+		const first = smoothBudget(handle.db, base);
+		assert.equal(first.syntaxBand, "B1");
+		assert.equal(first.ramp, "consolidate");
+		// Jump demand to B3: smoothed to a single step up (B2).
+		const hot = { ...base, syntaxBand: "B3" as const, vocabBand: "B3" as const };
+		const up1 = smoothBudget(handle.db, hot);
+		assert.equal(up1.syntaxBand, "B2");
+		assert.equal(up1.vocabBand, "B2");
+		assert.deepEqual(up1.wordRange, [15, 22], "derived fields follow the smoothed band");
+		const up2 = smoothBudget(handle.db, hot);
+		assert.equal(up2.syntaxBand, "B3");
+		// Collapse demand to B0: demotion applies immediately (no hysteresis on the way down).
+		const cold = { ...base, syntaxBand: "B0" as const };
+		const down = smoothBudget(handle.db, cold);
+		assert.equal(down.syntaxBand, "B0");
+	} finally {
+		handle.close();
+	}
+});
+
+test("smoothBudget: stretch requires two consecutive stretch signals", async () => {
+	const { smoothBudget } = await import("../learner-profile.ts");
+	const handle = freshDb();
+	try {
+		const base = deriveBudget(coldStartProfile());
+		const stretchy = { ...base, ramp: "stretch" as const };
+		assert.equal(smoothBudget(handle.db, stretchy).ramp, "consolidate", "first stretch signal is debounced");
+		assert.equal(smoothBudget(handle.db, stretchy).ramp, "stretch", "second consecutive signal engages stretch");
+		// A consolidate signal resets the streak.
+		assert.equal(smoothBudget(handle.db, { ...base, ramp: "consolidate" as const }).ramp, "consolidate");
+		assert.equal(smoothBudget(handle.db, stretchy).ramp, "consolidate", "streak reset after consolidation");
+	} finally {
+		handle.close();
+	}
+});
+
+// -- P1: errorTag whitelist + distinct-counting ----------------------------
+
+test("error tags are normalized to a whitelist and counted per distinct item", () => {
+	const handle = freshDb();
+	try {
+		const itemA = insertWord(handle);
+		const itemB = insertWord(handle);
+		// Same item, three consecutive retries with the same underlying tag in
+		// different spellings: must normalize and count ONCE (distinct item).
+		insertRecall(handle, { itemId: itemA, direction: "forward", verdict: "incorrect", errorTags: ["Spelling"], completedAt: iso(1) });
+		insertRecall(handle, { itemId: itemA, direction: "forward", verdict: "incorrect", errorTags: ["typo"], completedAt: iso(2) });
+		insertRecall(handle, { itemId: itemA, direction: "forward", verdict: "incorrect", errorTags: ["拼写"], completedAt: iso(3) });
+		// A second item with the same tag raises the distinct count to 2.
+		insertRecall(handle, { itemId: itemB, direction: "forward", verdict: "incorrect", errorTags: ["spelling"], completedAt: iso(4) });
+		// Unknown tags collapse to "other" (two distinct items here to pass the >=2 threshold).
+		insertRecall(handle, { itemId: itemB, direction: "forward", verdict: "incorrect", errorTags: ["some-novel-tag"], completedAt: iso(5) });
+		insertRecall(handle, { itemId: itemA, direction: "forward", verdict: "incorrect", errorTags: ["another-strange-one"], completedAt: iso(6) });
+		const profile = computeLearnerProfile(handle.db, NOW);
+		const focus = Object.fromEntries(profile.errorFocus.map((t) => [t.tag, t.count]));
+		assert.equal(focus.spelling, 2, "distinct items, not raw occurrences (itemA x3 retries count once)");
+		assert.equal(focus.other, 2);
+		assert.ok(!("Spelling" in focus) && !("typo" in focus), "no un-normalized tags survive");
 	} finally {
 		handle.close();
 	}

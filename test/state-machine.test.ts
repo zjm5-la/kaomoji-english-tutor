@@ -901,9 +901,9 @@ test("session B auto-refreshes when session A rates the shared card", { concurre
 		// Let B's poll observe the active card once so it can later detect changes.
 		await fake.firePoll();
 
-		// A rates Good, clearing the global slot.
+		// A rates Good, clearing the global slot. (Manual self-report schedules Hard per P0-2.)
 		await a.commands["kaomoji:good"].handler("", a.ctx);
-		assert.match(a.widget().join(" "), /记牢了/);
+		assert.match(a.widget().join(" "), /记了个大概/);
 
 		// B's poll notices the data_version change and drops the pending card.
 		await fake.firePoll();
@@ -1119,8 +1119,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const attemptCols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 9, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+			assert.deepEqual({ ...meta }, { schema_version: 10, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -1170,7 +1170,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 9);
+		assert.equal(meta.schema_version, 10);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -1212,7 +1212,7 @@ test("v7 restores fractional elapsed_days false-positive quarantines without los
 		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 9);
+		assert.equal(meta.schema_version, 10);
 		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
 		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1242,7 +1242,7 @@ test("v8 upgrades an existing v7 database and preserves directionless attempts",
 		const cols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((row) => row.name);
 		const attempt = db.prepare("SELECT verdict, direction FROM attempts WHERE id = 'legacy-attempt'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 9);
+		assert.equal(meta.schema_version, 10);
 		assert.ok(cols.includes("direction"), "direction migrated");
 		assert.deepEqual({ ...attempt }, { verdict: "correct", direction: null });
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1819,11 +1819,11 @@ test("mastery state tracks Good and Again evidence", { concurrency: false }, asy
 		db2.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
 		db2.close();
 		await fake.fire();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("dog", harness.ctx);
 		check = openTestDb();
 		m = check.prepare("SELECT stage, unassisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.equal(m.unassisted_good, 1, "Good clears the streak and counts one unassisted success");
+		assert.equal(m.unassisted_good, 1, "objective correct clears the streak and counts one unassisted success");
 		assert.equal(m.consecutive_again, 0, "Good resets consecutive Again");
 		assert.equal(m.stage, "recognition", "one Good promotes exposure -> recognition");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
@@ -1868,7 +1868,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 9, "schema migrated to v9");
+	assert.equal(meta.schema_version, 10, "schema migrated to v10");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -1884,11 +1884,11 @@ test("mastery stage promotes to controlled_recall after a second Good", { concur
 		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'recognition',1,0,?)").run(now);
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("deploy", harness.ctx);
 		const ck = openTestDb();
 		const m = ck.prepare("SELECT stage, unassisted_good FROM mastery_state WHERE item_id=1").get() as any;
 		ck.close();
-		assert.equal(m.stage, "controlled_recall", "second Good promotes recognition -> controlled_recall");
+		assert.equal(m.stage, "controlled_recall", "second objective correct promotes recognition -> controlled_recall");
 		assert.equal(m.unassisted_good, 2);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -1934,7 +1934,7 @@ test("persistent status stays compact while kaomoji:stats keeps detailed metrics
 		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));
 		// The profile/budget transparency line includes band, confidence, evidence counts, and the budget range.
 		assert.ok(harness.notifications().some((message) => /画像：句法 B1\(证据0,低\)/.test(message)), "stats shows syntax band with evidence");
-		assert.ok(harness.notifications().some((message) => /预算 12-18词\/拉伸/.test(message)), "stats shows the cold-start budget range");
+		assert.ok(harness.notifications().some((message) => /预算 12-18词\/巩固/.test(message)), "stats shows the conservative cold-start budget");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -2095,11 +2095,13 @@ test("claimDueItem blocks new cards once dailyNewLimit is reached", { concurrenc
 test("active recall: reverse direction asks for the Chinese meaning", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
-		Math.random = () => 1; // force reverse direction
 		const harness = await createHarness();
 		const db = openTestDb();
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','hello','你好',?,?,1)")
 			.run(new Date().toISOString(), new Date(0).toISOString());
+		// Direction comes from per-direction scheduling state: reverse is due, forward is not.
+		db.prepare("INSERT INTO direction_state(item_id,direction,fsrs_state,due_at,updated_at) VALUES(1,'forward','',?,?),(1,'reverse','',?,?)")
+			.run("2099-01-01T00:00:00.000Z", new Date().toISOString(), new Date(0).toISOString(), new Date().toISOString());
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /写出「hello」的中文释义/, "reverse front shows English, asks for Chinese");
@@ -2128,10 +2130,11 @@ test("active recall direction is shared across sessions and survives reattachmen
 		const db = openTestDb();
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','persist','持久化',?,?,1)")
 			.run(new Date().toISOString(), new Date(0).toISOString());
+		// Reverse direction is due; forward is not.
+		db.prepare("INSERT INTO direction_state(item_id,direction,fsrs_state,due_at,updated_at) VALUES(1,'forward','',?,?),(1,'reverse','',?,?)")
+			.run("2099-01-01T00:00:00.000Z", new Date().toISOString(), new Date(0).toISOString(), new Date().toISOString());
 		db.close();
-		Math.random = () => 1; // A claims a reverse card.
 		await fake.fire();
-		Math.random = () => 0; // Other sessions must not choose again.
 		await fake.fire();
 		assert.match(a.widget().join(" "), /写出「persist」的中文释义/);
 		assert.match(b.widget().join(" "), /写出「persist」的中文释义/);
@@ -2149,7 +2152,7 @@ test("active recall direction is shared across sessions and survives reattachmen
 	}
 });
 
-test("flip-assisted correct answer rates Good without unassisted mastery evidence", { concurrency: false }, async () => {
+test("flip-assisted correct answer schedules Again (a revealed answer is not recall evidence)", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -2165,11 +2168,11 @@ test("flip-assisted correct answer rates Good without unassisted mastery evidenc
 		const check = openTestDb();
 		const item = check.prepare("SELECT reviews FROM items WHERE id = 1").get() as any;
 		const attempt = check.prepare("SELECT assistance_level, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
-		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
+		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.equal(item.reviews, 1, "assisted correct answer still advances FSRS Good");
-		assert.deepEqual({ ...attempt }, { assistance_level: "revealed", explicit_rating: "good" });
-		assert.deepEqual({ ...mastery }, { stage: "controlled_recall", unassisted_good: 2, assisted_good: 1 });
+		assert.equal(item.reviews, 1, "the review still happened");
+		assert.deepEqual({ ...attempt }, { assistance_level: "revealed", explicit_rating: "again" }, "correct-after-reveal schedules Again (P0-2)");
+		assert.deepEqual({ ...mastery }, { stage: "recognition", unassisted_good: 0, assisted_good: 0, consecutive_again: 1 }, "a revealed answer produces no recall evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -2211,7 +2214,7 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		await inFlight;
 		const check = openTestDb();
 		const items = check.prepare("SELECT text, reviews FROM items ORDER BY id").all() as any[];
-		const attemptCount = (check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n;
+		const attemptCount = (check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE status = 'evaluated'").get() as any).n;
 		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id = 1").get() as any;
 		check.close();
 		assert.deepEqual(items.map((row) => ({ ...row })), [
@@ -2219,7 +2222,7 @@ test("stale async answer cannot record or rate the next global card", { concurre
 			{ text: "beta", reviews: 0 },
 		]);
 		assert.equal(active.active_item_id, 2, "beta remains the authoritative next card");
-		assert.equal(attemptCount, 0, "stale LLM result writes no attempt");
+		assert.equal(attemptCount, 0, "stale LLM result writes no evaluated attempt (B's manual self-report is recorded separately)");
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 	} finally {
@@ -2546,3 +2549,112 @@ test("word/phrase evaluator unavailable keeps card pending with zero writes", { 
 });
 
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));
+
+// -- P0-2 assistance-aware scheduling (harness level) ----------------------
+
+test("hint-assisted correct answer schedules Hard and says so", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','apple','苹果',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:hint"].handler("", harness.ctx);
+		await harness.commands["kaomoji:answer"].handler("apple", harness.ctx);
+		assert.match(harness.widget().join(" "), /记了个大概（用了提示，按困难安排）/);
+		const check = openTestDb();
+		const attempt = check.prepare("SELECT assistance_level, verdict, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
+		const mastery = check.prepare("SELECT unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
+		check.close();
+		assert.deepEqual({ ...attempt }, { assistance_level: "hint", verdict: "correct", explicit_rating: "hard" });
+		assert.deepEqual({ ...mastery }, { unassisted_good: 0, assisted_good: 1 }, "hint-correct is assisted evidence, never unassisted");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("manual /kaomoji:good is recorded as a conservative self-report, not objective evidence", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','banana','香蕉',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /自评兜底，按困难保守安排/);
+		const check = openTestDb();
+		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
+		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
+		check.close();
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写「香蕉」的英文" });
+		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 0 }, "self-report produces no objective evidence");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("word/phrase assistance persists across sessions (hint in A, answered in B still caps Hard)", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const a = await makeSession({ sessionId: "assist-a" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','cherry','樱桃',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		await a.commands["kaomoji:hint"].handler("", a.ctx);
+		// B attaches after the hint: it must still see assistance=hint.
+		const b = await makeSession({ sessionId: "assist-b" });
+		await b.commands["kaomoji:answer"].handler("cherry", b.ctx);
+		const check = openTestDb();
+		const attempt = check.prepare("SELECT assistance_level, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
+		check.close();
+		assert.deepEqual({ ...attempt }, { assistance_level: "hint", explicit_rating: "hard" }, "assistance survived reattachment and capped the rating");
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+// -- P0-1 direction-independent scheduling (harness level) -----------------
+
+test("after a forward Again, a due reverse surfaces in reverse direction", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','grape','葡萄',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /默写「葡萄」的英文/, "first surfacing defaults to forward production");
+		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		// Forward was just rated (due soon); simulate time passing so only the
+		// reverse direction is due, and the item itself is due again.
+		const db2 = openTestDb();
+		db2.prepare("UPDATE direction_state SET due_at = ? WHERE item_id = 1 AND direction = 'forward'").run("2099-01-01T00:00:00.000Z");
+		db2.prepare("UPDATE direction_state SET due_at = ? WHERE item_id = 1 AND direction = 'reverse'").run(new Date(0).toISOString());
+		db2.prepare("UPDATE items SET due_at = ? WHERE id = 1").run(new Date(0).toISOString());
+		db2.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
+		db2.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /写出「grape」的中文释义/, "the due reverse direction surfaces, not a random one");
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_direction FROM runtime_state WHERE id = 1").get() as any;
+		const dirs = check.prepare("SELECT direction, fsrs_state FROM direction_state WHERE item_id = 1 ORDER BY direction").all() as any[];
+		check.close();
+		assert.equal(state.active_direction, "reverse");
+		assert.ok(dirs.every((d) => typeof d.fsrs_state === "string"), "both direction rows exist after the first rating");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});

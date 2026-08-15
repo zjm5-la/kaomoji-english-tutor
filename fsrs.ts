@@ -1,10 +1,33 @@
 import { FSRS, Rating, Card, State } from "fsrs.js";
 import type { DatabaseSync } from "node:sqlite";
-import { EMPTY_SENTENCE_CYCLE, getRuntimeState, setRuntimeState } from "./runtime-state.ts";
+import { EMPTY_SENTENCE_CYCLE, getRuntimeState, setRuntimeState, type AssistanceLevel } from "./runtime-state.ts";
 
 // -- FSRS scheduling ------------------------------------------------------
 
 const scheduler = new FSRS();
+
+/**
+ * Assistance-aware scheduling policy for word/phrase recall (P0-2).
+ * Objective evidence ranks above self-report; assistance caps the rating:
+ * - unassisted objective correct -> Good (miss stays Again)
+ * - hint + correct -> at most Hard
+ * - revealed/flipped + correct -> Again
+ * - manual /kaomoji:good without an objective answer -> at most Hard
+ *   (self-report is recorded separately and never counts as unassisted evidence)
+ * Sentence cards do not use this policy; their stricter cycle logic is unchanged.
+ */
+export function effectiveRecallRating(args: {
+	rating: Rating;
+	assistance: AssistanceLevel;
+	manual: boolean;
+}): Rating {
+	const { rating, assistance, manual } = args;
+	if (rating !== Rating.Good) return rating;
+	if (assistance === "revealed") return Rating.Again;
+	if (assistance === "hint") return Rating.Hard;
+	if (manual) return Rating.Hard;
+	return Rating.Good;
+}
 
 /** Rebuild a Card from its stored JSON state (dates come back as strings).
  * Empty state is a valid new Card; non-empty malformed state is corruption. */
