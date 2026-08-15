@@ -441,3 +441,86 @@ export function formatProfileStatsLine(profile: LearnerProfile, budget: Difficul
 		`预算 ${budget.wordRange[0]}-${budget.wordRange[1]}词/${rampLabel(budget.ramp)}`,
 	].join(" · ");
 }
+
+// -- Recent attempt log (question snapshot + answer + verdict) ------------
+//
+// Per-attempt audit trail persisted since schema v9 (attempts.question_text).
+// Lesson generation injects a bounded, formatted slice of this log so the
+// generator sees what was actually asked, how the learner answered, and how
+// the evaluator ruled — including rulings whose feedback points at the
+// question design itself.
+
+export interface AttemptLogEntry {
+	kind: string;
+	direction: "forward" | "reverse" | null;
+	question: string | null;
+	answer: string | null;
+	verdict: string;
+	feedback: string;
+	completedAt: string;
+}
+
+/** Most recent evaluated attempts with question snapshots, newest first. */
+export function recentAttemptLog(db: DatabaseSync, limit = 12): AttemptLogEntry[] {
+	const rows = db
+		.prepare(
+			"SELECT kind, direction, question_text, answer_text, verdict, feedback_json, completed_at FROM attempts " +
+				"WHERE status = 'evaluated' AND verdict IN ('correct','partial','incorrect') AND completed_at IS NOT NULL " +
+				"ORDER BY completed_at DESC, rowid DESC LIMIT ?",
+		)
+		.all(limit) as unknown as {
+			kind: string;
+			direction: string | null;
+			question_text: string | null;
+			answer_text: string | null;
+			verdict: string;
+			feedback_json: string | null;
+			completed_at: string;
+		}[];
+	return rows.map((row) => {
+		let feedback = "";
+		if (row.feedback_json) {
+			try {
+				const parsed = JSON.parse(row.feedback_json) as { feedback?: unknown };
+				if (typeof parsed.feedback === "string") feedback = parsed.feedback;
+			} catch {
+				/* keep feedback empty on corrupt JSON */
+			}
+		}
+		return {
+			kind: row.kind,
+			direction: row.direction === "reverse" ? "reverse" : row.direction === "forward" ? "forward" : null,
+			question: row.question_text,
+			answer: row.answer_text,
+			verdict: row.verdict,
+			feedback,
+			completedAt: row.completed_at,
+		};
+	});
+}
+
+/** Compact prompt block for lesson generation: recent questions, answers, verdicts. */
+export function formatAttemptLogBlock(entries: AttemptLogEntry[]): string {
+	if (!entries.length) return "（暂无作答记录）";
+	const clip = (value: string | null, max = 60): string => {
+		if (!value) return "（空）";
+		const flat = value.replace(/\s+/g, " ").trim();
+		return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
+	};
+	const kindLabel = (entry: AttemptLogEntry): string => {
+		if (entry.kind === "recall") {
+			return entry.direction === "reverse" ? "英→中回忆" : entry.direction === "forward" ? "中→英回忆" : "回忆";
+		}
+		if (entry.kind === "sentence_cloze") return "句子填空";
+		if (entry.kind === "sentence_production") return "句子输出";
+		return entry.kind;
+	};
+	const verdictLabel = (verdict: string): string =>
+		verdict === "correct" ? "对" : verdict === "partial" ? "半对" : "错";
+	return entries
+		.map((entry) => {
+			const feedback = entry.feedback ? ` | 反馈:${clip(entry.feedback, 50)}` : "";
+			return `- [${kindLabel(entry)}] 题:${clip(entry.question)} | 答:${clip(entry.answer, 40)} | 判:${verdictLabel(entry.verdict)}${feedback}`;
+		})
+		.join("\n");
+}

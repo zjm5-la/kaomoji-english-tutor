@@ -13,9 +13,9 @@ import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, 
 import { quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
-import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, renderCard, sentenceExercise, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
+import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
-import { computeLearnerProfile, deriveBudget, formatProfileStatsLine, type AdaptiveContext } from "./learner-profile.ts";
+import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, type AdaptiveContext } from "./learner-profile.ts";
 
 export { contentFingerprint };
 
@@ -695,6 +695,7 @@ export default function kaomojiEnglishTutorExtension(
 			reviewCycleId: state.active_review_cycle_id,
 			exerciseId: state.active_exercise_id,
 			kind: exercise.kind,
+			questionText: sentenceQuestionText(exercise),
 		};
 		startAnswerThinking(ctx, attemptBase.sessionGeneration);
 		let result: SentenceEvaluation;
@@ -774,6 +775,7 @@ export default function kaomojiEnglishTutorExtension(
 			answerText: text,
 			assistanceLevel: pendingAssistance,
 			startedAt: new Date().toISOString(),
+			questionText: recallQuestionText(item, state.active_direction),
 		};
 		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
 		const target = attemptBase.direction === "reverse" ? item.meaning : item.text;
@@ -1017,13 +1019,15 @@ export default function kaomojiEnglishTutorExtension(
 						"UPDATE attempts SET explicit_rating = 'again', rated_at = ? WHERE id = (SELECT id FROM attempts WHERE review_cycle_id = ? AND explicit_rating IS NULL ORDER BY completed_at DESC, id DESC LIMIT 1)",
 					).run(now.toISOString(), cur.active_review_cycle_id);
 					if (Number(linked.changes) === 0) {
+						const selfReportExercise = sentenceExercise(item);
 						db.prepare(
-							"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, assistance_level, status, explicit_rating, started_at, completed_at, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'sentence_self_report', 'forward', ?, 'self_report', 'again', ?, ?, ?)",
+							"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, assistance_level, status, explicit_rating, started_at, completed_at, rated_at, question_text) VALUES (?, ?, ?, ?, ?, ?, ?, 'sentence_self_report', 'forward', ?, 'self_report', 'again', ?, ?, ?, ?)",
 						).run(
 							randomUUID(), item.id, cur.active_exercise_id, cur.active_review_cycle_id,
 							"sentence_self_report:" + cur.active_review_cycle_id + ":" + expectedVersion,
 							expectedVersion, expectedVersion, cur.active_assistance_level,
 							now.toISOString(), now.toISOString(), now.toISOString(),
+							selfReportExercise ? sentenceQuestionText(selfReportExercise) : null,
 						);
 					}
 				}
@@ -1211,6 +1215,7 @@ export default function kaomojiEnglishTutorExtension(
 			const profile = computeLearnerProfile(db, new Date());
 			return { profile, budget: deriveBudget(profile) };
 		})();
+		const replacementRecentLog = formatAttemptLogBlock(recentAttemptLog(db));
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
@@ -1221,7 +1226,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (!effectiveResolved) throw new Error("NO_MODEL");
 			let decision: ReplacementDecision;
 			try {
-				decision = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped, adaptive);
+				decision = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped, adaptive, replacementRecentLog);
 			} catch (err) {
 				if (!effectiveResolved.fromSession && ctx.model &&
 					(ctx.model.provider !== effectiveResolved.provider || ctx.model.id !== effectiveResolved.model)) {
@@ -1236,6 +1241,7 @@ export default function kaomojiEnglishTutorExtension(
 						config,
 						skipped,
 						adaptive,
+						replacementRecentLog,
 					);
 				} else {
 					throw err;
@@ -1444,6 +1450,7 @@ export default function kaomojiEnglishTutorExtension(
 			const profile = computeLearnerProfile(db, new Date());
 			return { profile, budget: deriveBudget(profile) };
 		})() : null;
+		const recentLog = db ? formatAttemptLogBlock(recentAttemptLog(db)) : undefined;
 
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
@@ -1455,7 +1462,7 @@ export default function kaomojiEnglishTutorExtension(
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined);
+				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
 				if (!effectiveResolved.fromSession && ctx.model &&
@@ -1465,7 +1472,7 @@ export default function kaomojiEnglishTutorExtension(
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined);
+					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog);
 					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
 				} else {
@@ -1490,7 +1497,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
 			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
-				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined);
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;

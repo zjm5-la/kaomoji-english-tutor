@@ -23,7 +23,8 @@
 - **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具。生成内容和补卡只有通过独立 critic 才会写入
 - **渐进句子输出**：同一张句子卡从 L1 单词填空 → L2 主干英文 → L3 完整自然表达；每级都用 `/kaomoji:answer` 真正输入英文，标准句只是参考，不要求逐字复刻
 - **遗忘曲线复习**：学习项用 [FSRS](https://github.com/open-spaced-repetition/fsrs.js)（Anki 同源算法）调度；单词/词组答对自动 Good、答错或部分正确自动 Again，模型暂时无法可靠判断时不记录成绩。句子在纠错后完成本轮，但按第一次回忆表现提交一次 Good/Again；损坏的 FSRS 数据会保留原文并隔离，不会静默重置
-- **卡片交互**：单词/词组复习随机进行中→英或英→中回忆；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度
+- **出题日志**：每次作答把题目快照、答案、判定与反馈写入 attempts 表，争议可审计；备课/补卡时注入最近作答记录，作为把握学生近况与避免争议出题的依据。释义字段只保留可回忆的最小释义，作用说明放例句，critic 发现混入直接打回
+- **卡片交互**：单词/词组复习随机进行中→英或英→中回忆；英→中识别方向接受同义表达与语体差异（如“已”与“已经”），中→英默写保持拼写严格；句子答案由本地精确匹配或隔离 SDK LLM 按语义、语法和搭配评价。句子写错会停留原级、给最小修正并要求立即重写；提示/翻面会使本轮最终按 Again 调度
 - **精简状态**：常驻 widget 只显示连续学习天数和今日剩余卡片；掌握阶段、强化需求和正确率通过 `/kaomoji:stats` 查看
 - **持久化**：学习记录、句子输出 cycle、重试和辅助状态存在 SQLite（`~/.pi/agent/kaomoji-english-tutor.db`，WAL 模式），跨会话累积；每天新学上限 3 个（可配置）
 - **多会话一致**：并行运行多个 Pi 会话时共享同一张当前卡；句子级别、纠错、提示、翻面及首次回忆结果也会跨会话/reload 恢复，任一会话提交后其他会话自动同步
@@ -74,7 +75,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
   "thinkingLevel": "medium",
   "intervalMinutes": 10,
   "dailyNewLimit": 3,
-  "maxTokens": 900,
+  "maxTokens": 4096,
   "showWidget": true,
   "verbose": false
 }
@@ -87,7 +88,7 @@ pi install git:github.com/zjm5-la/kaomoji-english-tutor
 | `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `intervalMinutes` | `10` | 无现成队列卡时的自动检查/备课间隔（分钟）；设为 `0` 可关闭；现成队列卡之间不等待 |
 | `dailyNewLimit` | `3` | 每天首次展示的计划新卡上限；`0` 为不限，Skip 补卡不占额度 |
-| `maxTokens` | `900` | 备课 LLM 响应的最大 token 数 |
+| `maxTokens` | `4096` | 备课 LLM 响应的最大 token 数（须覆盖模型的隐藏推理开销） |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
@@ -113,7 +114,8 @@ A kaomoji pet that lives in a widget below the editor, prepares lessons from you
 - **Unified Pi SDK transport**: lesson generation, independent critique, revision, replacements, sentence-data completion, and answer evaluation all run through isolated in-memory Pi SDK sessions with no discovered extensions, skills, project context, or file tools. Lessons and replacements are inserted only after independent critic approval
 - **Progressive sentence output**: one sentence moves from an L1 word cloze to L2 core-clause writing and L3 natural full-sentence production; every level requires `/kaomoji:answer`, and the reference is not treated as the only valid wording
 - **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase answers auto-rate when evaluation is reliable; unavailable evaluation writes no score. A sentence allows corrective retries but commits one Good/Again based on the first-recall path; corrupt FSRS state is preserved and quarantined instead of silently reset
-- **Card interaction**: word/phrase direction is randomized Chinese→English or English→Chinese. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again
+- **Question log**: every attempt persists the question snapshot, answer, verdict, and feedback in the attempts table, so disputes are auditable; recent attempts are injected into lesson/replacement generation as evidence of learner state and past question-design issues. Meaning fields keep only the minimal recallable translation — usage notes belong to examples, and the critic rejects violations
+- **Card interaction**: word/phrase direction is randomized Chinese→English or English→Chinese; Chinese-meaning recall accepts synonymous and register variants (e.g. 已 vs 已经) while English production stays spelling-strict. Sentence output is checked locally when exact or semantically by the isolated SDK LLM; misses receive one minimal correction and remain on the same level for immediate rewriting. Hint/flip makes the sentence cycle Again
 - **Compact status**: the persistent widget only shows learning streak and cards remaining today; `/kaomoji:stats` keeps mastery, reinforcement, and accuracy details
 - **Persistent**: learning history, sentence cycles, retries, and assistance live in SQLite (`~/.pi/agent/kaomoji-english-tutor.db`, WAL mode); daily new-item cap defaults to 3
 - **Multi-session consistency**: concurrent Pi sessions share one current card; sentence level, correction, hint/reveal state, and first-recall outcome survive session changes/reload and synchronize automatically
@@ -164,7 +166,7 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `intervalMinutes` | `10` | Background check/lesson interval when no stored card is ready; `0` disables it; ready queued cards have no inter-card wait |
 | `dailyNewLimit` | `3` | Planned cards first shown per day; `0` is unlimited and Skip replacements are quota-free |
-| `maxTokens` | `900` | Max tokens for lesson generation |
+| `maxTokens` | `4096` | Max tokens for lesson generation (must cover the model's hidden reasoning) |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 

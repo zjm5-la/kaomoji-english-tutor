@@ -23,7 +23,7 @@ export interface PetConfig {
 export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
 	dailyNewLimit: 3,
-	maxTokens: 900,
+	maxTokens: 4096,
 	showWidget: true,
 	verbose: false,
 };

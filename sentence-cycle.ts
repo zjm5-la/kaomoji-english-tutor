@@ -42,12 +42,13 @@ export function insertEvaluatedAttempt(
 		? JSON.stringify({ feedback: attempt.feedback, correctedAnswer: attempt.correctedAnswer })
 		: null;
 	db.prepare(
-		"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, answer_text, assistance_level, status, verdict, error_tags_json, feedback_json, explicit_rating, started_at, completed_at, rated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"INSERT INTO attempts (id, item_id, exercise_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, direction, answer_text, assistance_level, status, verdict, error_tags_json, feedback_json, explicit_rating, started_at, completed_at, rated_at, question_text) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 	).run(
 		randomUUID(), attempt.itemId, attempt.exerciseId ?? null, reviewCycleId, claimKey,
 		attempt.version, attempt.version, kind, attempt.direction, attempt.answerText, attempt.assistanceLevel,
 		"evaluated", attempt.verdict, attempt.errorTags?.length ? JSON.stringify(attempt.errorTags) : null,
 		feedback, explicitRating, attempt.startedAt, now.toISOString(), explicitRating ? now.toISOString() : null,
+		attempt.questionText ?? null,
 	);
 }
 

@@ -22,6 +22,7 @@ export interface PendingAttempt {
 	kind?: string;
 	errorTags?: string[];
 	correctedAnswer?: string;
+	questionText?: string;
 }
 
 export interface RuntimeState {

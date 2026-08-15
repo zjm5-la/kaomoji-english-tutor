@@ -167,6 +167,20 @@ export function sentenceExercise(item: ItemRow, requestedLevel = item.progress):
 	};
 }
 
+/** Canonical recall question text — single source for card display and attempt logs. */
+export function recallQuestionText(item: ItemRow, direction: "forward" | "reverse"): string {
+	return direction === "reverse"
+		? `写出「${item.text}」的中文释义`
+		: `默写「${item.meaning}」的英文`;
+}
+
+/** Canonical sentence-level question text for attempt logs. */
+export function sentenceQuestionText(exercise: SentenceExerciseView): string {
+	return exercise.kind === "sentence_cloze"
+		? `L${exercise.level + 1} 填空：${exercise.cloze}`
+		: `L${exercise.level + 1} 中文：${exercise.chinese}`;
+}
+
 /** Render a teach/review card as widget lines (front = question, back = answer). */
 export function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward"): string[] {
 	const label = TYPE_LABELS[item.type] ?? item.type;
@@ -199,10 +213,8 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 		if (showAnswer) {
 			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 			lines.push(`  第 ${item.reviews + 1} 次复习`);
-		} else if (direction === "reverse") {
-			lines.push(`${face} 复习时间到：✍️ 写出「${item.text}」的中文释义`);
 		} else {
-			lines.push(`${face} 复习时间到：✍️ 默写「${item.meaning}」的英文`);
+			lines.push(`${face} 复习时间到：✍️ ${recallQuestionText(item, direction)}`);
 		}
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);

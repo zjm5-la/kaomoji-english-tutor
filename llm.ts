@@ -133,6 +133,7 @@ export async function generateLesson(
 	config: PetConfig,
 	feedback?: CritiqueIssue[],
 	adaptive?: AdaptiveContext,
+	recentLog?: string,
 ): Promise<LessonDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
@@ -156,12 +157,17 @@ export async function generateLesson(
 		`- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（生词，数量不超过 ${budget.maxKeyWords} 个）`,
 		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
 		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
+		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）",
 		"- 只输出 JSON，不要任何其他文字：",
 		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
 			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
 				...feedback.map((i) => `- [${i.severity}] ${i.category}: ${i.description}`)]
+			: []),
+		...(recentLog
+			? ["", "最近出题与作答记录（新→旧，含题目快照与判定反馈）：", recentLog,
+				"参考记录：学生近期答错的内容可换角度复现巩固；若反馈指向出题方式本身（如释义混入补充说明），避免同类出题。"]
 			: []),
 		"",
 		formatAdaptiveBlock(ctxAdaptive.profile, budget),
@@ -288,6 +294,7 @@ export async function critiqueLesson(
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
 		"- 中文释义准确，不得机翻味",
+		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），违反记 blocker",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}、生词≤${budget.maxKeyWords}、句法结构遵循 difficulty_budget）；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致`,
 		"- 单词必须自然出现在句子中",
@@ -304,7 +311,7 @@ export async function critiqueLesson(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语教学内容审查员，只输出 JSON。",
 			prompt,
-			maxTokens: 450,
+			maxTokens: 2048,
 			thinkingLevel: config.thinkingLevel,
 		});
 	} catch {
@@ -346,6 +353,21 @@ export async function evaluateAttempt(
 	const isReverse = direction === "reverse";
 	const target = isReverse ? item.meaning : item.text;
 	const answerLang = isReverse ? "中文" : "英文";
+	// Direction-aware rubric: reverse (EN→CN) tests recognition, so any
+	// semantically correct Chinese rendering counts (synonym/register variants
+	// included); forward (CN→EN) tests production of the exact English item,
+	// so spelling stays strict.
+	const rubric = isReverse
+		? [
+			"- correct: 中文意思与目标释义一致即可；同义表达、简写/全称、语体差异（如“已”与“已经”）都算对，措辞不必逐字相同",
+			"- partial: 意思基本正确，但有明显遗漏或偏差（如漏掉释义的一半）",
+			"- incorrect: 意思错误、空白、语言错误或无法识别",
+		]
+		: [
+			"- correct: 英文与目标完全一致，或仅大小写/标点/多余空格差异",
+			"- partial: 英文有小错（拼写/字形），但明显是想写这个目标词",
+			"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
+		];
 	const prompt = [
 		`你是英语导师。学生看到${isReverse ? "英文" : "中文"}要写出对应的${answerLang}。`,
 		`目标：${target}`,
@@ -353,16 +375,14 @@ export async function evaluateAttempt(
 		"判断学生的答案，只输出 JSON：",
 		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
 		`- 学生必须用${answerLang}作答；写错语言一律 incorrect`,
-		`- correct: ${answerLang}与目标完全一致，或仅大小写/标点/多余空格差异`,
-		`- partial: ${answerLang}有小错（拼写/近义/字形），但明显是想表达这个意思`,
-		"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
+		...rubric,
 	].join("\n");
 	let text: string;
 	try {
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
 			prompt,
-			maxTokens: 200,
+			maxTokens: 1024,
 		});
 	} catch {
 		return unavailable();
@@ -440,7 +460,7 @@ export async function evaluateSentenceAttempt(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语输出评价员，只输出严格 JSON。",
 			prompt,
-			maxTokens: 350,
+			maxTokens: 1536,
 		});
 	} catch {
 		return unavailable();
@@ -474,6 +494,7 @@ export async function generateReplacement(
 	config: PetConfig,
 	skipped: ItemRow,
 	adaptive?: AdaptiveContext,
+	recentLog?: string,
 ): Promise<ReplacementDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
@@ -488,8 +509,11 @@ export async function generateReplacement(
 		`{"ready":true,"item":${itemSchema}}`,
 		skipped.type === "sentence"
 			? `句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，遵循预算的句法约束；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文；生词不超过 ${budget.maxKeyWords} 个。`
-			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算。",
+			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），用途/效果说明放 example/example_cn，不得混入 meaning。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
+		...(recentLog
+			? ["", "最近出题与作答记录（新→旧）：", recentLog, "避免重复近期刚练过的内容；若反馈指向出题缺陷，避免同类出题。"]
+			: []),
 		"",
 		formatAdaptiveBlock(ctxAdaptive.profile, budget),
 		"",
@@ -500,7 +524,7 @@ export async function generateReplacement(
 	const text = await llm.complete(ctx, resolved, {
 		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
 		prompt,
-		maxTokens: skipped.type === "sentence" ? config.maxTokens : 450,
+		maxTokens: skipped.type === "sentence" ? config.maxTokens : 2048,
 		thinkingLevel: config.thinkingLevel,
 	});
 	const json = extractJsonObjectText(text);
@@ -549,7 +573,7 @@ async function completeSentenceData(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语学习卡生成器，只输出 JSON。",
 			prompt,
-			maxTokens: 500,
+			maxTokens: 2048,
 			thinkingLevel: config.thinkingLevel,
 		});
 	} catch {

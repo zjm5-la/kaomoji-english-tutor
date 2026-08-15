@@ -8,11 +8,15 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PiSdkLlmClient } from "../pi-sdk-llm.ts";
 import type { PetConfig } from "../config.ts";
 import { openDb } from "../db.ts";
-import { critiqueLesson, generateLesson, generateReplacement, type GeneratedItem } from "../llm.ts";
+import { insertEvaluatedAttempt } from "../sentence-cycle.ts";
+import type { PendingAttempt } from "../runtime-state.ts";
+import { critiqueLesson, evaluateAttempt, generateLesson, generateReplacement, type GeneratedItem } from "../llm.ts";
 import {
 	coldStartProfile,
 	computeLearnerProfile,
 	deriveBudget,
+	formatAttemptLogBlock,
+	recentAttemptLog,
 	type AdaptiveContext,
 } from "../learner-profile.ts";
 
@@ -579,4 +583,120 @@ test("generateReplacement prompt injects the profile + budget block", async () =
 	assert.match(captured, /difficulty_budget/);
 	assert.match(captured, /12-18/, "B1 budget word range reaches the replacement prompt");
 	assert.doesNotMatch(captured, /中级学习者/);
+});
+
+// -- Attempt question-snapshot log (备课依据) -------------------------------
+
+test("evaluated attempts persist the question snapshot and feed the lesson-prep block", () => {
+	const handle = freshDb();
+	try {
+		const itemId = insertWord(handle, "reload");
+		const attempt: PendingAttempt = {
+			itemId,
+			version: 315,
+			direction: "reverse",
+			sessionGeneration: 1,
+			answerText: "重新加载",
+			assistanceLevel: "none",
+			startedAt: iso(),
+			verdict: "incorrect",
+			feedback: "只写了“重新加载”，漏写了目标中的“使新改动生效”。",
+			questionText: "写出「reload」的中文释义",
+		};
+		insertEvaluatedAttempt(handle.db, attempt, "again", NOW);
+		const log = recentAttemptLog(handle.db);
+		assert.equal(log.length, 1);
+		assert.equal(log[0].question, "写出「reload」的中文释义");
+		assert.equal(log[0].answer, "重新加载");
+		assert.equal(log[0].verdict, "incorrect");
+		assert.equal(log[0].direction, "reverse");
+		assert.match(log[0].feedback, /使新改动生效/);
+		const block = formatAttemptLogBlock(log);
+		assert.match(block, /英→中回忆/);
+		assert.match(block, /题:写出「reload」的中文释义/);
+		assert.match(block, /答:重新加载/);
+		assert.match(block, /判:错/);
+		assert.match(block, /反馈:/);
+	} finally {
+		handle.close();
+	}
+});
+
+test("attempt log excludes non-evaluated rows, orders newest first, tolerates legacy NULL snapshot", () => {
+	const handle = freshDb();
+	try {
+		const itemId = insertWord(handle);
+		insertRecall(handle, { itemId, direction: "forward", verdict: "correct", completedAt: iso(1000) });
+		insertRecall(handle, { itemId, direction: "reverse", verdict: "incorrect", completedAt: iso(2000) });
+		// In-flight row without a verdict must not leak into the log.
+		handle.db.prepare(
+			"INSERT INTO attempts (id, item_id, review_cycle_id, claim_key, question_version, evaluation_version, kind, assistance_level, status, started_at) VALUES (?, ?, ?, ?, 1, 1, 'recall', 'none', 'evaluating', ?)",
+		).run(randomUUID(), itemId, randomUUID(), randomUUID(), iso(3000));
+		const log = recentAttemptLog(handle.db);
+		assert.equal(log.length, 2);
+		assert.equal(log[0].verdict, "incorrect");
+		assert.equal(log[1].verdict, "correct");
+		assert.equal(log[0].question, null);
+		assert.match(formatAttemptLogBlock(log), /（空）/);
+	} finally {
+		handle.close();
+	}
+});
+
+test("generateLesson prompt carries the recent attempt log and the minimal-meaning rule", async () => {
+	let captured = "";
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured = request.prompt; return JSON.stringify({ ready: false, reason: "test" }); },
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const recentLog = "- [英→中回忆] 题:写出「reload」的中文释义 | 答:重新加载 | 判:错 | 反馈:漏写补充说明";
+	await generateLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "a real conversation with english", [], FAKE_CONFIG, undefined, adaptive, recentLog);
+	assert.match(captured, /最近出题与作答记录/);
+	assert.match(captured, /写出「reload」的中文释义/);
+	assert.match(captured, /最小中文释义/);
+});
+
+test("generateReplacement prompt carries the recent attempt log and the minimal-meaning rule", async () => {
+	let captured = "";
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured = request.prompt; return JSON.stringify({ ready: false, reason: "test" }); },
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const skipped = { type: "word", text: "reload", meaning: "重新加载" } as unknown as import("../db.ts").ItemRow;
+	await generateReplacement(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "conversation", [], FAKE_CONFIG, skipped, adaptive, "- [英→中回忆] 题:x | 答:y | 判:对");
+	assert.match(captured, /最近出题与作答记录/);
+	assert.match(captured, /最小中文释义/);
+});
+
+test("critic prompt includes the minimal-meaning blocker rule", async () => {
+	let captured = "";
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured = request.prompt; return JSON.stringify({ pass: true, issues: [], summary: "ok" }); },
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	// A word item skips the sentence-only deterministic gate and reaches the LLM call.
+	const word: GeneratedItem = { type: "word", text: "reload", meaning: "重新加载", example: "Reload the extension.", example_cn: "重新加载扩展。" };
+	const verdict = await critiqueLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, { topic: "t", items: [word] }, [], FAKE_CONFIG, adaptive);
+	assert.equal(verdict.pass, true);
+	assert.match(captured, /最小释义/);
+});
+
+test("answer-evaluation rubric is direction-aware: reverse accepts synonyms, forward stays strict", async () => {
+	const captured: string[] = [];
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured.push(request.prompt); return JSON.stringify({ verdict: "correct", feedback: "" }); },
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const item = { text: "filled", meaning: "（订单）已成交的" } as unknown as import("../db.ts").ItemRow;
+	const resolved = { provider: "p", model: "m" };
+	await evaluateAttempt(llm, FAKE_CTX, item, "已经成交的", resolved, "reverse");
+	await evaluateAttempt(llm, FAKE_CTX, item, "filled", resolved, "forward");
+	assert.match(captured[0], /同义表达/);
+	assert.match(captured[0], /语体差异/);
+	assert.doesNotMatch(captured[0], /完全一致/);
+	assert.match(captured[1], /完全一致/);
+	assert.doesNotMatch(captured[1], /语体差异/);
 });
