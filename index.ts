@@ -8,7 +8,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, enqueueReplacement, getDueItem, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
@@ -1193,16 +1193,19 @@ export default function kaomojiEnglishTutorExtension(
 		const skipped = skippedItem ?? latestMasteredItem(db, type);
 		if (!skipped) {
 			updateWidget(ctx, FACES.error, ["待补卡片缺少来源记录，请保留队列并稍后重试。", statsLine(db)]);
+			logGenStatus("replacement_no_source");
 			return false;
 		}
 		const conversation = buildConversation(ctx.sessionManager.getBranch());
 		if (!conversation.trim()) {
 			updateWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
+			logGenStatus("replacement_empty_conversation");
 			return false;
 		}
 		const rejectionKey = `${type}\n${conversation}`;
 		if (rejectionKey === lastRejectedReplacementKey) {
 			updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+			logGenStatus("replacement_cached_rejection");
 			return false;
 		}
 		const generationToken = claimGeneration();
@@ -1253,6 +1256,7 @@ export default function kaomojiEnglishTutorExtension(
 			if (!decision.ready) {
 				lastRejectedReplacementKey = rejectionKey;
 				updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+				logGenStatus(`replacement_not_ready: ${decision.reason || ""}`);
 				if (config.verbose && decision.reason) ctx.ui.notify(`暂不补卡：${decision.reason}`, "info");
 				return false;
 			}
@@ -1269,6 +1273,7 @@ export default function kaomojiEnglishTutorExtension(
 					replacementVerdict.available ? "补充卡内容质量未达标，保留队列稍后再试…" : "补充卡审查暂时不可用，保留队列稍后重试…",
 					statsLine(db),
 				]);
+				logGenStatus(`${replacementVerdict.available ? "replacement_critic_rejected" : "replacement_critic_unavailable"}: ${replacementVerdict.summary || ""}`);
 				if (config.verbose) ctx.ui.notify(`补充卡被审查拒绝：${replacementVerdict.summary}`, "info");
 				return false;
 			}
@@ -1282,6 +1287,7 @@ export default function kaomojiEnglishTutorExtension(
 				const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString());
 				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== type || dueReview) {
 					db.exec("ROLLBACK");
+					logGenStatus("replacement_insert_deferred");
 					return false;
 				}
 				const dupFp = contentFingerprint(item.type, item.text, item.meaning);
@@ -1323,10 +1329,12 @@ export default function kaomojiEnglishTutorExtension(
 			if (duplicate) {
 				lastRejectedReplacementKey = rejectionKey;
 				updateWidget(ctx, FACES.idle, ["模型给出了重复内容，等话题变化后再补卡…", statsLine(db)]);
+				logGenStatus("replacement_duplicate");
 				return false;
 			}
 			lastRejectedReplacementKey = "";
 			if (!inserted) return false;
+			logGenStatus(`replacement_ok: ${type} ${item.text}`);
 			showItem(ctx, inserted);
 			if (config.verbose) ctx.ui.notify(`已补充 ${TYPE_LABELS[type]}：${item.text}`, "info");
 			return true;
@@ -1335,6 +1343,7 @@ export default function kaomojiEnglishTutorExtension(
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
 			if (db && !isCtxStale(ctx)) updateWidget(ctx, FACES.error, [`补卡失败：${lastError}`, statsLine(db)]);
+			logGenStatus(`replacement_error: ${lastError}`);
 			return false;
 		} finally {
 			if (db) releaseGeneration(generationToken);
@@ -1416,7 +1425,10 @@ export default function kaomojiEnglishTutorExtension(
 	}
 
 	function logGenStatus(status: string) {
-		if (db) setStat(db, "last_gen_status", status.slice(0, 200));
+		if (!db) return;
+		setStat(db, "last_gen_status", status.slice(0, 200));
+		// Progress markers are not decisions; the ring log records outcomes only.
+		if (!status.startsWith("model:")) appendGenLog(db, status);
 	}
 	function deferPacing() {
 		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.max(1, config.intervalMinutes) * 60_000).toISOString() });
@@ -1529,6 +1541,7 @@ export default function kaomojiEnglishTutorExtension(
 					pendingReplacementTypes(db).length > 0 ||
 					getDueItem(db, insertedAt)) {
 					db.exec("ROLLBACK");
+					logGenStatus("insert_deferred");
 					return;
 				}
 				// Reject the whole batch if any item duplicates an existing canonical item.
@@ -1536,6 +1549,7 @@ export default function kaomojiEnglishTutorExtension(
 					const fp = contentFingerprint(it.type, it.text, it.meaning);
 					if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fp)) {
 						db.exec("ROLLBACK");
+						logGenStatus(`duplicate_batch: ${it.type} ${it.text}`);
 						return;
 					}
 				}
@@ -1867,6 +1881,15 @@ export default function kaomojiEnglishTutorExtension(
 			ctx.ui.notify(`掌握阶段：${stageLine}；需强化：${reinforce}；答题 ${attempts} 次，正确率 ${rate}%`, "info");
 			const profile = computeLearnerProfile(db, new Date());
 			ctx.ui.notify(formatProfileStatsLine(profile, deriveBudget(profile)), "info");
+			const genEvents = getGenLog(db).slice(-3);
+			if (genEvents.length) {
+				const fmt = (t: string) => {
+					const d = new Date(t);
+					const pad = (n: number) => String(n).padStart(2, "0");
+					return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+				};
+				ctx.ui.notify(`最近备课决策：${genEvents.map((e) => `${fmt(e.t)} ${e.s}`).join("；")}`, "info");
+			}
 		},
 	});
 

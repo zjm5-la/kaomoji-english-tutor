@@ -7,7 +7,7 @@ import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PiSdkLlmClient } from "../pi-sdk-llm.ts";
 import type { PetConfig } from "../config.ts";
-import { openDb } from "../db.ts";
+import { appendGenLog, getGenLog, openDb, setStat } from "../db.ts";
 import { insertEvaluatedAttempt } from "../sentence-cycle.ts";
 import type { PendingAttempt } from "../runtime-state.ts";
 import { critiqueLesson, evaluateAttempt, generateLesson, generateReplacement, type GeneratedItem } from "../llm.ts";
@@ -699,4 +699,34 @@ test("answer-evaluation rubric is direction-aware: reverse accepts synonyms, for
 	assert.doesNotMatch(captured[0], /完全一致/);
 	assert.match(captured[1], /完全一致/);
 	assert.doesNotMatch(captured[1], /语体差异/);
+});
+
+// -- Generation decision ring log (备课决策日志) ----------------------------
+
+test("gen log appends in order and caps at 20 entries", () => {
+	const handle = freshDb();
+	try {
+		for (let i = 0; i < 25; i++) appendGenLog(handle.db, `status-${i}`);
+		const log = getGenLog(handle.db);
+		assert.equal(log.length, 20);
+		assert.equal(log[0].s, "status-5"); // oldest 5 dropped
+		assert.equal(log[19].s, "status-24");
+		assert.ok(log.every((e) => typeof e.t === "string" && e.t.length > 0));
+	} finally {
+		handle.close();
+	}
+});
+
+test("gen log survives corrupt JSON and overlong status", () => {
+	const handle = freshDb();
+	try {
+		setStat(handle.db, "gen_log", "not-json");
+		assert.deepEqual(getGenLog(handle.db), []);
+		appendGenLog(handle.db, "x".repeat(500));
+		const log = getGenLog(handle.db);
+		assert.equal(log.length, 1);
+		assert.equal(log[0].s.length, 200);
+	} finally {
+		handle.close();
+	}
 });

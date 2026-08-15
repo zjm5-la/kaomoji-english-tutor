@@ -456,6 +456,36 @@ export function bumpStat(db: DatabaseSync, key: string, delta: number) {
 	setStat(db, key, Number(getStat(db, key) ?? 0) + delta);
 }
 
+export interface GenLogEntry {
+	t: string;
+	s: string;
+}
+
+const GEN_LOG_KEY = "gen_log";
+const GEN_LOG_CAP = 20;
+
+export function getGenLog(db: DatabaseSync): GenLogEntry[] {
+	const raw = getStat(db, GEN_LOG_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter(
+			(e): e is GenLogEntry =>
+				Boolean(e) && typeof e.t === "string" && typeof e.s === "string",
+		);
+	} catch {
+		return [];
+	}
+}
+
+/** Append a lesson/replacement generation decision to the bounded ring log (newest last). */
+export function appendGenLog(db: DatabaseSync, status: string): void {
+	const entries = getGenLog(db);
+	entries.push({ t: new Date().toISOString(), s: status.slice(0, 200) });
+	setStat(db, GEN_LOG_KEY, JSON.stringify(entries.slice(-GEN_LOG_CAP)));
+}
+
 function localDateStr(d: Date = new Date()): string {
 	const y = d.getFullYear();
 	const m = String(d.getMonth() + 1).padStart(2, "0");
