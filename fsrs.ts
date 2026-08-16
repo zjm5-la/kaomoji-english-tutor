@@ -12,7 +12,7 @@ const scheduler = new FSRS();
  * - unassisted objective correct -> Good (miss stays Again)
  * - hint + correct -> at most Hard
  * - revealed/flipped + correct -> Again
- * - manual /kaomoji:good without an objective answer -> at most Hard
+ * - manual /anki:good without an objective answer -> at most Hard
  *   (self-report is recorded separately and never counts as unassisted evidence)
  * Sentence cards do not use this policy; their stricter cycle logic is unchanged.
  */
@@ -141,6 +141,6 @@ export function quarantineCorruptFsrs(db: DatabaseSync, itemId: number, rawFsrsS
 		db.exec("COMMIT");
 	} catch (err) {
 		try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-		console.error(`[kaomoji-english-tutor] FSRS quarantine failed for item ${itemId}: ${err}`);
+		console.error(`[pi-english-anki] FSRS quarantine failed for item ${itemId}: ${err}`);
 	}
 }

@@ -205,7 +205,7 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 			lines.push(`  参考：${exercise.reference}`);
 			if (exercise.level === levels.length - 1 && chunks?.length) lines.push(`  意群：${chunks.join(" / ")}`);
 		}
-		lines.push("💬 /kaomoji:answer <英文> · /kaomoji:hint · /kaomoji:flip · /kaomoji:again");
+		lines.push("💬 /anki:answer <英文> · /anki:hint · /anki:flip · /anki:again");
 		return lines;
 	}
 
@@ -219,7 +219,7 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 		}
-		lines.push(`💬 /kaomoji:answer 默写 · /kaomoji:hint 提示 · /kaomoji:flip 翻面 · /kaomoji:good 记得 · /kaomoji:again 忘了`);
+		lines.push(`💬 /anki:answer 默写 · /anki:hint 提示 · /anki:flip 翻面 · /anki:good 记得 · /anki:again 忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
@@ -228,7 +228,7 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 				lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 			}
 		}
-		lines.push(`💬 /kaomoji:flip 翻面 · /kaomoji:skip 已会`);
+		lines.push(`💬 /anki:flip 翻面 · /anki:skip 已会`);
 	}
 	return lines;
 }

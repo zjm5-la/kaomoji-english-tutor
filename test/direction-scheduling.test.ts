@@ -148,7 +148,7 @@ test("effectiveRecallRating: hint caps correct at Hard; revealed/flip collapses 
 });
 
 test("effectiveRecallRating: manual self-report is never unassisted evidence", () => {
-	// /kaomoji:good without an objective answer is conservative: at most Hard.
+	// /anki:good without an objective answer is conservative: at most Hard.
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "none", manual: true }), Rating.Hard);
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "hint", manual: true }), Rating.Hard);
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: true }), Rating.Again);

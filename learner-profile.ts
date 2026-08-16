@@ -526,7 +526,7 @@ export function formatAdaptiveBlock(profile: LearnerProfile, budget: DifficultyB
 	].join("\n");
 }
 
-/** One-line transparency summary for /kaomoji:stats. */
+/** One-line transparency summary for /anki:stats. */
 export function formatProfileStatsLine(profile: LearnerProfile, budget: DifficultyBudget): string {
 	const focus = profile.errorFocus.length ? profile.errorFocus.map((t) => t.tag).join("/") : "无";
 	const dim = (d: BandDimension) => `${d.band}(证据${d.evidence},${confidenceLabel(d.confidence)})`;

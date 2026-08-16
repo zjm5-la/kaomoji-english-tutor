@@ -165,14 +165,14 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /timer/);
 		assert.match(harness.widget().join(" "), /连续学习 1 天.*今日剩余卡片（复习 1）/);
-		assert.match(harness.widget().join(" "), /\/kaomoji:flip/);
+		assert.match(harness.widget().join(" "), /\/anki:flip/);
 		assert.equal(harness.shortcuts["ctrl+alt+k"], undefined);
 		assert.equal(fake.active().length, 0);
 		const check = openTestDb();
 		const shown = check.prepare("SELECT shown,reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		check.close();
 		assert.deepEqual({ ...shown }, { shown: 1, reviews: 0, fsrs_state: "" });
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		assert.equal(fake.active().length, 1);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 		assert.equal(fake.active().length, 0);
@@ -198,7 +198,7 @@ test("answer on a newly taught word does not grade the visible English prompt", 
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /单词：condition/, "new-card face already shows the English word");
-		await harness.commands["kaomoji:answer"].handler("条件", harness.ctx);
+		await harness.commands["anki:answer"].handler("条件", harness.ctx);
 		assert.ok(harness.notifications().some((message) => /新卡.*翻面/.test(message)), "answer explains the new-card interaction");
 		const check = openTestDb();
 		const item = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -222,20 +222,20 @@ test("progressive sentence requires written output and touches FSRS only after L
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /句子输出（L1\/3）/);
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		let check = openTestDb();
 		let row = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
 		check.close();
 		assert.deepEqual({ ...row }, { progress: 0, reviews: 0 }, "manual Good cannot bypass sentence output");
 
-		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("extension", harness.ctx);
+		await harness.commands["anki:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		check.close();
 		assert.deepEqual({ ...row }, { progress: 2, reviews: 0, fsrs_state: "" });
 
-		await harness.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
+		await harness.commands["anki:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
 		assert.match(harness.widget().join(" "), /独立写对了/);
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -257,11 +257,11 @@ test("manual Again ends sentence output once and resets it to L1", { concurrency
 		const harness = await createHarness();
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("extension", harness.ctx);
+		await harness.commands["anki:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
 		assert.match(harness.widget().join(" "), /L3\/3/);
 
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 
 		const check = openTestDb();
 		const row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -295,8 +295,8 @@ test("sentence correction retries stay on the level and final FSRS uses the firs
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "sentence-retry" });
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("The extension clear resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("extension", harness.ctx);
+		await harness.commands["anki:answer"].handler("The extension clear resources during shutdown.", harness.ctx);
 		assert.match(harness.widget().join(" "), /差一点.*主谓一致/);
 		const reattached = await makeSession({ model, modelRegistry: registry, sessionId: "sentence-retry-reattached" });
 		assert.match(reattached.widget().join(" "), /差一点.*主谓一致/, "SQLite reattachment preserves corrective teaching");
@@ -308,8 +308,8 @@ test("sentence correction retries stay on the level and final FSRS uses the firs
 		assert.deepEqual({ ...row }, { progress: 1, reviews: 0 });
 		assert.deepEqual({ ...state }, { active_cycle_outcome: "again", active_retry_count: 1, active_assistance_level: "hint" });
 
-		await harness.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
+		await harness.commands["anki:answer"].handler("The extension clears resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", harness.ctx);
 		assert.match(harness.widget().join(" "), /首次回忆有辅助或错误/);
 		check = openTestDb();
 		row = check.prepare("SELECT progress,reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -356,8 +356,8 @@ test("answer shows a thinking animation while sentence evaluation is pending", {
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "answer-thinking" });
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
-		const inFlight = harness.commands["kaomoji:answer"].handler("The extension cleans resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("extension", harness.ctx);
+		const inFlight = harness.commands["anki:answer"].handler("The extension cleans resources during shutdown.", harness.ctx);
 		await started;
 		assert.match(harness.widget().join(" "), /⠋ 正在判断你的答案/);
 		releaseResponse();
@@ -396,7 +396,7 @@ test("answer judging keeps the card visible and ignores cross-session repaints",
 		await fake.fire(); // claim + render the review question
 		const cardLines = harness.widget();
 		assert.match(cardLines.join(" "), /复习时间到/);
-		const inFlight = harness.commands["kaomoji:answer"].handler("conditon", harness.ctx);
+		const inFlight = harness.commands["anki:answer"].handler("conditon", harness.ctx);
 		await started;
 		const judging = harness.widget();
 		assert.match(judging.join(" "), /正在判断你的答案/);
@@ -438,8 +438,8 @@ test("sentence spelling feedback highlights the changed letter order", { concurr
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "spelling-diff" });
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("extension", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("The extension claers resources during shutdown.", harness.ctx);
+		await harness.commands["anki:answer"].handler("extension", harness.ctx);
+		await harness.commands["anki:answer"].handler("The extension claers resources during shutdown.", harness.ctx);
 		assert.match(harness.widget().join(" "), /拼写对比：cl\[ae\]rs → cl\[ea\]rs/);
 		const reattached = await makeSession({ model, modelRegistry: registry, sessionId: "spelling-diff-reattached" });
 		assert.match(reattached.widget().join(" "), /拼写对比：cl\[ae\]rs → cl\[ea\]rs/, "highlight survives SQLite reattachment");
@@ -471,7 +471,7 @@ test("a natural L3 variant accepted by the SDK evaluator completes as Good", { c
 		db.prepare("UPDATE items SET progress=2, shown=1 WHERE id=1").run();
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("Since it owns the runtime, the extension cleans up during shutdown so callbacks aren't registered twice.", harness.ctx);
+		await harness.commands["anki:answer"].handler("Since it owns the runtime, the extension cleans up during shutdown so callbacks aren't registered twice.", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
 		const attempt = check.prepare("SELECT verdict,explicit_rating,kind FROM attempts WHERE item_id=1").get() as any;
@@ -493,16 +493,16 @@ test("sentence hint survives reattachment and prevents a clean Good", { concurre
 		const a = await makeSession({ sessionId: "sentence-hint-a" });
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
-		await a.commands["kaomoji:hint"].handler("", a.ctx);
+		await a.commands["anki:hint"].handler("", a.ctx);
 		const before = openTestDb();
 		const cycleId = String((before.prepare("SELECT active_review_cycle_id FROM runtime_state WHERE id=1").get() as any).active_review_cycle_id);
 		before.close();
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 
 		const b = await makeSession({ sessionId: "sentence-hint-b" });
-		await b.commands["kaomoji:answer"].handler("extension", b.ctx);
-		await b.commands["kaomoji:answer"].handler("The extension clears resources during shutdown.", b.ctx);
-		await b.commands["kaomoji:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", b.ctx);
+		await b.commands["anki:answer"].handler("extension", b.ctx);
+		await b.commands["anki:answer"].handler("The extension clears resources during shutdown.", b.ctx);
+		await b.commands["anki:answer"].handler("Because the extension owns runtime resources, it clears them during shutdown to prevent duplicate callbacks.", b.ctx);
 		const check = openTestDb();
 		const rated = check.prepare("SELECT explicit_rating FROM attempts WHERE review_cycle_id=? AND explicit_rating IS NOT NULL").get(cycleId) as any;
 		const mastery = check.prepare("SELECT unassisted_good,consecutive_again FROM mastery_state WHERE item_id=1").get() as any;
@@ -524,7 +524,7 @@ test("sentence evaluator unavailability keeps the card pending with zero attempt
 		const before = openTestDb();
 		const version = Number((before.prepare("SELECT active_version FROM runtime_state WHERE id=1").get() as any).active_version);
 		before.close();
-		await harness.commands["kaomoji:answer"].handler("wrong", harness.ctx);
+		await harness.commands["anki:answer"].handler("wrong", harness.ctx);
 		const check = openTestDb();
 		const state = check.prepare("SELECT active_item_id,active_version FROM runtime_state WHERE id=1").get() as any;
 		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
@@ -550,10 +550,10 @@ test("consecutive skips preserve FIFO replacement obligations", { concurrency: f
 		insert.run("phrase", "clear a timer", "清除定时器", new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /clear a timer/, "queued new card surfaces after deferred replacement generation");
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const raw = (check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value;
 		const statuses = check.prepare("SELECT status FROM items ORDER BY id").all() as Array<{ status: string }>;
@@ -587,7 +587,7 @@ test("a due review is activated before any replacement LLM call", { concurrency:
 		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1, next_check_at=? WHERE id=1")
 			.run(new Date(0).toISOString());
 		db.close();
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const state = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -620,7 +620,7 @@ test("successful replacement is one-for-one, critic-approved, and quota-free", {
 		insertDueWord(db, "timer", "定时器");
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const items = check.prepare("SELECT text,shown,status,introduction_kind,introduced_at FROM items ORDER BY id").all() as any[];
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -659,7 +659,7 @@ test("replacement critic rejection preserves the FIFO obligation and inserts not
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-reject" });
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -698,7 +698,7 @@ test("conversation changes during replacement critique make the result stale", {
 		harness.ctx.sessionManager.getBranch = () => [{ type: "message", message: { role: "user", content: [{ type: "text", text: conversation }] } }];
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
-		const inFlight = harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		const inFlight = harness.commands["anki:skip"].handler("", harness.ctx);
 		await started;
 		conversation = "new topic";
 		releaseCritic();
@@ -737,7 +737,7 @@ test("a review becoming due during replacement critique prevents replacement act
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-late-due" });
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
-		const inFlight = harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		const inFlight = harness.commands["anki:skip"].handler("", harness.ctx);
 		await started;
 		const during = openTestDb();
 		during.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','overdue','已到期',?,?,1)")
@@ -778,7 +778,7 @@ test("skip mastering rolls back when replacement enqueue fails", { concurrency: 
 		`);
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT status,fsrs_state FROM items WHERE id=1").get() as any;
 		const skippedStat = check.prepare("SELECT value FROM stats WHERE key='total_skipped'").get();
@@ -916,8 +916,8 @@ test("two sessions share one global card and rate it at most once", { concurrenc
 		assert.equal(active.active_kind, "teach");
 
 		// Both sessions attempt to rate the same card; only one applies.
-		await a.commands["kaomoji:good"].handler("", a.ctx);
-		await b.commands["kaomoji:good"].handler("", b.ctx);
+		await a.commands["anki:good"].handler("", a.ctx);
+		await b.commands["anki:good"].handler("", b.ctx);
 
 		const fin = openTestDb();
 		const row = fin.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
@@ -952,7 +952,7 @@ test("session B auto-refreshes when session A rates the shared card", { concurre
 		await fake.firePoll();
 
 		// A rates Good, clearing the global slot. (Manual self-report schedules Hard per P0-2.)
-		await a.commands["kaomoji:good"].handler("", a.ctx);
+		await a.commands["anki:good"].handler("", a.ctx);
 		assert.match(a.widget().join(" "), /记了个大概/);
 
 		// B's poll notices the data_version change and drops the pending card.
@@ -988,7 +988,7 @@ test("session shutdown keeps the shared global card for other sessions", { concu
 		assert.match(b.widget().join(" "), /timer/);
 
 		// B can still operate on it, applying the rating exactly once.
-		await b.commands["kaomoji:good"].handler("", b.ctx);
+		await b.commands["anki:good"].handler("", b.ctx);
 		const fin = openTestDb();
 		const row = fin.prepare("SELECT reviews FROM items WHERE id=1").get() as any;
 		fin.close();
@@ -1011,8 +1011,8 @@ test("stale cross-session sentence and Skip actions apply exactly once", { concu
 		db.close();
 		await fake.fire();
 		await fake.fire();
-		await a.commands["kaomoji:answer"].handler("extension", a.ctx);
-		await b.commands["kaomoji:answer"].handler("extension", b.ctx);
+		await a.commands["anki:answer"].handler("extension", a.ctx);
+		await b.commands["anki:answer"].handler("extension", b.ctx);
 		db = openTestDb();
 		const sentence = db.prepare("SELECT progress,reviews FROM items WHERE id=1").get() as any;
 		db.close();
@@ -1028,8 +1028,8 @@ test("stale cross-session sentence and Skip actions apply exactly once", { concu
 		db.close();
 		await fake.fire();
 		await fake.fire();
-		await c.commands["kaomoji:skip"].handler("", c.ctx);
-		await d.commands["kaomoji:skip"].handler("", d.ctx);
+		await c.commands["anki:skip"].handler("", c.ctx);
+		await d.commands["anki:skip"].handler("", d.ctx);
 		db = openTestDb();
 		const queue = JSON.parse((db.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value);
 		const skipped = Number((db.prepare("SELECT value FROM stats WHERE key='total_skipped'").get() as any).value);
@@ -1387,7 +1387,7 @@ test("today remaining counts due cards plus only the available new-card quota", 
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 1 · 新卡 1）/, "current review plus one quota-eligible new card");
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		const after = openTestDb();
 		const localStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate()).toISOString();
 		const planned = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind='planned' AND introduced_at >= ?").get(localStart) as any).n);
@@ -1441,7 +1441,7 @@ test("dailyNewLimit zero allows every queued planned card to surface", { concurr
 		for (const text of ["one", "two", "three"]) {
 			await fake.fire(fake.active().find((timer) => timer.delay === 0) ?? fake.active()[0]);
 			assert.match(harness.widget().join(" "), new RegExp(text));
-			if (text !== "three") await harness.commands["kaomoji:good"].handler("", harness.ctx);
+			if (text !== "three") await harness.commands["anki:good"].handler("", harness.ctx);
 		}
 		const check = openTestDb();
 		const shown = Number((check.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND introduction_kind='planned' AND introduced_at IS NOT NULL").get() as any).n);
@@ -1718,7 +1718,7 @@ test("active recall: a correct answer is judged and recorded", { concurrency: fa
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /你好/, "review front shows the Chinese meaning, not the English answer");
-		await harness.commands["kaomoji:answer"].handler("hello", harness.ctx);
+		await harness.commands["anki:answer"].handler("hello", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/);
 		assert.equal(fake.active().length, 1, "normal pacing timer remains when the queue is empty");
 		assert.ok(fake.active()[0].delay > 590_000, "feedback is not overwritten by a 0ms idle tick");
@@ -1744,7 +1744,7 @@ test("active recall without model: a wrong answer stays pending with zero writes
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("word", harness.ctx);
+		await harness.commands["anki:answer"].handler("word", harness.ctx);
 		assert.ok(harness.notifications().some((m) => /无法可靠判断/.test(m)), "warning shown for unavailable evaluator");
 		const check = openTestDb();
 		const att = check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id = 1").get() as any;
@@ -1775,7 +1775,7 @@ test("bad evaluator JSON leaves word card pending with zero authoritative writes
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("word", harness.ctx);
+		await harness.commands["anki:answer"].handler("word", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT reviews,fsrs_state FROM items WHERE id=1").get() as any;
 		const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
@@ -1808,7 +1808,7 @@ test("LLM evaluation marks a near-miss answer as partial with feedback", { concu
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("apple", harness.ctx);
+		await harness.commands["anki:answer"].handler("apple", harness.ctx);
 		assert.match(harness.widget().join(" "), /差一点/);
 		const check = openTestDb();
 		const att = check.prepare("SELECT verdict, feedback_json, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
@@ -1836,7 +1836,7 @@ test("recall exercise template is persisted when a card is answered", { concurre
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("cat", harness.ctx);
+		await harness.commands["anki:answer"].handler("cat", harness.ctx);
 		const check = openTestDb();
 		const ex = check.prepare("SELECT kind, stage, content_fingerprint FROM exercises WHERE item_id = 1").get() as any;
 		check.close();
@@ -1858,7 +1858,7 @@ test("mastery state tracks Good and Again evidence", { concurrency: false }, asy
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 		let check = openTestDb();
 		let m = check.prepare("SELECT unassisted_good, consecutive_again, stage FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
@@ -1869,7 +1869,7 @@ test("mastery state tracks Good and Again evidence", { concurrency: false }, asy
 		db2.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
 		db2.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("dog", harness.ctx);
+		await harness.commands["anki:answer"].handler("dog", harness.ctx);
 		check = openTestDb();
 		m = check.prepare("SELECT stage, unassisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
@@ -1893,7 +1893,7 @@ test("consecutive Again triggers a reinforcement hint", { concurrency: false }, 
 		db.prepare("INSERT INTO mastery_state (item_id, stage, unassisted_good, consecutive_again, updated_at) VALUES (1, 'recognition', 0, 1, ?)").run(now);
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /反复忘了/);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -1901,12 +1901,12 @@ test("consecutive Again triggers a reinforcement hint", { concurrency: false }, 
 	}
 });
 
-test("kaomoji:stats reports mastery distribution and accuracy without error", { concurrency: false }, async () => {
+test("anki:stats reports mastery distribution and accuracy without error", { concurrency: false }, async () => {
 	const harness = await createHarness();
 	try {
-		assert.equal(typeof harness.commands["kaomoji:stats"], "object");
+		assert.equal(typeof harness.commands["anki:stats"], "object");
 		// Exercises the full query path on an empty DB (no rows → "暂无", 0 attempts).
-		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
+		await harness.commands["anki:stats"].handler("", harness.ctx);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		// no fake timers
@@ -1934,7 +1934,7 @@ test("mastery stage promotes to controlled_recall after a second Good", { concur
 		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'recognition',1,0,?)").run(now);
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("deploy", harness.ctx);
+		await harness.commands["anki:answer"].handler("deploy", harness.ctx);
 		const ck = openTestDb();
 		const m = ck.prepare("SELECT stage, unassisted_good FROM mastery_state WHERE item_id=1").get() as any;
 		ck.close();
@@ -1957,7 +1957,7 @@ test("mastery stage demotes one level on Again", { concurrency: false }, async (
 		db.prepare("INSERT INTO mastery_state(item_id,stage,unassisted_good,consecutive_again,updated_at) VALUES(1,'controlled_recall',2,0,?)").run(now);
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 		const ck = openTestDb();
 		const m = ck.prepare("SELECT stage, consecutive_again FROM mastery_state WHERE item_id=1").get() as any;
 		ck.close();
@@ -1969,7 +1969,7 @@ test("mastery stage demotes one level on Again", { concurrency: false }, async (
 	}
 });
 
-test("persistent status stays compact while kaomoji:stats keeps detailed metrics", { concurrency: false }, async () => {
+test("persistent status stays compact while anki:stats keeps detailed metrics", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -1980,7 +1980,7 @@ test("persistent status stays compact while kaomoji:stats keeps detailed metrics
 		const status = harness.widget().join(" ");
 		assert.doesNotMatch(status, /连续学习|今日剩余卡片/);
 		assert.doesNotMatch(status, /需强化|今日新增|今日复习|已学/);
-		await harness.commands["kaomoji:stats"].handler("", harness.ctx);
+		await harness.commands["anki:stats"].handler("", harness.ctx);
 		assert.ok(harness.notifications().some((message) => /需强化：1/.test(message)));
 		// The profile/budget transparency line includes band, confidence, evidence counts, and the budget range.
 		assert.ok(harness.notifications().some((message) => /画像：句法 B1\(证据0,低\)/.test(message)), "stats shows syntax band with evidence");
@@ -2155,9 +2155,9 @@ test("active recall: reverse direction asks for the Chinese meaning", { concurre
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /写出「hello」的中文释义/, "reverse front shows English, asks for Chinese");
-		await harness.commands["kaomoji:hint"].handler("", harness.ctx);
+		await harness.commands["anki:hint"].handler("", harness.ctx);
 		assert.match(harness.notifications().at(-1) ?? "", /提示：你_/, "reverse hint masks the Chinese answer");
-		await harness.commands["kaomoji:answer"].handler("你好", harness.ctx);
+		await harness.commands["anki:answer"].handler("你好", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/, "correct Chinese answer auto-rates Good");
 		const check = openTestDb();
 		const att = check.prepare("SELECT verdict, answer_text, assistance_level, direction FROM attempts WHERE item_id = 1").get() as any;
@@ -2213,8 +2213,8 @@ test("flip-assisted correct answer schedules Again (a revealed answer is not rec
 			.run(new Date().toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:flip"].handler("", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("cat", harness.ctx);
+		await harness.commands["anki:flip"].handler("", harness.ctx);
+		await harness.commands["anki:answer"].handler("cat", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT reviews FROM items WHERE id = 1").get() as any;
 		const attempt = check.prepare("SELECT assistance_level, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
@@ -2255,9 +2255,9 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		db.close();
 		await fake.fire(); // A claims alpha.
 		await fake.fire(); // B renders alpha.
-		const inFlight = a.commands["kaomoji:answer"].handler("alph", a.ctx);
+		const inFlight = a.commands["anki:answer"].handler("alph", a.ctx);
 		await started;
-		await b.commands["kaomoji:good"].handler("", b.ctx); // B rates alpha.
+		await b.commands["anki:good"].handler("", b.ctx); // B rates alpha.
 		assert.ok(fake.active().some((timer) => timer.delay === 0), "next due card is scheduled immediately");
 		await fake.fire(fake.active().find((timer) => timer.delay === 0)); // B advances the global slot to beta.
 		releaseResponse();
@@ -2304,9 +2304,9 @@ test("stale sentence evaluator result writes no retry or rating after another se
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
 		await fake.fire();
-		const inFlight = a.commands["kaomoji:answer"].handler("extensio", a.ctx);
+		const inFlight = a.commands["anki:answer"].handler("extensio", a.ctx);
 		await started;
-		await b.commands["kaomoji:again"].handler("", b.ctx);
+		await b.commands["anki:again"].handler("", b.ctx);
 		releaseResponse();
 		await inFlight;
 		const check = openTestDb();
@@ -2348,9 +2348,9 @@ test("a sentence hint invalidates an in-flight clean evaluation", { concurrency:
 		const db = openTestDb(); insertSentence(db); db.close();
 		await fake.fire();
 		await fake.fire();
-		const inFlight = a.commands["kaomoji:answer"].handler("extensio", a.ctx);
+		const inFlight = a.commands["anki:answer"].handler("extensio", a.ctx);
 		await started;
-		await b.commands["kaomoji:hint"].handler("", b.ctx);
+		await b.commands["anki:hint"].handler("", b.ctx);
 		releaseResponse();
 		await inFlight;
 		const check = openTestDb();
@@ -2361,7 +2361,7 @@ test("a sentence hint invalidates an in-flight clean evaluation", { concurrency:
 		assert.deepEqual({ ...state }, { active_item_id: 1, active_cycle_outcome: "again", active_assistance_level: "hint" });
 		assert.deepEqual({ ...item }, { progress: 0, reviews: 0 });
 		assert.equal(attempts, 0);
-		await b.commands["kaomoji:again"].handler("", b.ctx);
+		await b.commands["anki:again"].handler("", b.ctx);
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 	} finally {
@@ -2382,7 +2382,7 @@ test("wrong-answer teaching remains visible before the next due card", { concurr
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /没关系，待会儿再考你一次/, "Again feedback is rendered");
 		assert.equal(fake.active().length, 1);
 		assert.ok(fake.active()[0].delay >= 14_900 && fake.active()[0].delay <= 15_000, "feedback gets a readable grace period");
@@ -2404,7 +2404,7 @@ test("Anki-style: correct rating immediately surfaces the next due card", { conc
 		db.close();
 		await fake.fire(); // surface first due card
 		assert.match(a.widget().join(" "), /阿尔法|贝塔/, "first card shown");
-		await a.commands["kaomoji:good"].handler("", a.ctx); // correct rating -> scheduleTimer(0)
+		await a.commands["anki:good"].handler("", a.ctx); // correct rating -> scheduleTimer(0)
 		assert.equal(fake.active().length, 1);
 		assert.equal(fake.active()[0].delay, 0, "command handler must not overwrite the immediate timer");
 		await fake.fire(); // immediate next-card tick
@@ -2464,7 +2464,7 @@ test("fractional elapsed_days produced by fsrs.js remains schedulable", { concur
 			.run(lastReview, new Date(0).toISOString(), state);
 		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1 WHERE id=1").run();
 		db.close();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT reviews,fsrs_status,fsrs_error FROM items WHERE id=1").get() as any;
 		const corruptions = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
@@ -2489,7 +2489,7 @@ test("corrupt FSRS state quarantines the card without silent reset", { concurren
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,fsrs_state) VALUES('word','bad','坏',?,?,1,'NOT_JSON')").run(now, new Date(0).toISOString());
 		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1 WHERE id=1").run();
 		db.close();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		const check = openTestDb();
 		const item = check.prepare("SELECT fsrs_status, fsrs_error FROM items WHERE id=1").get() as any;
 		const corrupt = check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any;
@@ -2532,7 +2532,7 @@ test("non-object and invalid-date FSRS states are quarantined without throwing",
 				.run(`bad-${index}`, "坏", now, new Date(0).toISOString(), fixture.state);
 			db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1 WHERE id=1").run();
 			db.close();
-			await harness.commands["kaomoji:good"].handler("", harness.ctx);
+			await harness.commands["anki:good"].handler("", harness.ctx);
 			const check = openTestDb();
 			const item = check.prepare("SELECT fsrs_status,fsrs_error FROM items WHERE id=1").get() as any;
 			const count = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
@@ -2559,8 +2559,8 @@ test("two sessions quarantine the same corrupt FSRS item only once", { concurren
 		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1 WHERE id=1").run();
 		db.close();
 		await Promise.all([
-			a.commands["kaomoji:good"].handler("", a.ctx),
-			b.commands["kaomoji:good"].handler("", b.ctx),
+			a.commands["anki:good"].handler("", a.ctx),
+			b.commands["anki:good"].handler("", b.ctx),
 		]);
 		const check = openTestDb();
 		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM fsrs_corruptions WHERE item_id=1").get() as any).n);
@@ -2584,7 +2584,7 @@ test("word/phrase evaluator unavailable keeps card pending with zero writes", { 
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','hello','你好',?,?,1)").run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:answer"].handler("wrong", harness.ctx);
+		await harness.commands["anki:answer"].handler("wrong", harness.ctx);
 		assert.ok(harness.notifications().some((m) => /无法可靠判断/.test(m)));
 		const check = openTestDb();
 		const att = check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any;
@@ -2611,8 +2611,8 @@ test("hint-assisted correct answer schedules Hard and says so", { concurrency: f
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:hint"].handler("", harness.ctx);
-		await harness.commands["kaomoji:answer"].handler("apple", harness.ctx);
+		await harness.commands["anki:hint"].handler("", harness.ctx);
+		await harness.commands["anki:answer"].handler("apple", harness.ctx);
 		assert.match(harness.widget().join(" "), /记了个大概（用了提示，按困难安排）/);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT assistance_level, verdict, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
@@ -2626,7 +2626,7 @@ test("hint-assisted correct answer schedules Hard and says so", { concurrency: f
 	}
 });
 
-test("manual /kaomoji:good is recorded as a conservative self-report, not objective evidence", { concurrency: false }, async () => {
+test("manual /anki:good is recorded as a conservative self-report, not objective evidence", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -2635,7 +2635,7 @@ test("manual /kaomoji:good is recorded as a conservative self-report, not object
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await harness.commands["kaomoji:good"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /自评兜底，按困难保守安排/);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
@@ -2659,10 +2659,10 @@ test("word/phrase assistance persists across sessions (hint in A, answered in B 
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		await a.commands["kaomoji:hint"].handler("", a.ctx);
+		await a.commands["anki:hint"].handler("", a.ctx);
 		// B attaches after the hint: it must still see assistance=hint.
 		const b = await makeSession({ sessionId: "assist-b" });
-		await b.commands["kaomoji:answer"].handler("cherry", b.ctx);
+		await b.commands["anki:answer"].handler("cherry", b.ctx);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT assistance_level, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
 		check.close();
@@ -2686,7 +2686,7 @@ test("after a forward Again, a due reverse surfaces in reverse direction", { con
 		db.close();
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /默写「葡萄」的英文/, "first surfacing defaults to forward production");
-		await harness.commands["kaomoji:again"].handler("", harness.ctx);
+		await harness.commands["anki:again"].handler("", harness.ctx);
 		// Forward was just rated (due soon); simulate time passing so only the
 		// reverse direction is due, and the item itself is due again.
 		const db2 = openTestDb();

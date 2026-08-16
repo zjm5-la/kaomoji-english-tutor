@@ -1,7 +1,7 @@
 # 学习者水平判断 · 学习框架
 
 > 状态：P1+P2 已实施（2026-08-13，schema v8：`attempts.direction` 持久化；画像聚合 + 难度预算注入备课与审查）；P3 起未实施
-> 范围：`kaomoji-english-tutor` 的适应能力——判断用户英语水平，作为备课依据
+> 范围：`pi-english-anki` 的适应能力——判断用户英语水平，作为备课依据
 > 关联文档：`adaptive-tutor-design.md`（导师流水线整体设计）
 
 ## 1. 问题

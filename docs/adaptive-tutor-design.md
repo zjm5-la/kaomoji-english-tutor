@@ -1,7 +1,7 @@
 # 自适应 LLM 英语导师正式设计
 
 > 状态：Accepted for implementation<br>
-> 范围：`kaomoji-english-tutor` 下一代备课、练习与反馈机制<br>
+> 范围：`pi-english-anki` 下一代备课、练习与反馈机制<br>
 > 优先级：教学效果是唯一优化目标，LLM 调用成本不进入设计权衡；交互延迟、数据一致性与可恢复性仍是硬约束
 
 ## 1. 摘要
@@ -18,7 +18,7 @@
 1. 从“固定生成单词、词组、长句”升级为“按学习价值选择 `wait | new | reinforce | contrast | transfer`”。
 2. 以**具体义项**而不是拼写作为学习对象。
 3. 新课形成一个紧密关联的教学单元；目标词、词组、例句、长句和练习共同服务同一个教学目标。
-4. 新增 `/kaomoji:answer <答案>`，收集不进入会话历史的真实英文或中文答案，并自动映射为 FSRS Good/Again。
+4. 新增 `/anki:answer <答案>`，收集不进入会话历史的真实英文或中文答案，并自动映射为 FSRS Good/Again。
 5. 复习从被动识别逐步升级为填空、主动产出和迁移使用。
 6. 使用多候选、多审查、有限修订的 LLM 流水线；质量门不通过时宁可不新增内容。
 7. LLM 只提供判题 verdict，永不直接写 FSRS；确定性引擎在 item/version/direction CAS 成功后把 correct 映射为 Good、partial/incorrect 映射为 Again，用户仍可手动执行 Good、Again 或 Skip。
@@ -36,7 +36,7 @@
 - 单一全局当前卡、跨进程版本 CAS、coordinator 和 generation lease；
 - 所有 LLM 通信统一通过隔离的 Pi SDK 内存 AgentSession；内部会话禁用扩展、skills、项目上下文和文件工具，generator 与 critic 使用独立会话；
 - LLM 调用期间不持有 SQLite 事务；
-- Widget 常驻展示及 `/kaomoji:*` 命令交互。
+- Widget 常驻展示及 `/anki:*` 命令交互。
 
 ### 2.2 教学瓶颈
 
@@ -106,7 +106,7 @@
   释义：协调多个参与者或任务，使其共同工作
   搭配：coordinate access to shared state
   场景：多个 Pi 会话需要安全共享学习状态
-💬 /kaomoji:flip 查看例句 · /kaomoji:skip 已会
+💬 /anki:flip 查看例句 · /anki:skip 已会
 ```
 
 翻面后展示：
@@ -124,13 +124,13 @@
 (=^‥^=) 主动回忆 · 填空
   We need to ___ access to shared state across several sessions.
   提示：协调
-💬 /kaomoji:answer <答案> · /kaomoji:hint · /kaomoji:flip
+💬 /anki:answer <答案> · /anki:hint · /anki:flip
 ```
 
 用户输入：
 
 ```text
-/kaomoji:answer coordinate
+/anki:answer coordinate
 ```
 
 命令不进入 Pi 会话历史。正确答案可立即由确定性规则确认；自由表达或非精确答案进入 LLM 评价流程。
@@ -142,7 +142,7 @@
   你的答案：coordinate
   完整句：We need to coordinate access to shared state across several sessions.
   要点：coordinate 后直接接需要协调的对象。
-💬 /kaomoji:good 记得 · /kaomoji:again 仍不稳
+💬 /anki:good 记得 · /anki:again 仍不稳
 ```
 
 部分正确时：
@@ -152,7 +152,7 @@
   你的答案：coordination
   更自然：coordinate
   原因：need to 后接动词原形；coordination 是名词。
-💬 /kaomoji:good 我已掌握 · /kaomoji:again 需要再练
+💬 /anki:good 我已掌握 · /anki:again 需要再练
 ```
 
 ### 5.4 命令契约
@@ -161,21 +161,21 @@
 
 | 命令 | 行为 |
 | --- | --- |
-| `/kaomoji:answer <text>` | 提交当前双向练习答案；correct 自动 FSRS Good，partial/incorrect 自动 Again |
-| `/kaomoji:hint` | 逐级显示预生成提示，并记录本次回答的辅助程度 |
-| `/kaomoji:report <reason>` | 报告错误/不自然内容，将当前 exercise 置为 quarantined 并触发独立复审；不修改 FSRS |
-| `/kaomoji:forget-attempts <all\|days>` | 删除原始答案历史，保留 FSRS 与不可逆推出原文的聚合计数 |
-| `/kaomoji:context <off\|summary\|conversation>` | 明确选择可发送给 tutor 模型的会话范围；新协议默认 off |
-| `/kaomoji:repair-fsrs <itemId> reset` | 仅在明确输入 `reset` 时归档损坏 blob 并把该 item 作为新卡重置；默认建议从数据库备份恢复 |
+| `/anki:answer <text>` | 提交当前双向练习答案；correct 自动 FSRS Good，partial/incorrect 自动 Again |
+| `/anki:hint` | 逐级显示预生成提示，并记录本次回答的辅助程度 |
+| `/anki:report <reason>` | 报告错误/不自然内容，将当前 exercise 置为 quarantined 并触发独立复审；不修改 FSRS |
+| `/anki:forget-attempts <all\|days>` | 删除原始答案历史，保留 FSRS 与不可逆推出原文的聚合计数 |
+| `/anki:context <off\|summary\|conversation>` | 明确选择可发送给 tutor 模型的会话范围；新协议默认 off |
+| `/anki:repair-fsrs <itemId> reset` | 仅在明确输入 `reset` 时归档损坏 blob 并把该 item 作为新卡重置；默认建议从数据库备份恢复 |
 
 保留：
 
 | 命令 | 行为 |
 | --- | --- |
-| `/kaomoji:flip` | 本地翻面；完整揭示答案，本次答题标记为已揭示 |
-| `/kaomoji:good` | 用户明确确认记得；全局至多一次地更新进度或 FSRS |
-| `/kaomoji:again` | 用户明确确认不稳；全局至多一次地退级或更新 FSRS |
-| `/kaomoji:skip` | 标记很熟并保留一对一补卡义务 |
+| `/anki:flip` | 本地翻面；完整揭示答案，本次答题标记为已揭示 |
+| `/anki:good` | 用户明确确认记得；全局至多一次地更新进度或 FSRS |
+| `/anki:again` | 用户明确确认不稳；全局至多一次地退级或更新 FSRS |
+| `/anki:skip` | 标记很熟并保留一对一补卡义务 |
 
 直接 Good/Again 仍可用，但记录为 `self_report`，没有真实答案评价。`/answer` 的 LLM 只返回 verdict；确定性引擎在 CAS 成功后将 correct 自动映射为 Good、partial/incorrect 自动映射为 Again。
 
@@ -283,7 +283,7 @@ FSRS 决定**何时出现**；掌握阶段和 facet 证据决定**出现时练�
 
 Again 的确定性降阶为：exposure/recognition → recognition，controlled recall → recognition，production → controlled recall，transfer → production。assisted success、partial/incorrect 后 Good 都会清零当前阶段的 unassisted streak；`cannot_judge` 不改变 streak；Skip 结束 stage 选择。wrong-sense 错误或新建 distinct sense 设置 `contrast_pending=1`；一次无提示 contrast 正确+Good 才清除并回到 base stage，Again 保持 contrast pending 且按上表降低 base stage。contrast evidence 同时关联两个 sense，但每个 review cycle 仍只计一次。
 
-Progressive sentence 保持一个跨 L1/L2/L3 的持久化 `review_cycle_id`。L1 使用单词 cloze 降低首次输出门槛，L2 根据中文主干写英文，L3 根据完整中文意图产出自然句子；参考句是语义锚点而非唯一合法字符串。每级都通过 `/kaomoji:answer` 作答，精确匹配本地通过，自然变体交给隔离 SDK evaluator 按语义、语法和搭配判断。
+Progressive sentence 保持一个跨 L1/L2/L3 的持久化 `review_cycle_id`。L1 使用单词 cloze 降低首次输出门槛，L2 根据中文主干写英文，L3 根据完整中文意图产出自然句子；参考句是语义锚点而非唯一合法字符串。每级都通过 `/anki:answer` 作答，精确匹配本地通过，自然变体交给隔离 SDK evaluator 按语义、语法和搭配判断。
 
 中间级正确只推进 progress、增加 active version 并记录 attempt，不修改 FSRS。partial/incorrect 记录本次 attempt、把 cycle outcome 固定为 Again、增加 retry count，并停留原级给出一个最小修正；第二次失败可展示参考表达。纠正成功后继续训练，但最终 L3 完成时仍按首次回忆路径提交 Again。只有整轮所有首次作答均无辅助正确，L3 才提交 Good。hint/flip 同样把 cycle outcome 固定为 Again；手动 Again 可随时结束，手动 Good 不能跳过句子输出。最终进级/attempt/FSRS/mastery/清槽必须在同一 CAS 事务中完成，一轮至多一次 scheduled review。
 
@@ -499,7 +499,7 @@ critic 优先使用与 generator 不同、且彼此不同的已认证提供商�
 
 ### 8.1 提交协议
 
-`/kaomoji:answer` 使用与评分相同强度的原子 CAS：
+`/anki:answer` 使用与评分相同强度的原子 CAS：
 
 1. 空答案在事务前拒绝，不建立 attempt；
 2. `BEGIN IMMEDIATE` 后读取 active item、exercise、phase 和 `active_version`；
@@ -552,7 +552,7 @@ critic 优先使用与 generator 不同、且彼此不同的已认证提供商�
 
 ### 8.5 内容报告与隔离
 
-`/kaomoji:report` 在短事务中写入 report、把 exercise 设为 `quarantined` 并增加 active version。若问题指向 canonical sense/translation，而不只是单个 prompt，则把 item 的 `content_status` 设为 `under_review`，在复审完成前只保留 FSRS 数据、不再展示该内容。随后建立独立 `content_review` tutor job，由未参与原生成的 critics 复查；通过后产生新 content version，失败则继续隔离。报告、隔离和修复均不把卡视为 Good/Again，也不删除历史 attempt。
+`/anki:report` 在短事务中写入 report、把 exercise 设为 `quarantined` 并增加 active version。若问题指向 canonical sense/translation，而不只是单个 prompt，则把 item 的 `content_status` 设为 `under_review`，在复审完成前只保留 FSRS 数据、不再展示该内容。随后建立独立 `content_review` tutor job，由未参与原生成的 critics 复查；通过后产生新 content version，失败则继续隔离。报告、隔离和修复均不把卡视为 Good/Again，也不删除历史 attempt。
 
 ## 9. 数据模型
 
@@ -870,7 +870,7 @@ FEEDBACK
 - `feedback_synthesizer`
 - `reinforcement_generator`
 
-第一版可以全部继承当前 `/kaomoji:model` 的模型，但内部使用独立上下文。若有多个已认证强模型：
+第一版可以全部继承当前 `/anki:model` 的模型，但内部使用独立上下文。若有多个已认证强模型：
 
 - planner/generator 选择最强的长上下文模型；
 - critic 优先选择不同提供商；
@@ -891,15 +891,15 @@ FEEDBACK
 
 - 会话内容、用户答案和历史模型输出均视为不可信数据，不能覆盖系统规则。
 - 发送前使用确定性 redactor。第一版至少覆盖：PEM private-key block；`Authorization: Bearer ...`；`api_key|apikey|token|secret|password` 邻接赋值；GitHub `gh[pousr]_...`、OpenAI `sk-...`、AWS `AKIA...`；以及 credential label 后 ≥32 字符高熵串。每条规则有 positive/negative fixture，替换为类型化占位符。工具调用正文默认不进入 tutor snapshot；redactor 命中只记录 rule id 和数量，不记录原文。
-- 配置提供 `contextSharing = conversation | summary | off`；adaptive protocol 新激活默认 `off`，必须通过 `/kaomoji:context` 或配置显式选择后才自动备课。`summary` 使用本地确定性截取/脱敏，不先把全文发送给 LLM 做摘要。README 必须说明所选模型提供商会收到什么。`off` 时只复习；用户执行 `/kaomoji:answer` 仅同意发送该 exercise/rubric 和本次答案，不隐式打开会话共享。
+- 配置提供 `contextSharing = conversation | summary | off`；adaptive protocol 新激活默认 `off`，必须通过 `/anki:context` 或配置显式选择后才自动备课。`summary` 使用本地确定性截取/脱敏，不先把全文发送给 LLM 做摘要。README 必须说明所选模型提供商会收到什么。`off` 时只复习；用户执行 `/anki:answer` 仅同意发送该 exercise/rubric 和本次答案，不隐式打开会话共享。
 - 只有 diagnostician/planner/generator 收到必要上下文；critic 只收到候选和最小目标，answer evaluator 只收到 exercise、rubric 和本次答案。
 - 所有 LLM 输出经严格 JSON 解析、判别联合、枚举白名单、长度限制和控制字符清理。
 - 模型输出不能生成命令、SQL 或可执行代码路径。
 - 日志默认记录 purpose、模型、input hash、状态、耗时和阻断 violation；不默认记录完整会话。
-- 原始 answer 默认在本地保留 90 天，聚合 mastery/error counts 可长期保留；提供 `/kaomoji:forget-attempts <all|days>` 和配置 `answerRetentionDays`。清理事务把 `attempts.answer_text` 置 NULL，删除/重写会回显答案的 `feedback_json`，并删除关联 evaluator `tutor_job_artifacts`；content、FSRS、显式 rating、只含 error code/count 的 mastery 聚合保留。清理不承诺删除模型提供商已按其政策保留的请求。
+- 原始 answer 默认在本地保留 90 天，聚合 mastery/error counts 可长期保留；提供 `/anki:forget-attempts <all|days>` 和配置 `answerRetentionDays`。清理事务把 `attempts.answer_text` 置 NULL，删除/重写会回显答案的 `feedback_json`，并删除关联 evaluator `tutor_job_artifacts`；content、FSRS、显式 rating、只含 error code/count 的 mastery 聚合保留。清理不承诺删除模型提供商已按其政策保留的请求。
 - provider 的服务端保留政策不由本扩展控制，文档必须明确这一边界；用户可为 tutor 选择独立模型提供商。
 - 质量审查失败时不插入新课；答案评价失败时保留当前练习并允许重试、翻面或自评。
-- `/kaomoji:report` 的内容立即 quarantine，在复审通过前不得再次作为答案锚点。
+- `/anki:report` 的内容立即 quarantine，在复审通过前不得再次作为答案锚点。
 - provider 全部不可用时，已有卡片、FSRS 和命令仍可正常工作。
 - schema migration 必须幂等。由于已经运行的旧扩展不会理解新的版本字段，不能假设数据库能强制它主动失败；发布必须保持旧写路径可安全降级，并采用显式协议切换。
 
@@ -949,7 +949,7 @@ FEEDBACK
 
 ### Milestone 2：真实答案与反馈
 
-- 新增 `/kaomoji:answer`、`/kaomoji:hint`；
+- 新增 `/anki:answer`、`/anki:hint`；
 - 引入 attempts、evaluation lease 和全局 phase；
 - 实现确定性填空判断、双路 LLM 评价和反馈综合；
 - 旧卡没有 approved exercise 时继续使用 legacy render/flip/Good/Again，不阻塞 due；首次到期时排入 `exercise_backfill` tutor job，审查通过后从下一次复习启用主动练习；

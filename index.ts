@@ -50,7 +50,7 @@ export interface KaomojiEnglishTutorExtensionOptions {
 	runtimeFactory?: PiSdkRuntimeFactory;
 }
 
-export default function kaomojiEnglishTutorExtension(
+export default function piEnglishAnkiExtension(
 	pi: ExtensionAPI,
 	options: KaomojiEnglishTutorExtensionOptions = {},
 ) {
@@ -206,7 +206,7 @@ export default function kaomojiEnglishTutorExtension(
 		try {
 			await petTick(ctx);
 		} catch (err) {
-			console.error(`[kaomoji-english-tutor] Timer tick failed: ${err}`);
+			console.error(`[pi-english-anki] Timer tick failed: ${err}`);
 		}
 		if (sessionGeneration !== generation) return;
 		// Keep re-evaluating unless leaving a locally-rated card up for this session.
@@ -223,7 +223,7 @@ export default function kaomojiEnglishTutorExtension(
 		try {
 			current.close();
 		} catch (err) {
-			console.error(`[kaomoji-english-tutor] Failed to close DB: ${err}`);
+			console.error(`[pi-english-anki] Failed to close DB: ${err}`);
 		}
 	}
 
@@ -273,7 +273,7 @@ export default function kaomojiEnglishTutorExtension(
 			return true;
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-			console.error(`[kaomoji-english-tutor] Coordinator lease failed: ${err}`);
+			console.error(`[pi-english-anki] Coordinator lease failed: ${err}`);
 			return false;
 		}
 	}
@@ -309,7 +309,7 @@ export default function kaomojiEnglishTutorExtension(
 			return token;
 		} catch (err) {
 			try { db!.exec("ROLLBACK"); } catch { /* no transaction */ }
-			console.error(`[kaomoji-english-tutor] Generation lease failed: ${err}`);
+			console.error(`[pi-english-anki] Generation lease failed: ${err}`);
 			return null;
 		}
 	}
@@ -442,7 +442,7 @@ export default function kaomojiEnglishTutorExtension(
 					ensureCoordinator(new Date());
 				}
 			} catch (err) {
-				console.error(`[kaomoji-english-tutor] Sync poll failed: ${err}`);
+				console.error(`[pi-english-anki] Sync poll failed: ${err}`);
 			}
 			pollTimer = setTimeout(tick, SYNC_POLL_MS);
 			(pollTimer as unknown as { kaomojiPoll?: boolean }).kaomojiPoll = true;
@@ -500,7 +500,7 @@ export default function kaomojiEnglishTutorExtension(
 		if (!ctx.hasUI) return;
 		if (!config.showWidget) {
 			if (!judgingFrame) lastWidgetLines = [];
-			ctx.ui.setWidget("kaomoji-english-tutor", undefined);
+			ctx.ui.setWidget("pi-english-anki", undefined);
 			return;
 		}
 		const accent = (s: string): string => {
@@ -514,10 +514,10 @@ export default function kaomojiEnglishTutorExtension(
 		const out = lines.filter(Boolean).flatMap((line) => wrapTextWithAnsi(line, width));
 		if (!judgingFrame) lastWidgetLines = out.length === 0 ? [] : lines;
 		if (out.length === 0) {
-			ctx.ui.setWidget("kaomoji-english-tutor", undefined);
+			ctx.ui.setWidget("pi-english-anki", undefined);
 			return;
 		}
-		ctx.ui.setWidget("kaomoji-english-tutor", out.map(accent), { placement: "belowEditor" });
+		ctx.ui.setWidget("pi-english-anki", out.map(accent), { placement: "belowEditor" });
 	}
 
 	/** Whether an already-stored review/new card can be claimed right now. */
@@ -595,7 +595,7 @@ export default function kaomojiEnglishTutorExtension(
 			return db.prepare("SELECT * FROM items WHERE id = ?").get(due.id) as unknown as ItemRow | undefined;
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-			console.error(`[kaomoji-english-tutor] Due-card claim failed: ${err}`);
+			console.error(`[pi-english-anki] Due-card claim failed: ${err}`);
 			return undefined;
 		}
 	}
@@ -696,7 +696,7 @@ export default function kaomojiEnglishTutorExtension(
 			db.exec("COMMIT");
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-			console.error(`[kaomoji-english-tutor] Sentence-attempt CAS failed: ${err}`);
+			console.error(`[pi-english-anki] Sentence-attempt CAS failed: ${err}`);
 		}
 		renderGlobalCard(ctx);
 		return true;
@@ -742,7 +742,7 @@ export default function kaomojiEnglishTutorExtension(
 		}
 		if (!result.available) {
 			renderGlobalCard(ctx);
-			ctx.ui.notify("暂时无法可靠判断这个句子；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
+			ctx.ui.notify("暂时无法可靠判断这个句子；没有记录成绩，请稍后重试或使用 /anki:again", "warning");
 			return true;
 		}
 		const attempt: PendingAttempt = {
@@ -781,7 +781,7 @@ export default function kaomojiEnglishTutorExtension(
 		if (!item) return true;
 		if (item.type === "sentence") return answerSentencePending(ctx, item, rawText, state);
 		if (state.active_kind !== "review") {
-			ctx.ui.notify("这是首次展示的新卡，请先用 /kaomoji:flip 翻面查看释义，再选择 /kaomoji:good 或 /kaomoji:skip", "info");
+			ctx.ui.notify("这是首次展示的新卡，请先用 /anki:flip 翻面查看释义，再选择 /anki:good 或 /anki:skip", "info");
 			return true;
 		}
 		const text = rawText.trim();
@@ -791,7 +791,7 @@ export default function kaomojiEnglishTutorExtension(
 				: `✍️ 请写出「${item.meaning}」的英文`;
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} ${promptText}`,
-				"用 /kaomoji:answer <你的答案>，或 /kaomoji:hint 看提示，或 /kaomoji:flip 看答案",
+				"用 /anki:answer <你的答案>，或 /anki:hint 看提示，或 /anki:flip 看答案",
 				statsLine(db),
 			]);
 			return true;
@@ -828,7 +828,7 @@ export default function kaomojiEnglishTutorExtension(
 			}
 			if (!result.available) {
 				renderGlobalCard(ctx);
-				ctx.ui.notify("暂时无法可靠判断这个答案；没有记录成绩，请稍后重试或使用 /kaomoji:again", "warning");
+				ctx.ui.notify("暂时无法可靠判断这个答案；没有记录成绩，请稍后重试或使用 /anki:again", "warning");
 				return true;
 			}
 			verdict = result.verdict;
@@ -957,7 +957,7 @@ export default function kaomojiEnglishTutorExtension(
 
 		// A sentence Good must come from an evaluated written answer; manual Again remains an escape hatch.
 		if (item.type === "sentence" && rating === Rating.Good && !attempt) {
-			ctx.ui.notify("句子卡请先用 /kaomoji:answer <英文> 完成输出；也可以用 /kaomoji:again 结束本轮", "info");
+			ctx.ui.notify("句子卡请先用 /anki:answer <英文> 完成输出；也可以用 /anki:again 结束本轮", "info");
 			return true;
 		}
 
@@ -1001,7 +1001,7 @@ export default function kaomojiEnglishTutorExtension(
 					db.exec("COMMIT");
 				} catch (err) {
 					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-					console.error(`[kaomoji-english-tutor] Sentence CAS failed: ${err}`);
+					console.error(`[pi-english-anki] Sentence CAS failed: ${err}`);
 				}
 				if (!applied) {
 					clearPendingLocals();
@@ -1146,7 +1146,7 @@ export default function kaomojiEnglishTutorExtension(
 			} catch {
 				/* already rolled back */
 			}
-			console.error(`[kaomoji-english-tutor] Rate CAS failed: ${err}`);
+			console.error(`[pi-english-anki] Rate CAS failed: ${err}`);
 		} finally {
 			clearPendingLocals();
 		}
@@ -1772,7 +1772,7 @@ export default function kaomojiEnglishTutorExtension(
 			const existing = existsSync(globalPath) ? JSON.parse(readFileSync(globalPath, "utf-8")) : {};
 			writeFileSync(globalPath, JSON.stringify({ ...existing, ...patch }, null, 2) + "\n");
 		} catch (err) {
-			console.error(`[kaomoji-english-tutor] Failed to persist config: ${err}`);
+			console.error(`[pi-english-anki] Failed to persist config: ${err}`);
 		}
 	}
 
@@ -1795,7 +1795,7 @@ export default function kaomojiEnglishTutorExtension(
 		return true;
 	}
 
-	pi.registerCommand("kaomoji:model", {
+	pi.registerCommand("anki:model", {
 		description: "Show/set the lesson model: pick from authenticated models or pass provider/model",
 		handler: async (args, ctx) => {
 			const target = String(args ?? "").trim();
@@ -1842,11 +1842,11 @@ export default function kaomojiEnglishTutorExtension(
 				return;
 			}
 
-			ctx.ui.notify(`用法：/kaomoji:model（交互选择）或 /kaomoji:model <provider/model|编号>`, "info");
+			ctx.ui.notify(`用法：/anki:model（交互选择）或 /anki:model <provider/model|编号>`, "info");
 		},
 	});
 
-	pi.registerCommand("kaomoji:interval", {
+	pi.registerCommand("anki:interval", {
 		description: "Show/set the automatic lesson interval in minutes, or off",
 		handler: async (args, ctx) => {
 			const target = String(args ?? "").trim().toLowerCase();
@@ -1855,7 +1855,7 @@ export default function kaomojiEnglishTutorExtension(
 					config.intervalMinutes > 0 ? `当前自动检查间隔：${config.intervalMinutes} 分钟` : "自动检查已关闭",
 					"info",
 				);
-				ctx.ui.notify("用法：/kaomoji:interval <分钟|off>", "info");
+				ctx.ui.notify("用法：/anki:interval <分钟|off>", "info");
 				return;
 			}
 			if (target === "off") {
@@ -1877,14 +1877,14 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:thinking", {
+	pi.registerCommand("anki:thinking", {
 		description: "Show/set the lesson thinking level (off|minimal|low|medium|high|xhigh|max)",
 		handler: async (args, ctx) => {
 			const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 			const target = String(args ?? "").trim().toLowerCase();
 			if (!target) {
 				ctx.ui.notify(`当前备课思考等级：${config.thinkingLevel ?? "（provider 默认）"}`, "info");
-				ctx.ui.notify(`用法：/kaomoji:thinking <${LEVELS.join("|")}>`, "info");
+				ctx.ui.notify(`用法：/anki:thinking <${LEVELS.join("|")}>`, "info");
 				return;
 			}
 			if (!(LEVELS as readonly string[]).includes(target)) {
@@ -1897,7 +1897,7 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:flip", {
+	pi.registerCommand("anki:flip", {
 		description: "Toggle the shown card between question and answer sides",
 		handler: async (_args, ctx) => {
 			if (!flipPending(ctx)) {
@@ -1906,8 +1906,8 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:good", {
-		description: "Rate a word/phrase as remembered; sentences require /kaomoji:answer",
+	pi.registerCommand("anki:good", {
+		description: "Rate a word/phrase as remembered; sentences require /anki:answer",
 		handler: async (_args, ctx) => {
 			if (!ratePending(ctx, Rating.Good)) {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
@@ -1915,7 +1915,7 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:again", {
+	pi.registerCommand("anki:again", {
 		description: "Rate the pending review card as forgotten (FSRS Again)",
 		handler: async (_args, ctx) => {
 			if (!ratePending(ctx, Rating.Again)) {
@@ -1924,37 +1924,37 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:skip", {
+	pi.registerCommand("anki:skip", {
 		description: "Mark the shown card as known and generate a same-type replacement",
 		handler: async (_args, ctx) => {
 			await runSkipAction(ctx);
 		},
 	});
 
-	pi.registerCommand("kaomoji:answer", {
+	pi.registerCommand("anki:answer", {
 		description: "Submit bidirectional recall or progressive written sentence output",
 		handler: async (args, ctx) => {
 			const text = String(args ?? "").trim();
 			const ok = await answerPending(ctx, text);
 			if (!ok && !text) {
-				ctx.ui.notify("用法：/kaomoji:answer <你的答案>（无参数显示题目）", "info");
+				ctx.ui.notify("用法：/anki:answer <你的答案>（无参数显示题目）", "info");
 			}
 		},
 	});
 
-	pi.registerCommand("kaomoji:hint", {
+	pi.registerCommand("anki:hint", {
 		description: "Show a recall hint or the current sentence level's initial-letter hint",
 		handler: async (_args, ctx) => {
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
 		},
 	});
 
-	pi.registerCommand("kaomoji:teach", {
+	pi.registerCommand("anki:teach", {
 		description: "Prepare a lesson on a specific topic now (bypasses readiness detection)",
 		handler: async (args, ctx) => {
 			const topic = String(args ?? "").trim();
 			if (!topic) {
-				ctx.ui.notify("用法：/kaomoji:teach <话题>（例如 /kaomoji:teach async programming）", "info");
+				ctx.ui.notify("用法：/anki:teach <话题>（例如 /anki:teach async programming）", "info");
 				return;
 			}
 			manualTeachTopic = topic;
@@ -1964,12 +1964,12 @@ export default function kaomojiEnglishTutorExtension(
 				return;
 			}
 			void generateAndInsert(ctx, new Date())
-				.catch((err) => console.error(`[kaomoji-english-tutor] teach failed: ${err}`))
+				.catch((err) => console.error(`[pi-english-anki] teach failed: ${err}`))
 				.finally(() => scheduleTimer());
 		},
 	});
 
-	pi.registerCommand("kaomoji:stats", {
+	pi.registerCommand("anki:stats", {
 		description: "Show detailed learning statistics (mastery stages, reinforcement, answer accuracy)",
 		handler: async (_args, ctx) => {
 			if (!db) return;
@@ -1994,7 +1994,7 @@ export default function kaomojiEnglishTutorExtension(
 		},
 	});
 
-	pi.registerCommand("kaomoji:sync", {
+	pi.registerCommand("anki:sync", {
 		description: "立即将学习数据推送到云端同步仓库",
 		handler: async (_args, ctx) => {
 			if (!db) { ctx.ui.notify("数据库不可用", "error"); return; }
@@ -2031,7 +2031,7 @@ export default function kaomojiEnglishTutorExtension(
 		try {
 			db = openDb();
 		} catch (err) {
-			console.error(`[kaomoji-english-tutor] Failed to open DB: ${err}`);
+			console.error(`[pi-english-anki] Failed to open DB: ${err}`);
 			db = null;
 		}
 		if (db && (syncPull.status === "pulled" || syncPull.status === "error")) {
