@@ -152,6 +152,7 @@ Or add to `settings.json`:
 | `/anki:good` | Manual self-report of knowing: recorded separately and scheduled conservatively (at most Hard), never objective mastery evidence; cannot bypass required sentence output |
 | `/anki:again` | Manually rate forgotten; from any sentence level, end the cycle and schedule the next attempt from L1 |
 | `/anki:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |
+| `/anki:pull` | Pull newer learning data from the cloud (local DB backed up as `.bak`) |
 | `/anki:sync` | Push learning data to the cloud sync repo now |
 
 Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json`. If project config defines the same field, the project value wins after reload.
@@ -161,9 +162,9 @@ Takes effect immediately and persists to `~/.pi/agent/kaomoji-english-tutor.json
 Learning data syncs across machines through a private Git repo (whole-DB snapshot, last writer wins — use one machine at a time):
 
 1. Create a private repo (e.g. `kaomoji-tutor-data`) and clone it to `~/.pi/agent/kaomoji-english-tutor-sync/`; the extension auto-enables sync when this directory exists.
-2. **Pull**: on every session start (including `/reload`) — a newer remote snapshot replaces the local DB (backed up as `.bak-<timestamp>`); skipped while another local session is live.
+2. **Pull**: never blocks startup — a background check after session start nudges you when the cloud is newer; `/anki:pull` then swaps in the remote snapshot (local DB backed up as `.bak-<timestamp>`).
 3. **Push**: throttled by the timer (at most once per 30 min) after progress, plus a final push on session shutdown; `/anki:sync` pushes immediately.
-4. A push is refused when the remote holds newer progress — `/reload` pulls it instead of clobbering.
+4. A push is refused when the remote holds newer progress — `/anki:pull` pulls it instead of clobbering.
 5. Sync actions land in the generation decision log (`sync_pulled` / `sync_pushed` / `sync_remote_newer` / `sync_error`), visible via `/anki:stats`.
 
 ### Configuration

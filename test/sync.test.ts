@@ -14,7 +14,7 @@ mkdirSync(agentDirB);
 process.env.PI_CODING_AGENT_DIR = agentDirA;
 
 const { insertItem, openDb, touchClient } = await import("../db.ts");
-const { activityTs, dbFilePath, pullIfNewer, pushSnapshot } = await import("../sync.ts");
+const { activityTs, dbFilePath, peekRemoteNewer, pullIfNewer, pushSnapshot } = await import("../sync.ts");
 
 function git(cwd: string, args: string[]): string {
 	return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -119,4 +119,55 @@ test("pull skipped while another local session is live", async () => {
 	const pull = await pullIfNewer(dbFilePath());
 	assert.equal(pull.status, "skipped_active_session");
 	assert.ok(existsSync(join(syncA, "kaomoji-english-tutor.db")));
+});
+
+test("force pull replaces the file even while a local session is live", async () => {
+	// Machine B pushes newer data.
+	process.env.PI_CODING_AGENT_DIR = agentDirB;
+	process.env.KAOMOJI_SYNC_DIR = syncB;
+	const dbB = openDb();
+	insertWord(dbB, "epsilon", "2026-08-15T12:00:00.000Z");
+	assert.equal((await pushSnapshot(dbB, { ignoreThrottle: true })).status, "pushed");
+	dbB.close();
+
+	// Machine A still has the fresh live-client row from the previous test.
+	process.env.PI_CODING_AGENT_DIR = agentDirA;
+	process.env.KAOMOJI_SYNC_DIR = syncA;
+	assert.equal((await pullIfNewer(dbFilePath())).status, "skipped_active_session");
+	const forced = await pullIfNewer(dbFilePath(), { force: true });
+	assert.equal(forced.status, "pulled");
+	const dbA = openDb();
+	try {
+		const texts = (dbA.prepare("SELECT text FROM items ORDER BY id").all() as { text: string }[]).map((r) => r.text);
+		assert.ok(texts.includes("epsilon"));
+	} finally {
+		dbA.close();
+	}
+});
+
+test("peekRemoteNewer reports a newer remote without touching the local file", async () => {
+	// Machine B pushes newer data.
+	process.env.PI_CODING_AGENT_DIR = agentDirB;
+	process.env.KAOMOJI_SYNC_DIR = syncB;
+	const dbB = openDb();
+	insertWord(dbB, "zeta", "2026-08-15T13:00:00.000Z");
+	assert.equal((await pushSnapshot(dbB, { ignoreThrottle: true })).status, "pushed");
+	dbB.close();
+
+	process.env.PI_CODING_AGENT_DIR = agentDirA;
+	process.env.KAOMOJI_SYNC_DIR = syncA;
+	const peek = await peekRemoteNewer(dbFilePath());
+	assert.equal(peek.remoteNewer, true);
+	assert.ok(peek.remoteTs);
+	// Local file untouched: no zeta present.
+	const dbA = openDb();
+	try {
+		const texts = (dbA.prepare("SELECT text FROM items ORDER BY id").all() as { text: string }[]).map((r) => r.text);
+		assert.ok(!texts.includes("zeta"));
+	} finally {
+		dbA.close();
+	}
+	// After a force pull, peek reports the local file is current.
+	assert.equal((await pullIfNewer(dbFilePath(), { force: true })).status, "pulled");
+	assert.equal((await peekRemoteNewer(dbFilePath())).remoteNewer, false);
 });

@@ -15,7 +15,7 @@ import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
-import { dbFilePath, isSyncEnabled, pullIfNewer, pushSnapshot } from "./sync.ts";
+import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
 import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, smoothBudget, type AdaptiveContext } from "./learner-profile.ts";
 
 export { contentFingerprint };
@@ -175,7 +175,7 @@ export default function piEnglishAnkiExtension(
 		try {
 			const r = await pushSnapshot(db);
 			if (r.status === "pushed") appendGenLog(db, `sync_pushed: ${r.localTs ?? ""}`);
-			else if (r.status === "remote_newer") appendGenLog(db, "sync_remote_newer: 云端有更新的进度，/reload 后自动拉取");
+			else if (r.status === "remote_newer") appendGenLog(db, "sync_remote_newer: 云端有更新的进度，/anki:pull 拉取");
 			else if (r.status === "error") appendGenLog(db, `sync_error: ${r.message ?? ""}`);
 		} catch { /* sync must never break the tick */ }
 	}
@@ -225,6 +225,23 @@ export default function piEnglishAnkiExtension(
 		} catch (err) {
 			console.error(`[pi-english-anki] Failed to close DB: ${err}`);
 		}
+	}
+
+	/** Attach this session to the freshly opened DB: identity, card render, polling. */
+	function attachDb(ctx: ExtensionContext) {
+		resolveModel(ctx);
+		if (!db) return;
+		ensureCoordinator(new Date(), true);
+		setStat(db, "pet_alive", new Date().toISOString());
+		setStat(db, "pet_config_model", `${config.provider}/${config.model}`);
+		touchClient(db, myId);
+		// Rebuild the active global card so this session converges immediately.
+		if (activeItem(db)) {
+			renderGlobalCard(ctx);
+		} else if (localVersion < 0) {
+			updateWidget(ctx, FACES.idle, [statsLine(db)]);
+		}
+		startPolling();
 	}
 
 	// -- Coordinator lease & cross-session sync ----------------------------
@@ -1994,6 +2011,45 @@ export default function piEnglishAnkiExtension(
 		},
 	});
 
+	pi.registerCommand("anki:pull", {
+		description: "从云端拉取更新的学习数据（本地旧库备份为 .bak）",
+		handler: async (_args, ctx) => {
+			if (!isSyncEnabled()) { ctx.ui.notify("未配置同步仓库：~/.pi/agent/kaomoji-english-tutor-sync", "warning"); return; }
+			if (answerJudging || pendingLLMCall) { ctx.ui.notify("正在判题/备课，稍后再拉取", "warning"); return; }
+			const generation = sessionGeneration;
+			stopAnswerThinking();
+			stopTimer();
+			stopPolling();
+			releaseCoordinator();
+			if (db) {
+				// Unregister myself so the live-client guard does not refuse the swap.
+				try { db.prepare("DELETE FROM runtime_clients WHERE client_id = ?").run(myId); } catch { /* best effort */ }
+			}
+			clearPendingLocals();
+			localVersion = -1;
+			closeDb();
+			const r = await pullIfNewer(dbFilePath(), { force: true });
+			if (generation !== sessionGeneration) return; // a newer session_start owns the DB now
+			try {
+				db = openDb();
+			} catch (err) {
+				console.error(`[pi-english-anki] Failed to reopen DB after pull: ${err}`);
+				db = null;
+			}
+			if (db && (r.status === "pulled" || r.status === "error")) {
+				appendGenLog(db, r.status === "pulled"
+					? `sync_pulled: ${r.remoteTs}`
+					: `sync_pull_error: ${r.message ?? ""}`);
+			}
+			attachDb(ctx);
+			scheduleTimer();
+			if (r.status === "pulled") ctx.ui.notify("已从云端拉取最新学习数据 ✓（旧本地库已备份 .bak）", "info");
+			else if (r.status === "current") ctx.ui.notify("本地已是最新，无需拉取", "info");
+			else if (r.status === "no_remote") ctx.ui.notify("远端还没有可拉取的快照", "warning");
+			else if (r.status !== "disabled") ctx.ui.notify(`拉取失败：${r.message ?? r.status}`, "error");
+		},
+	});
+
 	pi.registerCommand("anki:sync", {
 		description: "立即将学习数据推送到云端同步仓库",
 		handler: async (_args, ctx) => {
@@ -2002,7 +2058,7 @@ export default function piEnglishAnkiExtension(
 			const r = await pushSnapshot(db, { ignoreThrottle: true });
 			if (r.status === "pushed") ctx.ui.notify("学习数据已推送到云端 ✓", "info");
 			else if (r.status === "unchanged") ctx.ui.notify("没有需要推送的新进度", "info");
-			else if (r.status === "remote_newer") ctx.ui.notify("云端有更新的进度，/reload 后会自动拉取覆盖本地（旧本地库会备份为 .bak）", "warning");
+			else if (r.status === "remote_newer") ctx.ui.notify("云端有更新的进度，执行 /anki:pull 拉取（本地旧库会备份 .bak）", "warning");
 			else ctx.ui.notify(`同步失败：${r.message ?? r.status}`, "error");
 		},
 	});
@@ -2026,34 +2082,21 @@ export default function piEnglishAnkiExtension(
 		}
 		myId = myCoordinatorId(sessionId, instanceToken);
 		clearPendingLocals();
-		// Cloud sync: pull a newer remote snapshot before opening the local DB.
-		const syncPull = await pullIfNewer(dbFilePath());
+		// Cloud sync never blocks startup: no network here. A background peek
+		// runs after attach and nudges toward /anki:pull when the cloud is newer.
 		try {
 			db = openDb();
 		} catch (err) {
 			console.error(`[pi-english-anki] Failed to open DB: ${err}`);
 			db = null;
 		}
-		if (db && (syncPull.status === "pulled" || syncPull.status === "error")) {
-			appendGenLog(db, syncPull.status === "pulled"
-				? `sync_pulled: ${syncPull.remoteTs}`
-				: `sync_pull_error: ${syncPull.message ?? ""}`);
-		}
-		resolveModel(ctx);
-		if (db) {
-			ensureCoordinator(new Date(), true);
-			setStat(db, "pet_alive", new Date().toISOString());
-			setStat(db, "pet_config_model", `${config.provider}/${config.model}`);
-			touchClient(db, myId);
-			// Rebuild the active global card so this session converges immediately.
-			if (activeItem(db)) {
-				renderGlobalCard(ctx);
-			} else if (localVersion < 0) {
-				updateWidget(ctx, FACES.idle, [statsLine(db)]);
-			}
-			startPolling();
-		}
+		attachDb(ctx);
 		scheduleTimer();
+		const generation = sessionGeneration;
+		void peekRemoteNewer().then((r) => {
+			if (generation !== sessionGeneration || !latestCtx || isCtxStale(latestCtx)) return;
+			if (r.remoteNewer) latestCtx.ui.notify("云端有更新的学习进度，执行 /anki:pull 拉取（本地旧库会备份 .bak）", "warning");
+		}, () => { /* peek must never surface errors */ });
 	});
 
 	pi.on("session_shutdown", async () => {

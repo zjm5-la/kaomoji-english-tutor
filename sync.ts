@@ -125,16 +125,18 @@ function releaseLock(): void {
  * Skipped while another local session is live (its heartbeats prove it owns fresher state).
  * Runs before openDb in session_start, so no local connection is held by this session.
  */
-export async function pullIfNewer(localDbPath = dbFilePath()): Promise<SyncResult> {
+export async function pullIfNewer(localDbPath = dbFilePath(), opts: { force?: boolean } = {}): Promise<SyncResult> {
 	if (!isSyncEnabled()) return { status: "disabled" };
 	if (!acquireLock()) return { status: "locked" };
 	try {
+		// Cheap local check first: never touch the network when a live local
+		// session makes replacing the file unsafe anyway (unless forced).
+		const local = activityTsFromFile(localDbPath);
+		if (local.liveClients && !opts.force) return { status: "skipped_active_session", localTs: local.ts };
 		const remoteBuf = await fetchRemoteDb();
 		if (!remoteBuf) return { status: "no_remote" };
 		const remoteTs = activityTsFromBuffer(remoteBuf);
 		if (!remoteTs) return { status: "no_remote" };
-		const local = activityTsFromFile(localDbPath);
-		if (local.liveClients) return { status: "skipped_active_session", localTs: local.ts, remoteTs };
 		if (local.ts && remoteTs <= local.ts) return { status: "current", localTs: local.ts, remoteTs };
 		if (existsSync(localDbPath)) {
 			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -147,6 +149,26 @@ export async function pullIfNewer(localDbPath = dbFilePath()): Promise<SyncResul
 		return { status: "pulled", localTs: local.ts, remoteTs };
 	} catch (err) {
 		return { status: "error", message: String((err as Error)?.message || err) };
+	} finally {
+		releaseLock();
+	}
+}
+
+/**
+ * Non-destructive remote check: reports whether the cloud snapshot holds newer
+ * activity without replacing or locking out anything. Used for background
+ * nudges; /anki:pull performs the actual swap.
+ */
+export async function peekRemoteNewer(localDbPath = dbFilePath()): Promise<{ remoteNewer: boolean; remoteTs: string | null }> {
+	if (!isSyncEnabled()) return { remoteNewer: false, remoteTs: null };
+	if (!acquireLock()) return { remoteNewer: false, remoteTs: null };
+	try {
+		const local = activityTsFromFile(localDbPath);
+		const remoteBuf = await fetchRemoteDb();
+		const remoteTs = remoteBuf ? activityTsFromBuffer(remoteBuf) : null;
+		return { remoteNewer: Boolean(remoteTs && (!local.ts || remoteTs > local.ts)), remoteTs };
+	} catch {
+		return { remoteNewer: false, remoteTs: null };
 	} finally {
 		releaseLock();
 	}
