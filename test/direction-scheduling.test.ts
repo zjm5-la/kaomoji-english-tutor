@@ -115,19 +115,43 @@ test("advanceReviewDirectional keeps directions independent and mirrors items", 
 		assert.equal(rows1.length, 2);
 		assert.equal(rows1[0].fsrs_state, good.state);
 		assert.equal(rows1[1].fsrs_state, "", "untested sibling starts empty");
-		assert.equal(rows1[1].due_at, good.due, "sibling first surfaces with the rated direction");
+		assert.equal(rows1[1].due_at, new Date(T0.getTime() + 24 * 3600 * 1000).toISOString(), "sibling first surfaces at least 24h after the rated direction");
 		const mirror1 = h.db.prepare("SELECT fsrs_state, due_at, reviews FROM items WHERE id = ?").get(id) as { fsrs_state: string; due_at: string; reviews: number };
 		assert.equal(mirror1.fsrs_state, good.state, "items.fsrs_state mirrors forward (production)");
 		assert.equal(mirror1.due_at, good.due);
 		assert.equal(mirror1.reviews, 1);
-		// Rate reverse Again: items.due_at becomes the earlier reverse due; forward untouched.
+		// Rate reverse Again: items.due_at becomes the earlier reverse due; forward state
+		// untouched, but its near-term due is raised to the 24h separation floor.
 		advanceReviewDirectional(h.db, id, "reverse", again.state, again.due, 2, T0);
 		const fwd = h.db.prepare("SELECT fsrs_state, due_at FROM direction_state WHERE item_id = ? AND direction = 'forward'").get(id) as { fsrs_state: string; due_at: string };
 		assert.equal(fwd.fsrs_state, good.state, "recognition failure must not overwrite production state");
-		assert.equal(fwd.due_at, good.due);
+		assert.equal(fwd.due_at, new Date(T0.getTime() + 24 * 3600 * 1000).toISOString(), "sibling due is clamped to the 24h floor");
 		const mirror2 = h.db.prepare("SELECT fsrs_state, due_at FROM items WHERE id = ?").get(id) as { fsrs_state: string; due_at: string };
 		assert.equal(mirror2.due_at, again.due < good.due ? again.due : good.due, "items.due_at = min over directions");
 		assert.equal(mirror2.fsrs_state, good.state);
+	} finally {
+		h.close();
+	}
+});
+
+test("rating one direction pushes an overdue sibling at least 24h out", () => {
+	const h = freshDb();
+	try {
+		const id = insertRatedWord(h.db, "dual", "", T0.toISOString());
+		// Legacy state: both directions due right now (backfilled identically).
+		const nowIso = T0.toISOString();
+		h.db.prepare("UPDATE direction_state SET due_at = ?").run(nowIso);
+		const good = scheduleNext(null, T0, Rating.Good);
+		assert.ok(!("corrupt" in good));
+		advanceReviewDirectional(h.db, id, "forward", good.state, good.due, 1, T0);
+		const rev = h.db.prepare("SELECT due_at FROM direction_state WHERE item_id = ? AND direction = 'reverse'").get(id) as { due_at: string };
+		assert.equal(rev.due_at, new Date(T0.getTime() + 24 * 3600 * 1000).toISOString(), "overdue sibling deferred to now+24h");
+		// A sibling already scheduled beyond 24h keeps its own FSRS plan.
+		const later = new Date(T0.getTime() + 72 * 3600 * 1000).toISOString();
+		h.db.prepare("UPDATE direction_state SET due_at = ? WHERE item_id = ? AND direction = 'reverse'").run(later, id);
+		advanceReviewDirectional(h.db, id, "forward", good.state, good.due, 2, new Date(T0.getTime() + 3600 * 1000));
+		const rev2 = h.db.prepare("SELECT due_at FROM direction_state WHERE item_id = ? AND direction = 'reverse'").get(id) as { due_at: string };
+		assert.equal(rev2.due_at, later, "sibling beyond the 24h floor is not pulled earlier");
 	} finally {
 		h.close();
 	}

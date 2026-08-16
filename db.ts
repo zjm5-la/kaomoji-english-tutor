@@ -725,6 +725,13 @@ export function directionFsrsState(db: DatabaseSync, itemId: number, direction: 
  * items.fsrs_state mirrors the forward (production) state and items.due_at is
  * the minimum over both directions, so legacy readers stay consistent.
  */
+/**
+ * Minimum spacing between the two recall directions of one item: rating one
+ * direction pushes the other at least this far out, so recognition can never
+ * prime a same-day production answer (and vice versa).
+ */
+export const DIRECTION_MIN_SEPARATION_MS = 24 * 3600 * 1000;
+
 export function advanceReviewDirectional(
 	db: DatabaseSync,
 	id: number,
@@ -736,9 +743,14 @@ export function advanceReviewDirectional(
 ) {
 	const ts = now.toISOString();
 	const sibling = direction === "forward" ? "reverse" : "forward";
+	const siblingMinDue = new Date(now.getTime() + DIRECTION_MIN_SEPARATION_MS).toISOString();
 	db.prepare(
 		"INSERT OR IGNORE INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, '', ?, ?)",
-	).run(id, sibling, dueAt, ts);
+	).run(id, sibling, siblingMinDue, ts);
+	// An already-scheduled sibling keeps its FSRS plan but cannot surface within 24h.
+	db.prepare(
+		"UPDATE direction_state SET due_at = MAX(due_at, ?), updated_at = ? WHERE item_id = ? AND direction = ?",
+	).run(siblingMinDue, ts, id, sibling);
 	db.prepare(
 		`INSERT INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(item_id, direction) DO UPDATE SET fsrs_state = excluded.fsrs_state, due_at = excluded.due_at, updated_at = excluded.updated_at`,
