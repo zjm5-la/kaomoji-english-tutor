@@ -71,6 +71,10 @@ export default function kaomojiEnglishTutorExtension(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let answerThinkingTimer: ReturnType<typeof setInterval> | undefined;
+	/** Raw lines of the latest real widget render; the judging animation overlays these. */
+	let lastWidgetLines: string[] = [];
+	/** While true, the judging animation owns the widget and other renders are dropped. */
+	let answerJudging = false;
 	let latestCtx: ExtensionContext | undefined;
 	/** Per-runtime identity; distinct even when two processes open the same logical session. */
 	const instanceToken = randomUUID();
@@ -133,12 +137,17 @@ export default function kaomojiEnglishTutorExtension(
 	}
 
 	function stopAnswerThinking() {
+		answerJudging = false;
 		if (answerThinkingTimer) clearInterval(answerThinkingTimer);
 		answerThinkingTimer = undefined;
 	}
 
 	function startAnswerThinking(ctx: ExtensionContext, expectedGeneration: number) {
 		stopAnswerThinking();
+		// Overlay the spinner on the card being judged so the widget keeps a
+		// stable height; replacing the card with a bare 2-line spinner collapses
+		// and re-expands the layout on every interleaved render (flicker).
+		const base = lastWidgetLines;
 		let frame = 0;
 		const render = () => {
 			if (sessionGeneration !== expectedGeneration || isCtxStale(ctx)) {
@@ -146,11 +155,12 @@ export default function kaomojiEnglishTutorExtension(
 				return;
 			}
 			updateWidget(ctx, FACES.review, [
+				...base,
 				`${ANSWER_THINKING_FRAMES[frame % ANSWER_THINKING_FRAMES.length]} 正在判断你的答案…`,
-				...(db ? [statsLine(db)] : []),
-			]);
+			], true);
 			frame++;
 		};
+		answerJudging = true;
 		render();
 		answerThinkingTimer = setInterval(render, ANSWER_THINKING_INTERVAL_MS);
 		answerThinkingTimer.unref?.();
@@ -481,10 +491,15 @@ export default function kaomojiEnglishTutorExtension(
 		return undefined;
 	}
 
-	function updateWidget(ctx: ExtensionContext, _face: string, lines: string[]) {
+	function updateWidget(ctx: ExtensionContext, _face: string, lines: string[], judgingFrame = false) {
+		// While the answer-judging animation is running it owns the widget: drop
+		// interleaved renders (sync-poll card paints, stray pet ticks) so the
+		// widget cannot alternate between the card and the spinner (flicker).
+		if (answerJudging && !judgingFrame) return;
 		if (isCtxStale(ctx)) return;
 		if (!ctx.hasUI) return;
 		if (!config.showWidget) {
+			if (!judgingFrame) lastWidgetLines = [];
 			ctx.ui.setWidget("kaomoji-english-tutor", undefined);
 			return;
 		}
@@ -497,6 +512,7 @@ export default function kaomojiEnglishTutorExtension(
 		};
 		const width = Math.max(20, (process.stdout.columns || 120) - 2);
 		const out = lines.filter(Boolean).flatMap((line) => wrapTextWithAnsi(line, width));
+		if (!judgingFrame) lastWidgetLines = out.length === 0 ? [] : lines;
 		if (out.length === 0) {
 			ctx.ui.setWidget("kaomoji-english-tutor", undefined);
 			return;

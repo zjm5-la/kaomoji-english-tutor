@@ -371,6 +371,56 @@ test("answer shows a thinking animation while sentence evaluation is pending", {
 	}
 });
 
+test("answer judging keeps the card visible and ignores cross-session repaints", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-answer-flicker" });
+	let releaseResponse!: () => void;
+	let responseStarted!: () => void;
+	const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+	const started = new Promise<void>((resolve) => { responseStarted = resolve; });
+	try {
+		registration.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage(JSON.stringify({ verdict: "partial", feedback: "拼写差一点" }));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "answer-flicker" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','condition','（判断）条件',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire(); // claim + render the review question
+		const cardLines = harness.widget();
+		assert.match(cardLines.join(" "), /复习时间到/);
+		const inFlight = harness.commands["kaomoji:answer"].handler("conditon", harness.ctx);
+		await started;
+		const judging = harness.widget();
+		assert.match(judging.join(" "), /正在判断你的答案/);
+		assert.equal(judging.length, cardLines.length + 1, "spinner overlays the card instead of replacing it");
+		for (const line of cardLines) assert.ok(judging.includes(line), `card line preserved during judging: ${line}`);
+		// Another session commits to the shared DB; the sync poll must not repaint over the animation.
+		const external = openTestDb();
+		external.prepare("UPDATE items SET learned_at = learned_at WHERE id = 1").run();
+		external.close();
+		await fake.firePoll();
+		const afterPoll = harness.widget();
+		assert.equal(afterPoll.length, judging.length, "poll repaint cannot change widget height during judging");
+		assert.match(afterPoll.join(" "), /正在判断你的答案/);
+		releaseResponse();
+		await inFlight;
+		assert.doesNotMatch(harness.widget().join(" "), /正在判断你的答案/, "animation stops after evaluation");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		releaseResponse?.();
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("sentence spelling feedback highlights the changed letter order", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-spelling-diff" });
