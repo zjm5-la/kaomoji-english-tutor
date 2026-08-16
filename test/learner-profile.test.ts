@@ -545,10 +545,9 @@ test("in-budget sentence passes the deterministic gate and may reach the LLM cri
 	assert.equal(calls, 1, "LLM critic reached because the deterministic gate passed");
 });
 
-test("generateLesson accepts a valid 9-word B0 lesson (lower budget min, no >=15 veto)", async () => {
-	// Under a B0 budget (word range [8,12]), a valid 9-word progressive sentence must
-	// pass validSentenceTraining and be accepted ready=true. The legacy >=15 floor
-	// would have thrown INVALID_SENTENCE_TRAINING for a 9-word sentence.
+test("generateLesson accepts a valid 9-word B0 cloze lesson (lower budget min)", async () => {
+	// Under a B0 budget (word range [8,12]), a valid 9-word cloze sentence must be
+	// accepted ready=true with exactly one blank.
 	let calls = 0;
 	let captured = "";
 	const llm = {
@@ -561,11 +560,8 @@ test("generateLesson accepts a valid 9-word B0 lesson (lower budget min, no >=15
 					{ type: "word", text: "fox", meaning: "狐", example: "The fox runs.", example_cn: "狐在跑。" },
 					{ type: "phrase", text: "lazy dog", meaning: "懒狗", example: "The lazy dog sleeps.", example_cn: "懒狗在睡。" },
 					{
-						type: "sentence", text: "The brown fox jumps over the lazy dog here.", meaning: "那只棕狐跳过了懒狗。",
-						levels: ["The fox jumps.", "The fox jumps over the dog.", "The brown fox jumps over the lazy dog here."],
-						levels_cn: ["狐跳。", "狐跳过狗。", "那只棕狐跳过了懒狗。"],
-						chunks: ["The brown fox", "jumps over", "the lazy dog here"],
-						keyWords: [{ text: "fox", meaning: "狐" }],
+					type: "cloze", text: "The brown fox ___ (jump) over the lazy dog now.", meaning: "jumps",
+					example: "The brown fox jumps over the lazy dog now.", example_cn: "那只棕狐现在跳过了懒狗。（考点：第三人称单数）",
 					},
 				],
 			});
@@ -576,8 +572,8 @@ test("generateLesson accepts a valid 9-word B0 lesson (lower budget min, no >=15
 	profile.syntax.band = "B0";
 	const adaptive: AdaptiveContext = { profile, budget: deriveBudget(profile) };
 	const decision = await generateLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "a conversation about a fox", [], FAKE_CONFIG, undefined, adaptive);
-	assert.equal(decision.ready, true, "9-word B0 sentence passes validSentenceTraining under the budget min");
-	assert.equal(calls, 1, "no backfill call needed for a complete valid sentence");
+	assert.equal(decision.ready, true, "9-word B0 cloze passes the budget min");
+	assert.equal(calls, 1, "single generation call for a complete valid cloze");
 	assert.match(captured, /8-12/, "B0 word range reaches the generation prompt");
 });
 

@@ -17,6 +17,7 @@ export const TYPE_LABELS: Record<string, string> = {
 	word: "单词",
 	phrase: "词组",
 	sentence: "句子",
+	cloze: "语法填空",
 };
 
 function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): { total: number; reviews: number; newCards: number } {
@@ -169,6 +170,7 @@ export function sentenceExercise(item: ItemRow, requestedLevel = item.progress):
 
 /** Canonical recall question text — single source for card display and attempt logs. */
 export function recallQuestionText(item: ItemRow, direction: "forward" | "reverse"): string {
+	if (item.type === "cloze") return `语法填空：${item.text}`;
 	return direction === "reverse"
 		? `写出「${item.text}」的中文释义`
 		: `默写「${item.meaning}」的英文`;
@@ -206,6 +208,28 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 			if (exercise.level === levels.length - 1 && chunks?.length) lines.push(`  意群：${chunks.join(" / ")}`);
 		}
 		lines.push("💬 /anki:answer <英文> · /anki:hint · /anki:flip · /anki:again");
+		return lines;
+	}
+
+	// Cloze cards test one grammar point: fill the single blank in the sentence.
+	if (item.type === "cloze") {
+		if (isReview) {
+			if (showAnswer) {
+				lines.push(`${face} 语法填空：${item.example || item.text.replace("___", item.meaning)}`);
+				lines.push(`  答案：${item.meaning}`);
+				lines.push(`  第 ${item.reviews + 1} 次复习`);
+				if (item.example_cn) lines.push(`  ${item.example_cn}`);
+			} else {
+				lines.push(`${face} 语法填空：${item.text}`);
+				if (item.example_cn) lines.push(`  句意：${item.example_cn}`);
+			}
+			lines.push("💬 /anki:answer <答案> · /anki:hint 提示 · /anki:flip 翻面 · /anki:again 忘了");
+		} else {
+			lines.push(`${face} ${label}：${item.example || item.text.replace("___", item.meaning)}`);
+			lines.push(`  答案：${item.text} → ${item.meaning}`);
+			if (item.example_cn) lines.push(`  ${item.example_cn}`);
+			lines.push("💬 /anki:flip 翻面 · /anki:skip 已会");
+		}
 		return lines;
 	}
 

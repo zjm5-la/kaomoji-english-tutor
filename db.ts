@@ -9,7 +9,7 @@ import type { GeneratedItem } from "./llm.ts";
 
 export interface ItemRow {
 	id: number;
-	type: "word" | "phrase" | "sentence";
+	type: "word" | "phrase" | "sentence" | "cloze";
 	text: string;
 	phonetic: string | null;
 	meaning: string;
@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 10;
+const SCHEMA_TARGET_VERSION = 11;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -333,7 +333,68 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	(db: DatabaseSync) => {
 		migrateDirectionState(db);
 	},
+	// v11: cloze grammar-fill cards. Existing sentence cards keep working; the
+	// generator's third slot becomes cloze instead of progressive sentences.
+	(db: DatabaseSync) => {
+		rebuildItemsTableForCloze(db);
+	},
 ];
+
+/** Recreate items with a CHECK that also admits 'cloze' (SQLite cannot ALTER a CHECK). */
+function rebuildItemsTableForCloze(db: DatabaseSync): void {
+	db.exec(`
+		CREATE TABLE items_v11 (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			type TEXT NOT NULL CHECK (type IN ('word', 'phrase', 'sentence', 'cloze')),
+			text TEXT NOT NULL,
+			phonetic TEXT,
+			meaning TEXT NOT NULL,
+			example TEXT,
+			example_cn TEXT,
+			learned_at TEXT NOT NULL,
+			fsrs_state TEXT NOT NULL DEFAULT '',
+			due_at TEXT NOT NULL,
+			shown INTEGER NOT NULL DEFAULT 0,
+			reviews INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'learning',
+			levels TEXT,
+			levels_cn TEXT,
+			chunks TEXT,
+			key_words TEXT,
+			progress INTEGER NOT NULL DEFAULT 0,
+			lesson_id INTEGER,
+			lexical_sense_id INTEGER,
+			role TEXT,
+			content_fingerprint TEXT,
+			content_version INTEGER NOT NULL DEFAULT 1,
+			introduced_at TEXT,
+			introduction_kind TEXT,
+			introduction_accuracy TEXT NOT NULL DEFAULT 'exact',
+			content_status TEXT NOT NULL DEFAULT 'approved',
+			legacy_duplicate_of INTEGER,
+			fsrs_status TEXT NOT NULL DEFAULT 'ok',
+			fsrs_error TEXT,
+			fsrs_corrupt_at TEXT
+		);
+		INSERT INTO items_v11 (
+			id, type, text, phonetic, meaning, example, example_cn, learned_at, fsrs_state, due_at,
+			shown, reviews, status, levels, levels_cn, chunks, key_words, progress, lesson_id, lexical_sense_id,
+			role, content_fingerprint, content_version, introduced_at, introduction_kind, introduction_accuracy,
+			content_status, legacy_duplicate_of, fsrs_status, fsrs_error, fsrs_corrupt_at
+		)
+		SELECT
+			id, type, text, phonetic, meaning, example, example_cn, learned_at, fsrs_state, due_at,
+			shown, reviews, status, levels, levels_cn, chunks, key_words, progress, lesson_id, lexical_sense_id,
+			role, content_fingerprint, content_version, introduced_at, introduction_kind, introduction_accuracy,
+			content_status, legacy_duplicate_of, fsrs_status, fsrs_error, fsrs_corrupt_at
+		FROM items;
+		DROP TABLE items;
+		ALTER TABLE items_v11 RENAME TO items;
+		CREATE UNIQUE INDEX IF NOT EXISTS items_content_fingerprint_uq ON items(content_fingerprint) WHERE content_fingerprint IS NOT NULL;
+		CREATE INDEX IF NOT EXISTS items_due_shown_idx ON items(due_at, shown, id) WHERE content_status = 'approved';
+		CREATE INDEX IF NOT EXISTS items_introduction_idx ON items(introduction_kind, introduced_at) WHERE introduction_kind = 'planned';
+	`);
+}
 
 /**
  * Create direction_state and backfill both directions from the legacy single
@@ -421,7 +482,7 @@ export function openDb(): DatabaseSync {
 		PRAGMA journal_mode = WAL;
 		CREATE TABLE IF NOT EXISTS items (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			type TEXT NOT NULL CHECK (type IN ('word', 'phrase', 'sentence')),
+			type TEXT NOT NULL CHECK (type IN ('word', 'phrase', 'sentence', 'cloze')),
 			text TEXT NOT NULL,
 			phonetic TEXT,
 			meaning TEXT NOT NULL,
@@ -805,7 +866,7 @@ export function pendingReplacementTypes(
 		if (!Array.isArray(parsed)) return [];
 		return parsed.filter(
 			(type): type is GeneratedItem["type"] =>
-				type === "word" || type === "phrase" || type === "sentence",
+				type === "word" || type === "phrase" || type === "sentence" || type === "cloze",
 		);
 	} catch {
 		return [];

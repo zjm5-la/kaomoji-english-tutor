@@ -421,6 +421,100 @@ test("answer judging keeps the card visible and ignores cross-session repaints",
 	}
 });
 
+function insertClozeCard(db: DatabaseSync, shown: 0 | 1 = 0) {
+	db.prepare(
+		"INSERT INTO items(type,text,phonetic,meaning,example,example_cn,learned_at,due_at,shown) VALUES('cloze',?,NULL,?,?,?,?,?,?)",
+	).run(
+		"The fix that ___ (commit) this morning won't take effect until you reload.",
+		"was committed",
+		"The fix that was committed this morning won't take effect until you reload.",
+		"今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
+		new Date().toISOString(),
+		new Date(0).toISOString(),
+		shown,
+	);
+}
+
+function makeClozeDue() {
+	const db = openTestDb();
+	db.prepare("UPDATE items SET due_at = ? WHERE type = 'cloze'").run(new Date(0).toISOString());
+	db.prepare("UPDATE runtime_state SET next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
+	db.close();
+}
+
+test("cloze lifecycle: teach face, review answer, exact match, and LLM partial", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-cloze-life" });
+	try {
+		// One evaluator call for the near-miss answer at the end of the test.
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ verdict: "partial", feedback: "少了 was：应为被动语态。" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "cloze-life" });
+		const db = openTestDb();
+		insertClozeCard(db);
+		db.close();
+		await fake.fire();
+		// Teach face: the complete correct sentence, translation, and answer annotation.
+		const teach = harness.widget().join(" ");
+		assert.match(teach, /语法填空/);
+		assert.match(teach, /The fix that was committed this morning won't take effect until you reload\./);
+		assert.match(teach, /was committed/);
+		assert.match(teach, /\/anki:flip/);
+		// Answering a teach card is refused exactly like word/phrase.
+		await harness.commands["anki:answer"].handler("was committed", harness.ctx);
+		assert.ok(harness.notifications().some((message) => /新卡.*翻面/.test(message)), "answer explains the new-card interaction");
+		await harness.commands["anki:flip"].handler("", harness.ctx);
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		let check = openTestDb();
+		const afterTeach = check.prepare("SELECT reviews, due_at FROM items WHERE id = 1").get() as any;
+		const directions = (check.prepare("SELECT COUNT(*) AS n FROM direction_state WHERE item_id = 1").get() as any).n;
+		check.close();
+		assert.equal(afterTeach.reviews, 1, "manual self-report rates the card once");
+		assert.ok(new Date(afterTeach.due_at).getTime() > Date.now(), "rated into the future");
+		assert.equal(directions, 0, "cloze keeps a single-direction FSRS state");
+
+		// Review question face: the blanked sentence plus the Chinese hint, no answer.
+		makeClozeDue();
+		await fake.fire();
+		const review = harness.widget().join(" ");
+		assert.match(review, /___/);
+		assert.match(review, /句意/);
+		assert.doesNotMatch(review, /was committed/, "review face must not leak the answer");
+		// Hint masks the answer with first letters and word lengths.
+		await harness.commands["anki:hint"].handler("", harness.ctx);
+		assert.ok(harness.notifications().some((message) => /提示：w__ c_{8}/.test(message)), "hint masks the answer");
+		// Exact local match (case/punctuation tolerant) skips the LLM entirely.
+		await harness.commands["anki:answer"].handler("Was  COMMITTED.", harness.ctx);
+		assert.match(harness.widget().join(" "), /答对了/);
+		check = openTestDb();
+		const exact = check.prepare("SELECT verdict, kind, direction, question_text FROM attempts WHERE item_id = 1 ORDER BY completed_at DESC LIMIT 1").get() as any;
+		check.close();
+		assert.equal(exact.verdict, "correct");
+		assert.equal(exact.kind, "recall");
+		assert.equal(exact.direction, "forward");
+		assert.equal(exact.question_text, "语法填空：The fix that ___ (commit) this morning won't take effect until you reload.");
+
+		// A near-miss form goes to the strict LLM rubric → partial → Again with the correction.
+		makeClozeDue();
+		await fake.fire();
+		await harness.commands["anki:answer"].handler("was commit", harness.ctx);
+		const partial = harness.widget().join(" ");
+		assert.match(partial, /差一点/);
+		assert.match(partial, /正确：was committed/);
+		check = openTestDb();
+		const nearMiss = check.prepare("SELECT verdict FROM attempts WHERE item_id = 1 ORDER BY completed_at DESC LIMIT 1").get() as any;
+		check.close();
+		assert.equal(nearMiss.verdict, "partial");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("sentence spelling feedback highlights the changed letter order", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-spelling-diff" });
@@ -595,6 +689,53 @@ test("a due review is activated before any replacement LLM call", { concurrency:
 		assert.equal(state.active_item_id, 2);
 		assert.equal(llmCalls, 0, "due review must not wait for replacement generation");
 		assert.deepEqual(queue, ["word"], "replacement obligation stays queued");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("skipping a legacy sentence card replaces it with a cloze card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-skip-map" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: {
+					type: "cloze",
+					text: "The hotfix that ___ (push) to production yesterday broke the build pipeline again.",
+					meaning: "was pushed",
+					example: "The hotfix that was pushed to production yesterday broke the build pipeline again.",
+					example_cn: "昨天推到生产的那个热修又把构建流水线搞坏了。（考点：被动语态）",
+				},
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "skip-map" });
+		const db = openTestDb();
+		insertSentence(db);
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /句子输出（L1\/3）/, "legacy sentence card still surfaces normally");
+		await harness.commands["anki:skip"].handler("", harness.ctx);
+		await fake.flush();
+		assert.match(harness.widget().join(" "), /语法填空/, "replacement cloze card is shown");
+		const check = openTestDb();
+		const items = check.prepare("SELECT type, text, status, introduction_kind FROM items ORDER BY id").all() as any[];
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'" ).get() as any).value));
+		const genLog = String((check.prepare("SELECT value FROM stats WHERE key='gen_log'").get() as any)?.value ?? "");
+		check.close();
+		assert.equal(items.length, 2, "skipped sentence plus one replacement");
+		assert.equal(items[0].status, "mastered");
+		assert.equal(items[1].type, "cloze", "legacy sentence replacement generates a cloze card");
+		assert.match(items[1].text, /^The hotfix that ___ \(push\)/);
+		assert.equal(items[1].introduction_kind, "replacement");
+		assert.deepEqual(queue, [], "FIFO obligation consumed");
+		assert.match(genLog, /replacement_mapped: sentence→cloze/, "mapping is recorded in the gen log");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		registration.unregister();
@@ -841,7 +982,6 @@ function insertDueWord(db: DatabaseSync, text: string, meaning: string) {
 }
 
 function lessonResponse(topic = "concurrency") {
-	const sentence = "Because several sessions share one database, each action must be committed exactly once before every widget refreshes.";
 	return JSON.stringify({
 		ready: true,
 		topic,
@@ -849,19 +989,15 @@ function lessonResponse(topic = "concurrency") {
 			{ type: "word", text: "coordinate", phonetic: "/koʊˈɔːrdɪneɪt/", meaning: "协调", example: "We coordinate shared work.", example_cn: "我们协调共享工作。" },
 			{ type: "phrase", text: "single source of truth", phonetic: "", meaning: "唯一事实来源", example: "SQLite is the single source of truth.", example_cn: "SQLite 是唯一事实来源。" },
 			{
-				type: "sentence", text: sentence, phonetic: "", meaning: "因为多个会话共享同一个数据库，所以每个操作都必须只提交一次，然后所有组件再刷新。", example: "", example_cn: "",
-				levels: ["Each action must be committed.", "Each action must be committed exactly once before every widget refreshes.", sentence],
-				levels_cn: ["每个操作都必须提交。", "每个操作都必须只提交一次，然后所有组件再刷新。", "因为多个会话共享同一个数据库，所以每个操作都必须只提交一次，然后所有组件再刷新。"],
-				chunks: ["Because several sessions share one database", "each action must be committed exactly once", "before every widget refreshes"],
-				keyWords: [{ text: "commit", phonetic: "/kəˈmɪt/", meaning: "提交" }, { text: "refresh", phonetic: "/rɪˈfreʃ/", meaning: "刷新" }],
+				type: "cloze", text: "The fix that ___ (commit) this morning won't take effect until you reload.", phonetic: "", meaning: "was committed",
+				example: "The fix that was committed this morning won't take effect until you reload.", example_cn: "今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
 			},
 		],
 	});
 }
 
-/** A lesson whose 20-word sentence is out of the cold-start B1 budget [12,18] (too long). */
+/** A lesson whose 20-word cloze sentence is out of the cold-start B1 budget [12,18] (too long). */
 function longLessonResponse(topic = "out-of-budget") {
-	const sentence = "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.";
 	return JSON.stringify({
 		ready: true,
 		topic,
@@ -869,11 +1005,8 @@ function longLessonResponse(topic = "out-of-budget") {
 			{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化", example: "We persist the data.", example_cn: "我们持久化数据。" },
 			{ type: "phrase", text: "difficulty budget", phonetic: "", meaning: "难度预算", example: "The budget guides the lesson.", example_cn: "预算指导备课。" },
 			{
-				type: "sentence", text: sentence, phonetic: "", meaning: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。", example: "", example_cn: "",
-				levels: ["The profile recomputes a fresh budget each time.", "The profile recomputes a fresh difficulty budget each time it stores an attempt.", sentence],
-				levels_cn: ["画像每次重算一个新预算。", "画像每次保存答题后重算一个新难度预算。", "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。"],
-				chunks: ["Because the system stores every learner attempt", "with its direction", "the profile recomputes a fresh difficulty budget each time now"],
-				keyWords: [{ text: "recompute", phonetic: "/ˌriːkəmˈpjuːt/", meaning: "重算" }, { text: "budget", phonetic: "/ˈbʌdʒɪt/", meaning: "预算" }],
+				type: "cloze", text: "Because the system ___ (store) every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", phonetic: "", meaning: "stores",
+				example: "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", example_cn: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。",
 			},
 		],
 	});
@@ -1169,8 +1302,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const attemptCols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 10, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+			assert.deepEqual({ ...meta }, { schema_version: 11, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -1220,7 +1353,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 10);
+		assert.equal(meta.schema_version, 11);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -1262,7 +1395,7 @@ test("v7 restores fractional elapsed_days false-positive quarantines without los
 		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 10);
+		assert.equal(meta.schema_version, 11);
 		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
 		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1292,9 +1425,54 @@ test("v8 upgrades an existing v7 database and preserves directionless attempts",
 		const cols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((row) => row.name);
 		const attempt = db.prepare("SELECT verdict, direction FROM attempts WHERE id = 'legacy-attempt'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 10);
+		assert.equal(meta.schema_version, 11);
 		assert.ok(cols.includes("direction"), "direction migrated");
 		assert.deepEqual({ ...attempt }, { verdict: "correct", direction: null });
+		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("v11 upgrades an existing v10 database and admits cloze items", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const first = await createHarness({ sessionId: "migration-v11-source" });
+		await first.handlers.session_shutdown({ reason: "quit" }, first.ctx);
+		let db = openTestDb();
+		insertDueWord(db, "preserved", "保留");
+		// Rebuild items with the pre-cloze CHECK to simulate a v10 database.
+		const createSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='items'").get() as any).sql as string;
+		db.exec(createSql
+			.replace(/CREATE TABLE "?items"?\s*\(/, "CREATE TABLE items_v10 (")
+			.replace("'word', 'phrase', 'sentence', 'cloze'", "'word', 'phrase', 'sentence'"));
+		db.exec("INSERT INTO items_v10 SELECT * FROM items; DROP TABLE items; ALTER TABLE items_v10 RENAME TO items;");
+		assert.throws(
+			() => db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('cloze','x ___ y','答案',?,?)").run(new Date().toISOString(), new Date(0).toISOString()),
+			/CHECK constraint failed/,
+			"v10 schema rejects cloze items",
+		);
+		db.prepare("DELETE FROM schema_migrations WHERE version = 11").run();
+		db.prepare("UPDATE schema_meta SET schema_version = 10 WHERE id = 1").run();
+		db.close();
+
+		const upgraded = await makeSession({ sessionId: "migration-v11-target" });
+		db = openTestDb();
+		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
+		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
+		db.prepare(
+			"INSERT INTO items(type,text,phonetic,meaning,example,example_cn,learned_at,due_at) VALUES('cloze',?,NULL,?,?,?, ?,?)",
+		).run(
+			"The fix that ___ (commit) this morning won't take effect until you reload.",
+			"was committed",
+			"The fix that was committed this morning won't take effect until you reload.",
+			"今早提交的修复要等你重载后才生效。",
+			new Date().toISOString(),
+			new Date(0).toISOString(),
+		);
+		db.close();
+		assert.equal(meta.schema_version, 11, "v11 migration applied");
+		assert.deepEqual({ ...card }, { text: "preserved", meaning: "保留" }, "existing cards survive the rebuild");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
@@ -1521,7 +1699,7 @@ test("generated lesson items carry unique content fingerprints", { concurrency: 
 	}
 });
 
-test("word/phrase items link to a lexical sense; sentences do not", { concurrency: false }, async () => {
+test("word/phrase items link to a lexical sense; cloze items do not", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-sense-faux" });
 	try {
@@ -1536,12 +1714,12 @@ test("word/phrase items link to a lexical sense; sentences do not", { concurrenc
 		await fake.flush();
 		const db = openTestDb();
 		const linked = db.prepare("SELECT COUNT(*) AS n FROM items WHERE type IN ('word','phrase') AND lexical_sense_id IS NOT NULL").get() as any;
-		const sentence = db.prepare("SELECT lexical_sense_id FROM items WHERE type='sentence'").get() as any;
+		const cloze = db.prepare("SELECT lexical_sense_id FROM items WHERE type='cloze'").get() as any;
 		const senses = db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as any;
 		const distinctFps = (db.prepare("SELECT COUNT(*) AS n FROM (SELECT DISTINCT sense_fingerprint FROM lexical_senses)").get() as any).n;
 		db.close();
 		assert.ok(Number(linked.n) >= 2, "word/phrase items linked to senses");
-		assert.equal(sentence.lexical_sense_id, null, "sentence has no sense");
+		assert.equal(cloze.lexical_sense_id, null, "cloze has no sense");
 		assert.ok(Number(senses.n) >= 2, "distinct senses created");
 		assert.equal(Number(senses.n), distinctFps, "sense fingerprints are unique");
 	} finally {
@@ -1581,8 +1759,8 @@ test("deterministic budget gate rejects an out-of-budget generated lesson with z
 	const registration = registerFauxProvider({ provider: "kaomoji-budget-gate" });
 	try {
 		// Cold-start DB -> B1 budget [12,18]. Each generated lesson has a 20-word
-		// sentence (too long): validSentenceTraining passes (>=12), but the
-		// deterministic critic gate rejects it before any LLM critic call.
+		// cloze sentence (too long): the deterministic critic gate rejects it
+		// before any LLM critic call.
 		registration.setResponses([
 			fauxAssistantMessage(longLessonResponse("too-long-1")),
 			fauxAssistantMessage(longLessonResponse("too-long-2")),
@@ -1918,7 +2096,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 10, "schema migrated to v10");
+	assert.equal(meta.schema_version, 11, "schema migrated to v11");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -2020,10 +2198,10 @@ test("lesson generation stamps content_fingerprint and lexical_sense_id", { conc
 		}
 		const word = items.find((i) => i.type === "word");
 		const phrase = items.find((i) => i.type === "phrase");
-		const sentence = items.find((i) => i.type === "sentence");
+		const cloze = items.find((i) => i.type === "cloze");
 		assert.ok(word.lexical_sense_id, "word linked to a lexical sense");
 		assert.ok(phrase.lexical_sense_id, "phrase linked to a lexical sense");
-		assert.ok(!sentence.lexical_sense_id, "sentence has no lexical sense");
+		assert.ok(!cloze.lexical_sense_id, "cloze has no lexical sense");
 		assert.ok(senses >= 2, "word + phrase each created a sense");
 		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
 	} finally {

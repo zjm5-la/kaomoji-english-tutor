@@ -599,7 +599,7 @@ export default function piEnglishAnkiExtension(
 				bumpStat(db, "total_learned", 1);
 				touchStreak(db, now);
 			}
-			const direction: RecallDirection = due.type !== "sentence" && isReview ? dueDirection(db, due.id, now) : "forward";
+			const direction: RecallDirection = (due.type === "word" || due.type === "phrase") && isReview ? dueDirection(db, due.id, now) : "forward";
 			setRuntimeState(db, {
 				active_item_id: due.id,
 				active_kind: isReview ? "review" : "teach",
@@ -803,9 +803,11 @@ export default function piEnglishAnkiExtension(
 		}
 		const text = rawText.trim();
 		if (!text) {
-			const promptText = pendingDirection === "reverse"
-				? `✍️ 请写出「${item.text}」的中文释义`
-				: `✍️ 请写出「${item.meaning}」的英文`;
+			const promptText = item.type === "cloze"
+				? `✍️ 请补全：${item.text}`
+				: pendingDirection === "reverse"
+					? `✍️ 请写出「${item.text}」的中文释义`
+					: `✍️ 请写出「${item.meaning}」的英文`;
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} ${promptText}`,
 				"用 /anki:answer <你的答案>，或 /anki:hint 看提示，或 /anki:flip 看答案",
@@ -826,8 +828,12 @@ export default function piEnglishAnkiExtension(
 			startedAt: new Date().toISOString(),
 			questionText: recallQuestionText(item, state.active_direction),
 		};
-		const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-		const target = attemptBase.direction === "reverse" ? item.meaning : item.text;
+		const norm = (s: string) => item.type === "cloze"
+			? s.toLowerCase().replace(/[’]/g, "'").replace(/[^a-z0-9']+/g, " ").trim().replace(/\s+/g, " ")
+			: s.trim().toLowerCase().replace(/\s+/g, " ");
+		const target = item.type === "cloze"
+			? item.meaning
+			: attemptBase.direction === "reverse" ? item.meaning : item.text;
 		const exact = norm(text) === norm(target);
 		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
@@ -866,14 +872,15 @@ export default function piEnglishAnkiExtension(
 	/** Persist a recall exercise template for a word/phrase item (idempotent, groundwork for M3 multi-exercise). */
 	function ensureRecallExercise(item: ItemRow) {
 		if (!db) return;
-		const hint = item.text[0] + "_".repeat(Math.max(0, item.text.length - 1));
+		const answer = item.type === "cloze" ? item.meaning : item.text;
+		const hint = answer[0] + "_".repeat(Math.max(0, answer.length - 1));
 		db.prepare(
 			"INSERT OR IGNORE INTO exercises (item_id, kind, schema_version, stage, content_fingerprint, prompt_json, answer_json, hints_json, rubric_json, quality_json, created_at) VALUES (?, 'recall', 1, 'recall', ?, ?, ?, ?, '{}', '{}', ?)",
 		).run(
 			item.id,
 			"recall:" + item.id,
-			JSON.stringify({ meaning: item.meaning }),
-			JSON.stringify({ acceptedForms: [item.text] }),
+			JSON.stringify(item.type === "cloze" ? { cloze: item.text } : { meaning: item.meaning }),
+			JSON.stringify({ acceptedForms: [answer] }),
 			JSON.stringify([hint]),
 			new Date().toISOString(),
 		);
@@ -902,7 +909,9 @@ export default function piEnglishAnkiExtension(
 			ctx.ui.notify(`提示：${exercise.hint}`, "info");
 			return true;
 		}
-		const hint = pendingDirection === "reverse"
+		const hint = item.type === "cloze"
+			? item.meaning.split(/\s+/).map((word) => word[0] + "_".repeat(Math.max(0, word.replace(/[^A-Za-z]/g, "").length - 1))).join(" ")
+			: pendingDirection === "reverse"
 			? item.meaning.split(/([，,；;、/\s]+)/).map((part) => {
 				if (!part || /^[，,；;、/\s]+$/.test(part)) return part;
 				const chars = Array.from(part);
@@ -1037,11 +1046,13 @@ export default function piEnglishAnkiExtension(
 
 		// Full rating: one-shot, atomic, applies at most once globally.
 		// Word/phrase: assistance-aware effective rating + per-direction schedule (P0-1/P0-2).
+		// Cloze: assistance-aware rating but a single-direction FSRS state like sentences.
 		const isRecall = item.type !== "sentence";
+		const usesDirection = item.type === "word" || item.type === "phrase";
 		const effective = isRecall
 			? effectiveRecallRating({ rating, assistance: assistanceLevel, manual: !attempt })
 			: rating;
-		const stateForSchedule = isRecall
+		const stateForSchedule = usesDirection
 			? (directionFsrsState(db, item.id, expectedDirection) ?? item.fsrs_state)
 			: item.fsrs_state;
 		const next = scheduleNext(stateForSchedule, now, effective);
@@ -1105,7 +1116,11 @@ export default function piEnglishAnkiExtension(
 					);
 				}
 				if (isRecall) {
-					advanceReviewDirectional(db, item.id, expectedDirection, next.state, next.due, item.reviews + 1, now);
+					if (usesDirection) {
+						advanceReviewDirectional(db, item.id, expectedDirection, next.state, next.due, item.reviews + 1, now);
+					} else {
+						advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
+					}
 				} else {
 					advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
 				}
@@ -1174,11 +1189,11 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 		recordRendered(getRuntimeState(db));
-		const downgradeNote = effective !== rating
-			? assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
+		const downgradeNote = effective === rating
+			? ""
+			: assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
 			: assistanceLevel === "hint" ? "（用了提示，按困难安排）"
-			: "（自评兜底，按困难保守安排）"
-			: "";
+			: "（自评兜底，按困难保守安排）";
 		if (effective === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				...(recallNote ? [recallNote] : []),
@@ -1215,10 +1230,11 @@ export default function piEnglishAnkiExtension(
 		const now = new Date();
 		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
 		// Skip claims the whole word is known: push out BOTH directions (P0-1).
-		const isRecall = item.type !== "sentence";
+		// Cloze has a single direction, so it skips like a sentence card.
+		const usesDirection = item.type === "word" || item.type === "phrase";
 		const perDirection: { direction: "forward" | "reverse"; state: string; due: string }[] = [];
-		let sentenceNext: { state: string; due: string } | undefined;
-		if (isRecall) {
+		let singleNext: { state: string; due: string } | undefined;
+		if (usesDirection) {
 			for (const dir of ["forward", "reverse"] as const) {
 				const raw = directionFsrsState(db, item.id, dir) ?? (item.fsrs_state || null);
 				const st = scheduleNext(raw, now, Rating.Easy);
@@ -1240,7 +1256,7 @@ export default function piEnglishAnkiExtension(
 				renderGlobalCard(ctx);
 				return undefined;
 			}
-			sentenceNext = { state: next.state, due: next.due < minDue ? minDue : next.due };
+			singleNext = { state: next.state, due: next.due < minDue ? minDue : next.due };
 		}
 		let applied = false;
 		try {
@@ -1252,13 +1268,13 @@ export default function piEnglishAnkiExtension(
 				clearPendingLocals();
 				return undefined;
 			}
-			if (isRecall) {
+			if (usesDirection) {
 				for (const d of perDirection) advanceReviewDirectional(db, item.id, d.direction, d.state, d.due, item.reviews + 1, now);
 				db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
 			} else {
 				db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(
-					sentenceNext!.state,
-					sentenceNext!.due,
+					singleNext!.state,
+					singleNext!.due,
 					item.id,
 				);
 			}
@@ -1304,11 +1320,15 @@ export default function piEnglishAnkiExtension(
 
 	async function generateReplacementAndInsert(
 		ctx: ExtensionContext,
-		type: GeneratedItem["type"],
+		requestedType: GeneratedItem["type"],
 		skippedItem?: ItemRow,
 	): Promise<boolean> {
 		if (!db) return false;
-		const skipped = skippedItem ?? latestMasteredItem(db, type);
+		// Legacy sentence skips are fulfilled with cloze cards now.
+		const type: GeneratedItem["type"] = requestedType === "sentence" ? "cloze" : requestedType;
+		if (type !== requestedType) logGenStatus("replacement_mapped: sentence→cloze");
+		let skipped = skippedItem ?? latestMasteredItem(db, requestedType);
+		if (skipped && skipped.type === "sentence" && type === "cloze") skipped = { ...skipped, type: "cloze" };
 		if (!skipped) {
 			updateWidget(ctx, FACES.error, ["待补卡片缺少来源记录，请保留队列并稍后重试。", statsLine(db)]);
 			logGenStatus("replacement_no_source");
@@ -1403,7 +1423,7 @@ export default function piEnglishAnkiExtension(
 			try {
 				const state = getRuntimeState(db);
 				const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString());
-				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== type || dueReview) {
+				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== requestedType || dueReview) {
 					db.exec("ROLLBACK");
 					logGenStatus("replacement_insert_deferred");
 					return false;
@@ -1423,7 +1443,7 @@ export default function piEnglishAnkiExtension(
 					});
 					bumpStat(db, "total_learned", 1);
 					touchStreak(db, now);
-					if (!consumeReplacement(db, type)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
+					if (!consumeReplacement(db, requestedType)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
 					markShown(db, id);
 					db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(now.toISOString(), id);
 					setRuntimeState(db, {

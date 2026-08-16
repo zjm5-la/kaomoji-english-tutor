@@ -8,7 +8,7 @@ import { coldStartProfile, deriveBudget, formatAdaptiveBlock, normalizeErrorTag,
 // -- LLM lesson generation ------------------------------------------------
 
 export interface GeneratedItem {
-	type: "word" | "phrase" | "sentence";
+	type: "word" | "phrase" | "sentence" | "cloze";
 	text: string;
 	phonetic?: string;
 	meaning: string;
@@ -56,9 +56,11 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 	if (!raw || typeof raw !== "object") return undefined;
 	const record = raw as Record<string, unknown>;
 	const type = record.type;
-	if (type !== "word" && type !== "phrase" && type !== "sentence") return undefined;
+	if (type !== "word" && type !== "phrase" && type !== "sentence" && type !== "cloze") return undefined;
 	if (expectedType && type !== expectedType) return undefined;
 	if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) return undefined;
+	// Cloze: exactly one blank, non-empty answer (meaning checked above).
+	if (type === "cloze" && record.text.split("___").length !== 2) return undefined;
 	for (const key of ["phonetic", "example", "example_cn"] as const) {
 		if (record[key] != null && typeof record[key] !== "string") return undefined;
 	}
@@ -79,20 +81,8 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 	return item;
 }
 
-function validSentenceTraining(item: GeneratedItem, minWords = 15): boolean {
-	if (item.type !== "sentence" || !item.levels || !item.levels_cn || !item.chunks || !item.keyWords) return false;
-	const fullWords = item.text.trim().split(/\s+/).length;
-	const middleWords = item.levels[1]?.trim().split(/\s+/).length ?? 0;
-	return (
-		fullWords >= minWords &&
-		item.levels.length === 3 &&
-		new Set(item.levels.map((level) => level.trim())).size === 3 &&
-		item.levels_cn.length === 3 &&
-		item.chunks.length >= 2 && item.chunks.length <= 5 &&
-		item.keyWords.length >= 1 && item.keyWords.length <= 3 &&
-		item.levels[2].trim() === item.text.trim() &&
-		middleWords / fullWords >= 0.35 && middleWords / fullWords <= 0.9
-	);
+function validClozeItem(item: GeneratedItem): boolean {
+	return item.type === "cloze" && item.text.split("___").length === 2 && Boolean(item.meaning.trim());
 }
 
 interface ReadyLesson {
@@ -140,7 +130,7 @@ export async function generateLesson(
 	const prompt = [
 		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
 		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
-		"只有信息充分时，才围绕主题准备 3 个学习项：1 个单词、1 个词组、1 个渐进长句。",
+		"只有信息充分时，才围绕主题准备 3 个学习项：1 个单词、1 个词组、1 个语法填空。",
 		"",
 		"备课条件：",
 		"- 只要会话中出现过真实、常用的英语表达（单词、词组、完整句子），就可以备课",
@@ -151,15 +141,14 @@ export async function generateLesson(
 		"学习项要求：",
 		"- 内容要真实常用，贴近主题的实际使用场景，难度须贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
-		"- 教学项必须关联：word 的 text 必须自然出现在 sentence 的 text 中；phrase 尽量出现在 sentence 中，形成一个统一的教学单元",
-		`- sentence 的 text 词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构严格遵循预算的句法约束（见下方 difficulty_budget）`,
-		"- 句子必须是真实、有意义、贴合主题的渐进长句；不得为凑词数或结构堆砌空洞、重复或无意义的内容",
-		`- sentence 必须带 levels（3 个渐进级别，最后一级与 text 相同）、levels_cn（与 levels 一一对应的逐级中文翻译）、chunks（3-5 个意群）、keyWords（生词，数量不超过 ${budget.maxKeyWords} 个）`,
-		"- levels 必须均匀递进且互不相同：每一级只增加一个主要意群，L2 的词数应约为 L3 的 50%-75%，禁止从很短的 L2 突然跳到完整长句",
-		"- levels_cn 必须是自然地道的中文，准确对应各级英文，避免逐字直译和同词重复造成的生硬表达",
+		"- 教学项围绕同一主题：word 的 text 尽量自然出现在 cloze 的句子中，phrase 尽量出现在其中，形成一个统一的教学单元",
+		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
+		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
+		"- cloze 的 meaning 填正确答案（如 was committed）；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
+		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）",
 		"- 只输出 JSON，不要任何其他文字：",
-		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"sentence","text":"完整长句","phonetic":"","meaning":"完整长句的中文翻译","example":"","example_cn":"","levels":["主干短句","加一个成分后的句子","与text相同的完整长句"],"levels_cn":["主干短句的翻译","第二级的翻译","完整长句的翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}]}',
+		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）"}]}',
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
 			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
@@ -207,17 +196,9 @@ export async function generateLesson(
 	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
 	const items = parsedItems as GeneratedItem[];
 	if (new Set(items.map((item) => item.type)).size !== 3) throw new Error("INVALID_LESSON_SHAPE");
-
-	// Sentence cards need levels/chunks/keyWords for progressive training.
-	// Models sometimes omit them — backfill with a dedicated follow-up call.
-	const minWords = budget.wordRange[0];
-	for (const it of items) {
-		if (it.type === "sentence" && !validSentenceTraining(it, minWords)) {
-			await completeSentenceData(llm, ctx, resolved, config, it, budget.maxKeyWords);
-		}
-	}
-	const sentence = items.find((item) => item.type === "sentence")!;
-	if (!validSentenceTraining(sentence, minWords)) throw new Error("INVALID_SENTENCE_TRAINING");
+	// The third slot is a grammar cloze now; sentences are legacy review-only.
+	if (items.some((item) => item.type === "sentence")) throw new Error("INVALID_LESSON_SHAPE");
+	if (!items.some((item) => validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
 
 	return { ready: true, topic: String(parsed.topic ?? ""), items };
 }
@@ -252,11 +233,31 @@ export async function critiqueLesson(
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
 
-	// Deterministic objective gate: sentence word count and keyWords must respect
-	// the budget. This fails before any LLM call so an out-of-budget sentence can
-	// never be approved, regardless of the model critic's verdict.
+	// Deterministic objective gate: cloze structure and sentence word count must
+	// respect the budget. This fails before any LLM call so an out-of-budget or
+	// malformed item can never be approved, regardless of the model critic's verdict.
 	const budgetBlockers: CritiqueIssue[] = [];
 	for (const item of lesson.items) {
+		if (item.type === "cloze") {
+			if (!validClozeItem(item)) {
+				budgetBlockers.push({
+					severity: "blocker",
+					category: "structure",
+					description: "语法填空必须恰好包含一个 ___ 且答案（meaning）非空",
+				});
+				continue;
+			}
+			const base = (item.example || item.text).replace(/___/g, " x ").replace(/\s*\([^)]*\)/g, "");
+			const words = base.trim().split(/\s+/).filter(Boolean).length;
+			const [clozeMin, clozeMax] = budget.wordRange;
+			if (words < clozeMin || words > clozeMax) {
+				budgetBlockers.push({
+					severity: "blocker",
+					category: "budget",
+					description: `语法填空句词数 ${words} 不在预算区间 [${clozeMin}, ${clozeMax}] 内`,
+				});
+			}
+		}
 		if (item.type !== "sentence") continue;
 		const words = item.text.trim().split(/\s+/).filter(Boolean).length;
 		const [minWords, maxWords] = budget.wordRange;
@@ -293,11 +294,11 @@ export async function critiqueLesson(
 		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
+		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；example 必须是代入答案后的完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
 		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），违反记 blocker",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
-		`- 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}、生词≤${budget.maxKeyWords}、句法结构遵循 difficulty_budget）；levels 必须逐级递进、不得突变；chunks 和 levels 必须一致`,
-		"- 单词必须自然出现在句子中",
+		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；word 的 text 尽量自然出现在 cloze 句中`,
 		"- 不得为凑结构硬造不自然句子",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
 		"",
@@ -350,14 +351,22 @@ export async function evaluateAttempt(
 ): Promise<AnswerEvaluation> {
 	const unavailable = (): AnswerEvaluation => ({ available: false, verdict: "incorrect", feedback: "" });
 	if (!resolved) return unavailable();
+	const isCloze = item.type === "cloze";
 	const isReverse = direction === "reverse";
-	const target = isReverse ? item.meaning : item.text;
+	const target = isCloze ? item.meaning : isReverse ? item.meaning : item.text;
 	const answerLang = isReverse ? "中文" : "英文";
 	// Direction-aware rubric: reverse (EN→CN) tests recognition, so any
 	// semantically correct Chinese rendering counts (synonym/register variants
 	// included); forward (CN→EN) tests production of the exact English item,
-	// so spelling stays strict.
-	const rubric = isReverse
+	// so spelling stays strict. Cloze grades the grammatical form: a synonymous
+	// but differently-formed answer is not correct.
+	const rubric = isCloze
+		? [
+			"- correct: 与目标答案完全一致，或仅大小写差异",
+			"- partial: 语法形式接近但有错误（如漏助动词、时态/单复数/拼写错），如目标 was committed 写成 was commit",
+			"- incorrect: 不同的词、空白或语言错误；语义相同但语法形式不同的答案不算对",
+		]
+		: isReverse
 		? [
 			"- correct: 中文意思与目标释义一致即可；同义表达、简写/全称、语体差异（如“已”与“已经”）都算对，措辞不必逐字相同",
 			"- partial: 意思基本正确，但有明显遗漏或偏差（如漏掉释义的一半）",
@@ -369,7 +378,10 @@ export async function evaluateAttempt(
 			"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
 		];
 	const prompt = [
-		`你是英语导师。学生看到${isReverse ? "英文" : "中文"}要写出对应的${answerLang}。`,
+		isCloze
+			? "你是英语导师。学生要做语法填空，写出空格处正确的语法形式。"
+			: `你是英语导师。学生看到${isReverse ? "英文" : "中文"}要写出对应的${answerLang}。`,
+		...(isCloze ? [`填空句：${item.text}`] : []),
 		`目标：${target}`,
 		`学生写了：${answer}`,
 		"判断学生的答案，只输出 JSON：",
@@ -499,8 +511,9 @@ export async function generateReplacement(
 ): Promise<ReplacementDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
-	const itemSchema = skipped.type === "sentence"
-		? '{"type":"sentence","text":"完整长句","meaning":"中文翻译","levels":["L1主干","L2扩展","与text相同的L3"],"levels_cn":["L1翻译","L2翻译","L3翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"释义"}]}'
+	const isCloze = skipped.type === "cloze";
+	const itemSchema = isCloze
+		? '{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）"}'
 		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
 	const prompt = [
 		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟。`,
@@ -508,8 +521,8 @@ export async function generateReplacement(
 		"如果会话信息不足以生成真实有用的同类型卡片，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
-		skipped.type === "sentence"
-			? `句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，遵循预算的句法约束；levels 均匀递进且互不相同，L2 约为 L3 的 50%-75%；逐级翻译使用自然中文；生词不超过 ${budget.maxKeyWords} 个。`
+		isCloze
+			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，example 是代入答案后的完整句子，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
 			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），用途/效果说明放 example/example_cn，不得混入 meaning。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog
@@ -525,7 +538,7 @@ export async function generateReplacement(
 	const text = await llm.complete(ctx, resolved, {
 		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
 		prompt,
-		maxTokens: skipped.type === "sentence" ? config.maxTokens : 2048,
+		maxTokens: 2048,
 		thinkingLevel: config.thinkingLevel,
 	});
 	const json = extractJsonObjectText(text);
@@ -542,63 +555,5 @@ export async function generateReplacement(
 	if (parsed.ready !== true) throw new Error("INVALID_READY");
 	const item = parseGeneratedItem(parsed.item, skipped.type);
 	if (!item) throw new Error("EMPTY_REPLACEMENT");
-	const minWords = budget.wordRange[0];
-	if (item.type === "sentence" && !validSentenceTraining(item, minWords)) {
-		await completeSentenceData(llm, ctx, resolved, config, item, budget.maxKeyWords);
-	}
-	if (item.type === "sentence" && !validSentenceTraining(item, minWords)) throw new Error("INVALID_REPLACEMENT_SENTENCE");
 	return { ready: true, item };
-}
-
-/** Backfill levels/chunks/keyWords for a sentence card via a focused call. */
-async function completeSentenceData(
-	llm: PiSdkLlmClient,
-	ctx: ExtensionContext,
-	resolved: ResolvedModel,
-	config: PetConfig,
-	item: GeneratedItem,
-	maxKeyWords = 3,
-) {
-	const prompt = [
-		"为下面的英文句子生成长句训练数据，只输出 JSON：",
-		'{"levels":["主干短句（去掉所有修饰成分，同一语义）","主干+一个修饰成分","与原文完全相同的完整长句"],"levels_cn":["主干短句的中文翻译","加一个成分后的中文翻译","完整长句的中文翻译"],"chunks":["意群1","意群2","意群3"],"keyWords":[{"text":"生词","phonetic":"/音标/","meaning":"中文释义"}]}',
-		`要求：levels 最后一级必须与原文完全相同；三个级别互不相同，每级只增加一个主要意群，L2 词数约为 L3 的 50%-75%；levels_cn 与 levels 一一对应，使用自然地道的中文；chunks 是原文的意群切分（3-5 个）；keyWords 是句中可能生僻的词（含音标和中文释义），最多 ${maxKeyWords} 个。`,
-		"",
-		"<sentence>",
-		item.text,
-		"</sentence>",
-	].join("\n");
-
-	let text: string;
-	try {
-		text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语学习卡生成器，只输出 JSON。",
-			prompt,
-			maxTokens: 2048,
-			thinkingLevel: config.thinkingLevel,
-		});
-	} catch {
-		return;
-	}
-
-	const json = extractJsonObjectText(text);
-	if (!json) return;
-	let parsed: Record<string, unknown>;
-	try {
-		parsed = JSON.parse(json);
-	} catch {
-		return;
-	}
-
-	const levels = stringArray(parsed.levels);
-	const levelsCn = stringArray(parsed.levels_cn);
-	const chunks = stringArray(parsed.chunks);
-	const keyWords = keyWordArray(parsed.keyWords);
-	if (levels?.length === 3) {
-		levels[2] = item.text;
-		item.levels = levels;
-	}
-	if (levelsCn?.length === 3) item.levels_cn = levelsCn;
-	if (chunks) item.chunks = chunks;
-	if (keyWords) item.keyWords = keyWords.slice(0, maxKeyWords);
 }
