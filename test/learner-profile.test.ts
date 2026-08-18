@@ -562,6 +562,7 @@ test("generateLesson accepts a valid 9-word B0 cloze lesson (lower budget min)",
 					{
 					type: "cloze", text: "The brown fox ___ (jump) over the lazy dog now.", meaning: "jumps",
 					example: "The brown fox jumps over the lazy dog now.", example_cn: "那只棕狐现在跳过了懒狗。（考点：第三人称单数）",
+					chunks: ["The brown fox", "jumps over the lazy dog", "now"],
 					},
 				],
 			});

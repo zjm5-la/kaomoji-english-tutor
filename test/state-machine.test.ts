@@ -423,12 +423,13 @@ test("answer judging keeps the card visible and ignores cross-session repaints",
 
 function insertClozeCard(db: DatabaseSync, shown: 0 | 1 = 0) {
 	db.prepare(
-		"INSERT INTO items(type,text,phonetic,meaning,example,example_cn,learned_at,due_at,shown) VALUES('cloze',?,NULL,?,?,?,?,?,?)",
+		"INSERT INTO items(type,text,phonetic,meaning,example,example_cn,chunks,learned_at,due_at,shown) VALUES('cloze',?,NULL,?,?,?,?,?,?,?)",
 	).run(
 		"The fix that ___ (commit) this morning won't take effect until you reload.",
 		"was committed",
 		"The fix that was committed this morning won't take effect until you reload.",
 		"今早提交的修复要等你重载后才生效。（考点：that 从句修饰单数主语 document，需用 was committed）",
+		JSON.stringify(["The fix", "that was committed this morning", "won't take effect", "until you reload"]),
 		new Date().toISOString(),
 		new Date(0).toISOString(),
 		shown,
@@ -709,6 +710,7 @@ test("skipping a legacy sentence card replaces it with a cloze card", { concurre
 					meaning: "was pushed",
 					example: "The hotfix that was pushed to production yesterday broke the build pipeline again.",
 					example_cn: "昨天推到生产的那个热修又把构建流水线搞坏了。（考点：被动语态）",
+					chunks: ["The hotfix", "that was pushed to production yesterday", "broke the build pipeline again"],
 				},
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
@@ -991,6 +993,7 @@ function lessonResponse(topic = "concurrency") {
 			{
 				type: "cloze", text: "The fix that ___ (commit) this morning won't take effect until you reload.", phonetic: "", meaning: "was committed",
 				example: "The fix that was committed this morning won't take effect until you reload.", example_cn: "今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
+				chunks: ["The fix", "that was committed this morning", "won't take effect", "until you reload"],
 			},
 		],
 	});
@@ -1007,6 +1010,7 @@ function longLessonResponse(topic = "out-of-budget") {
 			{
 				type: "cloze", text: "Because the system ___ (store) every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", phonetic: "", meaning: "stores",
 				example: "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", example_cn: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。",
+				chunks: ["Because the system stores every learner attempt", "with its direction", "the profile recomputes a fresh difficulty budget", "each time now"],
 			},
 		],
 	});
@@ -1497,9 +1501,11 @@ test("legacy teach-state cloze renders as a quiz and answers", { concurrency: fa
 		const face = harness.widget().join(" ");
 		assert.match(face, /语法填空：The fix that ___ \(commit\)/);
 		assert.doesNotMatch(face, /was committed|句意|考点/, "legacy teach state renders the quiz face");
-		// Flip reveals the answer side (was a no-op on the old teach face).
+		// Flip reveals the answer side (was a no-op on the old teach face),
+		// including the meaning-chunk reading aid.
 		await harness.commands["anki:flip"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /was committed/, "flip reveals the answer");
+		assert.match(harness.widget().join(" "), /意群：The fix \/ that was committed this morning/, "answer face shows chunks");
 		// And the card is answerable without flip, graded like a review.
 		await harness.commands["anki:answer"].handler("was committed", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了/);

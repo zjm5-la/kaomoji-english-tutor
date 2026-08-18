@@ -18,7 +18,7 @@ export interface GeneratedItem {
 	levels?: string[];
 	/** Sentence only: per-level Chinese translations, aligned with levels. */
 	levels_cn?: string[];
-	/** Sentence only: chunking of the full sentence for guided reading. */
+	/** Sentence/cloze only: chunking of the full sentence for guided reading. */
 	chunks?: string[];
 	/** Sentence only: likely-new words inside the sentence, with meanings. */
 	keyWords?: { text: string; phonetic?: string; meaning: string }[];
@@ -59,8 +59,15 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 	if (type !== "word" && type !== "phrase" && type !== "sentence" && type !== "cloze") return undefined;
 	if (expectedType && type !== expectedType) return undefined;
 	if (typeof record.text !== "string" || !record.text.trim() || typeof record.meaning !== "string" || !record.meaning.trim()) return undefined;
-	// Cloze: exactly one blank, non-empty answer (meaning checked above).
-	if (type === "cloze" && record.text.split("___").length !== 2) return undefined;
+	// Cloze: exactly one blank, non-empty answer (meaning checked above), and
+	// 2-6 meaning chunks covering the full sentence (answer-face reading aid).
+	let clozeChunks: string[] | undefined;
+	if (type === "cloze") {
+		if (record.text.split("___").length !== 2) return undefined;
+		const chunks = stringArray(record.chunks);
+		if (!chunks || chunks.length < 2 || chunks.length > 6) return undefined;
+		clozeChunks = chunks;
+	}
 	for (const key of ["phonetic", "example", "example_cn"] as const) {
 		if (record[key] != null && typeof record[key] !== "string") return undefined;
 	}
@@ -71,6 +78,7 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 		phonetic: record.phonetic as string | undefined,
 		example: record.example as string | undefined,
 		example_cn: record.example_cn as string | undefined,
+		...(clozeChunks ? { chunks: clozeChunks } : {}),
 	};
 	if (type === "sentence") {
 		if (record.levels != null && !(item.levels = stringArray(record.levels))) return undefined;
@@ -82,7 +90,8 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 }
 
 function validClozeItem(item: GeneratedItem): boolean {
-	return item.type === "cloze" && item.text.split("___").length === 2 && Boolean(item.meaning.trim());
+	return item.type === "cloze" && item.text.split("___").length === 2 && Boolean(item.meaning.trim())
+		&& Array.isArray(item.chunks) && item.chunks.length >= 2 && item.chunks.length <= 6;
 }
 
 interface ReadyLesson {
@@ -149,7 +158,8 @@ export async function generateLesson(
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
 		"- 只输出 JSON，不要任何其他文字：",
-		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）"}]}',
+		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}]}',
+		"- cloze 必须带 chunks（2-6 个意群，按顺序拼接后覆盖代入答案后的完整句子）",
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
 			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
@@ -295,7 +305,7 @@ export async function critiqueLesson(
 		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
-		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；违反记 blocker",
+		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；chunks 必须是 2-6 个意群且拼接覆盖完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
 		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
@@ -515,7 +525,7 @@ export async function generateReplacement(
 	const budget = ctxAdaptive.budget;
 	const isCloze = skipped.type === "cloze";
 	const itemSchema = isCloze
-		? '{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）"}'
+		? '{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}'
 		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
 	const prompt = [
 		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟。`,
@@ -524,7 +534,7 @@ export async function generateReplacement(
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
 		isCloze
-			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，example 是代入答案后的完整句子，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
+			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
 			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog

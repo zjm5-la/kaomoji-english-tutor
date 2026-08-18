@@ -218,6 +218,8 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 			if (showAnswer) {
 				lines.push(`${face} 语法填空：${item.example || item.text.replace("___", item.meaning)}`);
 				lines.push(`  答案：${item.meaning}`);
+				const chunks = parseJsonCol<string[]>(item.chunks);
+				if (chunks?.length) lines.push(`  意群：${chunks.join(" / ")}`);
 				lines.push(`  第 ${item.reviews + 1} 次复习`);
 				if (item.example_cn) lines.push(`  ${item.example_cn}`);
 			} else {
