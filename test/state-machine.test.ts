@@ -428,7 +428,7 @@ function insertClozeCard(db: DatabaseSync, shown: 0 | 1 = 0) {
 		"The fix that ___ (commit) this morning won't take effect until you reload.",
 		"was committed",
 		"The fix that was committed this morning won't take effect until you reload.",
-		"今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
+		"今早提交的修复要等你重载后才生效。（考点：that 从句修饰单数主语 document，需用 was committed）",
 		new Date().toISOString(),
 		new Date(0).toISOString(),
 		shown,
@@ -476,12 +476,13 @@ test("cloze lifecycle: teach face, review answer, exact match, and LLM partial",
 		assert.ok(new Date(afterTeach.due_at).getTime() > Date.now(), "rated into the future");
 		assert.equal(directions, 0, "cloze keeps a single-direction FSRS state");
 
-		// Review question face: the blanked sentence plus the Chinese hint, no answer.
+		// Review question face: only the blanked sentence; the Chinese gloss and
+		// grammar note (which can name the answer form) stay on the answer face.
 		makeClozeDue();
 		await fake.fire();
 		const review = harness.widget().join(" ");
 		assert.match(review, /___/);
-		assert.match(review, /句意/);
+		assert.doesNotMatch(review, /句意|考点/, "question face shows no Chinese gloss or grammar note");
 		assert.doesNotMatch(review, /was committed/, "review face must not leak the answer");
 		// Hint masks the answer with first letters and word lengths.
 		await harness.commands["anki:hint"].handler("", harness.ctx);

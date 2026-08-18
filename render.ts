@@ -221,7 +221,8 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 				if (item.example_cn) lines.push(`  ${item.example_cn}`);
 			} else {
 				lines.push(`${face} 语法填空：${item.text}`);
-				if (item.example_cn) lines.push(`  句意：${item.example_cn}`);
+				// No Chinese gloss here: any translation or grammar note hints the
+				// answer form. example_cn is shown on the answer face instead.
 			}
 			lines.push("💬 /anki:answer <答案> · /anki:hint 提示 · /anki:flip 翻面 · /anki:again 忘了");
 		} else {
