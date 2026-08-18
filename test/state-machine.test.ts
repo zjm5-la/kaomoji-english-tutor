@@ -2333,7 +2333,7 @@ test("active recall: reverse direction asks for the Chinese meaning", { concurre
 			.run("2099-01-01T00:00:00.000Z", new Date().toISOString(), new Date(0).toISOString(), new Date().toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /写出「hello」的中文释义/, "reverse front shows English, asks for Chinese");
+		assert.match(harness.widget().join(" "), /写出单词「hello」的中文释义/, "reverse front shows English, asks for Chinese");
 		await harness.commands["anki:hint"].handler("", harness.ctx);
 		assert.match(harness.notifications().at(-1) ?? "", /提示：你_/, "reverse hint masks the Chinese answer");
 		await harness.commands["anki:answer"].handler("你好", harness.ctx);
@@ -2365,15 +2365,15 @@ test("active recall direction is shared across sessions and survives reattachmen
 		db.close();
 		await fake.fire();
 		await fake.fire();
-		assert.match(a.widget().join(" "), /写出「persist」的中文释义/);
-		assert.match(b.widget().join(" "), /写出「persist」的中文释义/);
+		assert.match(a.widget().join(" "), /写出单词「persist」的中文释义/);
+		assert.match(b.widget().join(" "), /写出单词「persist」的中文释义/);
 		const check = openTestDb();
 		const state = check.prepare("SELECT active_direction FROM runtime_state WHERE id = 1").get() as any;
 		check.close();
 		assert.equal(state.active_direction, "reverse");
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
 		const c = await makeSession({ sessionId: "direction-c" });
-		assert.match(c.widget().join(" "), /写出「persist」的中文释义/, "new session restores persisted direction");
+		assert.match(c.widget().join(" "), /写出单词「persist」的中文释义/, "new session restores persisted direction");
 		await c.handlers.session_shutdown({ reason: "quit" }, c.ctx);
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 	} finally {
@@ -2820,7 +2820,7 @@ test("manual /anki:good is recorded as a conservative self-report, not objective
 		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写「香蕉」的英文" });
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文" });
 		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 0 }, "self-report produces no objective evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -2864,7 +2864,7 @@ test("after a forward Again, a due reverse surfaces in reverse direction", { con
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /默写「葡萄」的英文/, "first surfacing defaults to forward production");
+		assert.match(harness.widget().join(" "), /默写单词「葡萄」的英文/, "first surfacing defaults to forward production");
 		await harness.commands["anki:again"].handler("", harness.ctx);
 		// Forward was just rated (due soon); simulate time passing so only the
 		// reverse direction is due, and the item itself is due again.
@@ -2875,7 +2875,7 @@ test("after a forward Again, a due reverse surfaces in reverse direction", { con
 		db2.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
 		db2.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /写出「grape」的中文释义/, "the due reverse direction surfaces, not a random one");
+		assert.match(harness.widget().join(" "), /写出单词「grape」的中文释义/, "the due reverse direction surfaces, not a random one");
 		const check = openTestDb();
 		const state = check.prepare("SELECT active_direction FROM runtime_state WHERE id = 1").get() as any;
 		const dirs = check.prepare("SELECT direction, fsrs_state FROM direction_state WHERE item_id = 1 ORDER BY direction").all() as any[];

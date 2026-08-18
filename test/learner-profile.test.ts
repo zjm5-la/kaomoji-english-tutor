@@ -608,19 +608,19 @@ test("evaluated attempts persist the question snapshot and feed the lesson-prep 
 			startedAt: iso(),
 			verdict: "incorrect",
 			feedback: "只写了“重新加载”，漏写了目标中的“使新改动生效”。",
-			questionText: "写出「reload」的中文释义",
+			questionText: "写出单词「reload」的中文释义",
 		};
 		insertEvaluatedAttempt(handle.db, attempt, "again", NOW);
 		const log = recentAttemptLog(handle.db);
 		assert.equal(log.length, 1);
-		assert.equal(log[0].question, "写出「reload」的中文释义");
+		assert.equal(log[0].question, "写出单词「reload」的中文释义");
 		assert.equal(log[0].answer, "重新加载");
 		assert.equal(log[0].verdict, "incorrect");
 		assert.equal(log[0].direction, "reverse");
 		assert.match(log[0].feedback, /使新改动生效/);
 		const block = formatAttemptLogBlock(log);
 		assert.match(block, /英→中回忆/);
-		assert.match(block, /题:写出「reload」的中文释义/);
+		assert.match(block, /题:写出单词「reload」的中文释义/);
 		assert.match(block, /答:重新加载/);
 		assert.match(block, /判:错/);
 		assert.match(block, /反馈:/);
@@ -657,10 +657,10 @@ test("generateLesson prompt carries the recent attempt log and the minimal-meani
 		dispose: async () => {},
 	} as unknown as PiSdkLlmClient;
 	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
-	const recentLog = "- [英→中回忆] 题:写出「reload」的中文释义 | 答:重新加载 | 判:错 | 反馈:漏写补充说明";
+	const recentLog = "- [英→中回忆] 题:写出单词「reload」的中文释义 | 答:重新加载 | 判:错 | 反馈:漏写补充说明";
 	await generateLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "a real conversation with english", [], FAKE_CONFIG, undefined, adaptive, recentLog);
 	assert.match(captured, /最近出题与作答记录/);
-	assert.match(captured, /写出「reload」的中文释义/);
+	assert.match(captured, /写出单词「reload」的中文释义/);
 	assert.match(captured, /最小中文释义/);
 });
 

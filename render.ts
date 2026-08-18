@@ -171,9 +171,10 @@ export function sentenceExercise(item: ItemRow, requestedLevel = item.progress):
 /** Canonical recall question text — single source for card display and attempt logs. */
 export function recallQuestionText(item: ItemRow, direction: "forward" | "reverse"): string {
 	if (item.type === "cloze") return `语法填空：${item.text}`;
+	const label = TYPE_LABELS[item.type] ?? item.type;
 	return direction === "reverse"
-		? `写出「${item.text}」的中文释义`
-		: `默写「${item.meaning}」的英文`;
+		? `写出${label}「${item.text}」的中文释义`
+		: `默写${label}「${item.meaning}」的英文`;
 }
 
 /** Canonical sentence-level question text for attempt logs. */
