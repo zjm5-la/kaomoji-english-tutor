@@ -44,6 +44,13 @@ function keyWordArray(value: unknown): GeneratedItem["keyWords"] | undefined {
 	return result;
 }
 
+function clozeTextAppendsAnswer(text: string, answer: string): boolean {
+	const suffix = text.match(/\s(?:=|→)\s*(.+?)\s*$/u)?.[1];
+	if (!suffix) return false;
+	const normalize = (value: string) => value.trim().replace(/[.!?。！？]+$/u, "").trim().toLowerCase().replace(/\s+/g, " ");
+	return normalize(suffix) === normalize(answer);
+}
+
 /** Extract the first JSON object, tolerating an optional Markdown fence. */
 function extractJsonObjectText(text: string): string | undefined {
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
@@ -63,7 +70,7 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 	// 2-6 meaning chunks covering the full sentence (answer-face reading aid).
 	let clozeChunks: string[] | undefined;
 	if (type === "cloze") {
-		if (record.text.split("___").length !== 2) return undefined;
+		if (record.text.split("___").length !== 2 || clozeTextAppendsAnswer(record.text, record.meaning)) return undefined;
 		const chunks = stringArray(record.chunks);
 		if (!chunks || chunks.length < 2 || chunks.length > 6) return undefined;
 		clozeChunks = chunks;
@@ -91,6 +98,7 @@ function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]):
 
 function validClozeItem(item: GeneratedItem): boolean {
 	return item.type === "cloze" && item.text.split("___").length === 2 && Boolean(item.meaning.trim())
+		&& !clozeTextAppendsAnswer(item.text, item.meaning)
 		&& Array.isArray(item.chunks) && item.chunks.length >= 2 && item.chunks.length <= 6;
 }
 
@@ -154,7 +162,7 @@ export async function generateLesson(
 		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
 		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
 		"- cloze 的句子必须在语法上锁死唯一答案：若同一个空存在多种语法正确的填法（如 isn't called 与 won't be called 都成立），必须加时间/语境锚点（如 once the migration finishes）排除歧义，否则换考点或改写句子",
-		"- cloze 的 meaning 填正确答案（如 was committed）；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
+		"- cloze 的 meaning 填正确答案（如 was committed）；text 只放挖空句，严禁在句尾附加 = was committed、→ was committed 等答案；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
 		"- 只输出 JSON，不要任何其他文字：",
@@ -534,7 +542,7 @@ export async function generateReplacement(
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
 		isCloze
-			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
+			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，text 只放挖空句且句尾不得附加 = 答案或 → 答案，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
 			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog

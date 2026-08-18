@@ -593,6 +593,29 @@ test("generateReplacement prompt injects the profile + budget block", async () =
 	assert.doesNotMatch(captured, /中级学习者/);
 });
 
+test("generateReplacement rejects a cloze whose text appends the answer", async () => {
+	const llm = {
+		complete: async () => JSON.stringify({
+			ready: true,
+			item: {
+				type: "cloze",
+				text: "The V8 demo ___ (arm) before the first rotation, so the timer was disabled right away. = was armed",
+				meaning: "was armed",
+				example: "The V8 demo was armed before the first rotation, so the timer was disabled right away.",
+				example_cn: "V8 演示在首次轮换前就已武装就绪。",
+				chunks: ["The V8 demo", "was armed before the first rotation", "so the timer was disabled right away"],
+			},
+		}),
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const skipped = { type: "cloze", text: "Old ___ (arm) prompt.", meaning: "armed" } as unknown as import("../db.ts").ItemRow;
+	await assert.rejects(
+		() => generateReplacement(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "conversation", [], FAKE_CONFIG, skipped, adaptive),
+		/EMPTY_REPLACEMENT/,
+	);
+});
+
 // -- Attempt question-snapshot log (备课依据) -------------------------------
 
 test("evaluated attempts persist the question snapshot and feed the lesson-prep block", () => {
