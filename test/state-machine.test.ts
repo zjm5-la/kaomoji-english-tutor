@@ -457,23 +457,22 @@ test("cloze lifecycle: teach face, review answer, exact match, and LLM partial",
 		insertClozeCard(db);
 		db.close();
 		await fake.fire();
-		// Teach face: the complete correct sentence, translation, and answer annotation.
-		const teach = harness.widget().join(" ");
-		assert.match(teach, /语法填空/);
-		assert.match(teach, /The fix that was committed this morning won't take effect until you reload\./);
-		assert.match(teach, /was committed/);
-		assert.match(teach, /\/anki:flip/);
-		// Answering a teach card is refused exactly like word/phrase.
+		// First showing is already the quiz face: blank + lemma hint, no answer,
+		// no Chinese gloss/grammar note (they would name the answer form).
+		const first = harness.widget().join(" ");
+		assert.match(first, /语法填空/);
+		assert.match(first, /The fix that ___ \(commit\) this morning/);
+		assert.doesNotMatch(first, /was committed/, "first showing must not leak the answer");
+		assert.doesNotMatch(first, /句意|考点/, "first showing hides the gloss and grammar note");
+		// First attempt is graded immediately (exact local match -> Good).
 		await harness.commands["anki:answer"].handler("was committed", harness.ctx);
-		assert.ok(harness.notifications().some((message) => /新卡.*翻面/.test(message)), "answer explains the new-card interaction");
-		await harness.commands["anki:flip"].handler("", harness.ctx);
-		await harness.commands["anki:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /答对了/);
 		let check = openTestDb();
-		const afterTeach = check.prepare("SELECT reviews, due_at FROM items WHERE id = 1").get() as any;
+		const afterFirst = check.prepare("SELECT reviews, due_at FROM items WHERE id = 1").get() as any;
 		const directions = (check.prepare("SELECT COUNT(*) AS n FROM direction_state WHERE item_id = 1").get() as any).n;
 		check.close();
-		assert.equal(afterTeach.reviews, 1, "manual self-report rates the card once");
-		assert.ok(new Date(afterTeach.due_at).getTime() > Date.now(), "rated into the future");
+		assert.equal(afterFirst.reviews, 1, "first attempt rates the card once");
+		assert.ok(new Date(afterFirst.due_at).getTime() > Date.now(), "rated into the future");
 		assert.equal(directions, 0, "cloze keeps a single-direction FSRS state");
 
 		// Review question face: only the blanked sentence; the Chinese gloss and

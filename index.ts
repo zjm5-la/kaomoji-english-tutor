@@ -602,7 +602,10 @@ export default function piEnglishAnkiExtension(
 			const direction: RecallDirection = (due.type === "word" || due.type === "phrase") && isReview ? dueDirection(db, due.id, now) : "forward";
 			setRuntimeState(db, {
 				active_item_id: due.id,
-				active_kind: isReview ? "review" : "teach",
+				// Cloze cards quiz from the very first showing: the blank + lemma hint
+				// is self-contained, so a teach face would only leak the answer and the
+				// first attempt is genuine mastery evidence.
+				active_kind: isReview || due.type === "cloze" ? "review" : "teach",
 				active_direction: direction,
 				active_version: state.active_version + 1,
 				...EMPTY_SENTENCE_CYCLE,
