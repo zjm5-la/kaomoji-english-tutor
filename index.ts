@@ -382,6 +382,11 @@ export default function piEnglishAnkiExtension(
 		localVersion = state.active_version;
 	}
 
+	/** Cloze has no teach face: a legacy persisted teach state still quizzes. */
+	function effectiveIsReview(item: ItemRow, state: RuntimeState): boolean {
+		return state.active_kind === "review" || item.type === "cloze";
+	}
+
 	/**
 	 * Re-render the widget from the global active card. Returns true when the
 	 * global card changed (so the caller knows a stale local panel should close).
@@ -393,7 +398,7 @@ export default function piEnglishAnkiExtension(
 		if (item?.type === "sentence") state = ensureSentenceCycle(db, item, state);
 		const changed = state.active_version !== localVersion;
 		if (item && state.active_kind) {
-			const isReview = state.active_kind === "review";
+			const isReview = effectiveIsReview(item, state);
 			pendingItemId = state.active_item_id;
 			pendingIsReview = isReview;
 			pendingDirection = state.active_direction;
@@ -626,7 +631,7 @@ export default function piEnglishAnkiExtension(
 		let state = getRuntimeState(db);
 		if (state.active_item_id !== item.id || !state.active_kind) return false;
 		if (item.type === "sentence") state = ensureSentenceCycle(db, item, state);
-		const isReview = state.active_kind === "review";
+		const isReview = effectiveIsReview(item, state);
 		pendingItemId = item.id;
 		pendingFlipped = false;
 		pendingIsReview = isReview;
@@ -800,7 +805,7 @@ export default function piEnglishAnkiExtension(
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
 		if (item.type === "sentence") return answerSentencePending(ctx, item, rawText, state);
-		if (state.active_kind !== "review") {
+		if (!effectiveIsReview(item, state)) {
 			ctx.ui.notify("这是首次展示的新卡，请先用 /anki:flip 翻面查看释义，再选择 /anki:good 或 /anki:skip", "info");
 			return true;
 		}

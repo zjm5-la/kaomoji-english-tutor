@@ -1479,6 +1479,37 @@ test("v11 upgrades an existing v10 database and admits cloze items", { concurren
 	}
 });
 
+test("legacy teach-state cloze renders as a quiz and answers", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-cloze-legacy-teach" });
+	try {
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		// Persist an active cloze card claimed under the old code (active_kind='teach').
+		const seed = await makeSession({ model, modelRegistry: registry, sessionId: "cloze-legacy-seed" });
+		await seed.handlers.session_shutdown({ reason: "quit" }, seed.ctx);
+		const db = openTestDb();
+		insertClozeCard(db, 1);
+		db.prepare("UPDATE runtime_state SET active_item_id = 1, active_kind = 'teach', active_direction = 'forward', active_version = active_version + 1 WHERE id = 1").run();
+		db.close();
+		// Reattach: the persisted teach state must not restore the leaking teach face.
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "cloze-legacy-reattach" });
+		const face = harness.widget().join(" ");
+		assert.match(face, /语法填空：The fix that ___ \(commit\)/);
+		assert.doesNotMatch(face, /was committed|句意|考点/, "legacy teach state renders the quiz face");
+		// Flip reveals the answer side (was a no-op on the old teach face).
+		await harness.commands["anki:flip"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /was committed/, "flip reveals the answer");
+		// And the card is answerable without flip, graded like a review.
+		await harness.commands["anki:answer"].handler("was committed", harness.ctx);
+		assert.match(harness.widget().join(" "), /答对了/);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
 test("introduced_at is stamped when a new card is first displayed", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
