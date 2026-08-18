@@ -703,6 +703,8 @@ test("answer-evaluation rubric is direction-aware: reverse accepts synonyms, for
 	await evaluateAttempt(llm, FAKE_CTX, item, "filled", resolved, "forward");
 	assert.match(captured[0], /同义表达/);
 	assert.match(captured[0], /语体差异/);
+	assert.match(captured[0], /生效，起作用/);
+	assert.match(captured[0], /不同义项/);
 	assert.doesNotMatch(captured[0], /完全一致/);
 	assert.match(captured[1], /完全一致/);
 	assert.doesNotMatch(captured[1], /语体差异/);

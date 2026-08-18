@@ -146,7 +146,7 @@ export async function generateLesson(
 		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
 		"- cloze 的 meaning 填正确答案（如 was committed）；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
-		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）",
+		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
 		"- 只输出 JSON，不要任何其他文字：",
 		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）"}]}',
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
@@ -296,7 +296,7 @@ export async function critiqueLesson(
 		"- 英语单词/词组/句子必须正确、自然",
 		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；example 必须是代入答案后的完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
-		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），违反记 blocker",
+		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；word 的 text 尽量自然出现在 cloze 句中`,
 		"- 不得为凑结构硬造不自然句子",
@@ -369,7 +369,8 @@ export async function evaluateAttempt(
 		: isReverse
 		? [
 			"- correct: 中文意思与目标释义一致即可；同义表达、简写/全称、语体差异（如“已”与“已经”）都算对，措辞不必逐字相同",
-			"- partial: 意思基本正确，但有明显遗漏或偏差（如漏掉释义的一半）",
+			"- 目标释义并列的多个说法若互为近义（如「生效，起作用」），答出任一近义说法即为 correct，不得因漏掉其余说法判 partial",
+			"- partial: 意思基本正确，但有明显遗漏或偏差；遗漏仅指漏掉并列的不同义项（如「银行」与「河岸」只答出其一）",
 			"- incorrect: 意思错误、空白、语言错误或无法识别",
 		]
 		: [
@@ -523,7 +524,7 @@ export async function generateReplacement(
 		`{"ready":true,"item":${itemSchema}}`,
 		isCloze
 			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，example 是代入答案后的完整句子，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
-			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），用途/效果说明放 example/example_cn，不得混入 meaning。",
+			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog
 			? ["", "最近出题与作答记录（新→旧）：", recentLog, "避免重复近期刚练过的内容；若反馈指向出题缺陷，避免同类出题。"]
