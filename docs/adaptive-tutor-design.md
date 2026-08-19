@@ -412,7 +412,7 @@ Progressive sentence 保持一个跨 L1/L2/L3 的持久化 `review_cycle_id`。L
 
 对于 `new` 教学单元，所有本课 lexical targets 及规划器选定的核心搭配必须自然出现在 supporting progressive sentence 中，并服务同一个语义目标。不能为了字符串命中制造不自然句子；supporting sentence 只有在自身也是独立表达目标时才成为可调度 sentence item。
 
-实现时新增版本化 `LessonPlanV2` 契约，明确包含 `schedulableItems[]`、`supportingMaterials[]` 和 `exercises[]`，不再复用当前“恰好三个不同 type 的 `GeneratedItem[]`”解析器。只有 `schedulableItems` 写入 `items` 和占用额度；supporting material 写入 lesson/exercise。旧契约只用于读取已有卡和迁移期 fallback，不得与 V2 混合插入。
+实现时新增版本化 `LessonPlanV2` 契约，明确包含 `schedulableItems[]`、`supportingMaterials[]` 和 `exercises[]`，不再复用当前“固定 10 个 word/phrase + 1 个 cloze 的 `GeneratedItem[]`”解析器。只有 `schedulableItems` 写入 `items` 和占用额度；supporting material 写入 lesson/exercise。旧契约只用于读取已有卡和迁移期 fallback，不得与 V2 混合插入。
 
 确定性认知负担上限：每个 exercise 只测试一个主目标；新课默认最多 1 个新义项和 1 个核心搭配；额外未知词最多 2 个且必须提供提示；渐进长句默认 15–25 词、上限 30 词（明确 advanced 规划才可放宽）；每级只增加一个主要意群；一次 Widget 只显示一个 prompt，反馈优先给一个最小修正和一个理由。终端继续完整换行，不通过截断隐藏教学内容。
 

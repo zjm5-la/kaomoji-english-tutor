@@ -20,10 +20,16 @@ export interface PetConfig {
 	verbose: boolean;
 }
 
+/** Daily batch composition: word/phrase items (words-majority) + grammar clozes. */
+export const LESSON_WORD_ITEMS = 10;
+export const LESSON_CLOZE_ITEMS = 1;
+/** The daily batch is words-majority: phrases may not exceed this count. */
+export const LESSON_MAX_PHRASES = 3;
+
 export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
-	dailyNewLimit: 3,
-	maxTokens: 4096,
+	dailyNewLimit: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS,
+	maxTokens: 8192,
 	showWidget: true,
 	verbose: false,
 };

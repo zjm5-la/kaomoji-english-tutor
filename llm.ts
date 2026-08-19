@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { PetConfig } from "./config.ts";
+import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import type { ItemRow } from "./db.ts";
 import type { SentenceExerciseView } from "./render.ts";
@@ -147,7 +147,7 @@ export async function generateLesson(
 	const prompt = [
 		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
 		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
-		"只有信息充分时，才围绕主题准备 3 个学习项：1 个单词、1 个词组、1 个语法填空。",
+		"只有信息充分时，才围绕主题准备一整天的课量：共 " + (LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS) + " 个学习项，其中 " + LESSON_WORD_ITEMS + " 个单词或词组（以单词为主，词组不超过 " + LESSON_MAX_PHRASES + " 个），" + (LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空") + "。",
 		"",
 		"备课条件：",
 		"- 只要会话中出现过真实、常用的英语表达（单词、词组、完整句子），就可以备课",
@@ -158,15 +158,16 @@ export async function generateLesson(
 		"学习项要求：",
 		"- 内容要真实常用，贴近主题的实际使用场景，难度须贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
-		"- 教学项围绕同一主题：word 的 text 尽量自然出现在 cloze 的句子中，phrase 尽量出现在其中，形成一个统一的教学单元",
+		"- 教学项围绕同一主题：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
+		`- 每个学习项必须互不重复；${LESSON_WORD_ITEMS} 个单词/词组项彼此独立，各自配一个小巧自然的例句`,
 		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
 		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
 		"- cloze 的句子必须在语法上锁死唯一答案：若同一个空存在多种语法正确的填法（如 isn't called 与 won't be called 都成立），必须加时间/语境锚点（如 once the migration finishes）排除歧义，否则换考点或改写句子",
 		"- cloze 的 meaning 填正确答案（如 was committed）；text 只放挖空句，严禁在句尾附加 = was committed、→ was committed 等答案；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
-		"- 只输出 JSON，不要任何其他文字：",
-		'{"ready":true,"topic":"主题名","items":[{"type":"word","text":"单词","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"phrase","text":"词组","phonetic":"","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}]}',
+		'- 只输出 JSON，不要任何其他文字：',
+		`{"ready":true,"topic":"主题名","items":[${Array.from({ length: LESSON_WORD_ITEMS }, () => '{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"}').join(",")}${Array.from({ length: LESSON_CLOZE_ITEMS }, () => ',{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}').join("")}]}`,
 		"- cloze 必须带 chunks（2-6 个意群，按顺序拼接后覆盖代入答案后的完整句子）",
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
@@ -210,14 +211,24 @@ export async function generateLesson(
 	}
 	if (parsed.ready !== true) throw new Error("INVALID_READY");
 
-	if (!Array.isArray(parsed.items) || parsed.items.length !== 3) throw new Error("INVALID_LESSON_SHAPE");
+	if (!Array.isArray(parsed.items) || parsed.items.length !== LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS) throw new Error("INVALID_LESSON_SHAPE");
 	const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
 	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
 	const items = parsedItems as GeneratedItem[];
-	if (new Set(items.map((item) => item.type)).size !== 3) throw new Error("INVALID_LESSON_SHAPE");
-	// The third slot is a grammar cloze now; sentences are legacy review-only.
+	// The word/phrase slots are homogeneous now: at least one word, phrases capped,
+	// sentence cards are legacy review-only.
+	const wordCount = items.filter((item) => item.type === "word").length;
+	const phraseCount = items.filter((item) => item.type === "phrase").length;
+	const clozeCount = items.filter((item) => item.type === "cloze").length;
+	if (wordCount + phraseCount !== LESSON_WORD_ITEMS || phraseCount > LESSON_MAX_PHRASES || wordCount < 1) throw new Error("INVALID_LESSON_SHAPE");
+	if (clozeCount !== LESSON_CLOZE_ITEMS) throw new Error("INVALID_LESSON_SHAPE");
+	// Grammar clozes are the dedicated slots now; sentences are legacy review-only.
 	if (items.some((item) => item.type === "sentence")) throw new Error("INVALID_LESSON_SHAPE");
-	if (!items.some((item) => validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
+	if (items.filter((item) => item.type === "cloze").some((item) => !validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
+	// Reject in-batch duplicates early; the fingerprint unique index would
+	// otherwise sink the whole commit at insertion time.
+	const batchTexts = new Set(items.map((item) => item.text.trim().toLowerCase()));
+	if (batchTexts.size !== items.length) throw new Error("INVALID_LESSON_ITEM");
 
 	return { ready: true, topic: String(parsed.topic ?? ""), items };
 }
@@ -253,9 +264,18 @@ export async function critiqueLesson(
 	const budget = ctxAdaptive.budget;
 
 	// Deterministic objective gate: cloze structure and sentence word count must
-	// respect the budget. This fails before any LLM call so an out-of-budget or
-	// malformed item can never be approved, regardless of the model critic's verdict.
+	// respect the budget, and the batch must stay words-majority. This fails before
+	// any LLM call so an out-of-budget or malformed item can never be approved,
+	// regardless of the model critic's verdict.
 	const budgetBlockers: CritiqueIssue[] = [];
+	const phraseCount = lesson.items.filter((item) => item.type === "phrase").length;
+	if (lesson.items.length === LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS && phraseCount > LESSON_MAX_PHRASES) {
+		budgetBlockers.push({
+			severity: "blocker",
+			category: "composition",
+			description: `词组数量 ${phraseCount} 超过单词为主的批次上限 ${LESSON_MAX_PHRASES}，请减词组换单词`,
+		});
+	}
 	for (const item of lesson.items) {
 		if (item.type === "cloze") {
 			if (!validClozeItem(item)) {
@@ -313,11 +333,12 @@ export async function critiqueLesson(
 		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
+		`- 批次组成：${LESSON_WORD_ITEMS} 个单词/词组项以单词为主（词组不超过 ${LESSON_MAX_PHRASES} 个）加 ${LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空"}；同批学习项之间不得重复或近乎重复；违反记 blocker`,
 		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；chunks 必须是 2-6 个意群且拼接覆盖完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
 		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
-		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；word 的 text 尽量自然出现在 cloze 句中`,
+		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；cloze 句子可以自然复用批次中 1-2 个单词或词组`,
 		"- 不得为凑结构硬造不自然句子",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
 		"",

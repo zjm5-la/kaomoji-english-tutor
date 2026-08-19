@@ -983,36 +983,54 @@ function insertDueWord(db: DatabaseSync, text: string, meaning: string) {
 		.run(text, meaning, new Date().toISOString(), new Date(0).toISOString());
 }
 
+function lessonItems() {
+	const words: { type: string; text: string; phonetic: string; meaning: string; example: string; example_cn: string }[] = [
+		{ type: "word", text: "coordinate", phonetic: "/koʊˈɔːrdɪneɪt/", meaning: "协调", example: "We coordinate shared work.", example_cn: "我们协调共享工作。" },
+		{ type: "word", text: "commit", phonetic: "/kəˈmɪt/", meaning: "提交", example: "They commit the change.", example_cn: "他们提交了改动。" },
+		{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化", example: "We persist the data.", example_cn: "我们持久化数据。" },
+		{ type: "word", text: "refresh", phonetic: "/rɪˈfreʃ/", meaning: "刷新", example: "The view will refresh.", example_cn: "视图会刷新。" },
+		{ type: "word", text: "merge", phonetic: "/mɜːrdʒ/", meaning: "合并", example: "I merge both branches.", example_cn: "我合并两个分支。" },
+		{ type: "word", text: "expire", phonetic: "/ɪkˈspaɪər/", meaning: "过期", example: "The lease will expire.", example_cn: "租约会过期。" },
+		{ type: "word", text: "claim", phonetic: "/kleɪm/", meaning: "认领", example: "One client must claim the lock.", example_cn: "只能有一个客户端认领锁。" },
+		{ type: "phrase", text: "single source of truth", phonetic: "", meaning: "唯一事实来源", example: "SQLite is the single source of truth.", example_cn: "SQLite 是唯一事实来源。" },
+		{ type: "phrase", text: "take effect", phonetic: "", meaning: "生效", example: "The fix will take effect.", example_cn: "修复会生效。" },
+		{ type: "phrase", text: "in flight", phonetic: "", meaning: "进行中", example: "The request is in flight.", example_cn: "请求进行中。" },
+	];
+	const cloze = {
+		type: "cloze", text: "The fix that ___ (commit) this morning won't take effect until you reload.", phonetic: "", meaning: "was committed",
+		example: "The fix that was committed this morning won't take effect until you reload.", example_cn: "今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
+		chunks: ["The fix", "that was committed this morning", "won't take effect", "until you reload"],
+	};
+	return [...words, cloze];
+}
+
 function lessonResponse(topic = "concurrency") {
 	return JSON.stringify({
 		ready: true,
 		topic,
-		items: [
-			{ type: "word", text: "coordinate", phonetic: "/koʊˈɔːrdɪneɪt/", meaning: "协调", example: "We coordinate shared work.", example_cn: "我们协调共享工作。" },
-			{ type: "phrase", text: "single source of truth", phonetic: "", meaning: "唯一事实来源", example: "SQLite is the single source of truth.", example_cn: "SQLite 是唯一事实来源。" },
-			{
-				type: "cloze", text: "The fix that ___ (commit) this morning won't take effect until you reload.", phonetic: "", meaning: "was committed",
-				example: "The fix that was committed this morning won't take effect until you reload.", example_cn: "今早提交的修复要等你重载后才生效。（考点：一般过去时被动语态）",
-				chunks: ["The fix", "that was committed this morning", "won't take effect", "until you reload"],
-			},
-		],
+		items: lessonItems(),
 	});
 }
 
 /** A lesson whose 20-word cloze sentence is out of the cold-start B1 budget [12,18] (too long). */
 function longLessonResponse(topic = "out-of-budget") {
+	const items = lessonItems().map((item) =>
+		item.type === "cloze"
+			? {
+				...item,
+				type: "cloze" as const,
+				text: "Because the system ___ (store) every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.",
+				meaning: "stores",
+				example: "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.",
+				example_cn: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。",
+				chunks: ["Because the system stores every learner attempt", "with its direction", "the profile recomputes a fresh difficulty budget", "each time now"],
+			}
+			: item,
+	);
 	return JSON.stringify({
 		ready: true,
 		topic,
-		items: [
-			{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化", example: "We persist the data.", example_cn: "我们持久化数据。" },
-			{ type: "phrase", text: "difficulty budget", phonetic: "", meaning: "难度预算", example: "The budget guides the lesson.", example_cn: "预算指导备课。" },
-			{
-				type: "cloze", text: "Because the system ___ (store) every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", phonetic: "", meaning: "stores",
-				example: "Because the system stores every learner attempt with its direction the profile recomputes a fresh difficulty budget each time now.", example_cn: "因为系统把每个学习者答题连同方向一起保存，画像每次都能重算出新的难度预算。",
-				chunks: ["Because the system stores every learner attempt", "with its direction", "the profile recomputes a fresh difficulty budget", "each time now"],
-			},
-		],
+		items,
 	});
 }
 
@@ -1241,7 +1259,7 @@ test("single coordinator commits one lesson batch", { concurrency: false }, asyn
 		const state = db.prepare("SELECT active_item_id,active_kind FROM runtime_state WHERE id=1").get() as any;
 		db.close();
 		assert.equal(registration.state.callCount, 2);
-		assert.equal(count, 3);
+		assert.equal(count, 11, "full daily batch committed: 10 words/phrases + 1 cloze");
 		assert.equal(state.active_item_id, 1);
 		assert.equal(state.active_kind, "teach");
 		await fake.firePoll();
@@ -1580,7 +1598,7 @@ test("a negative dailyNewLimit falls back to the default quota", { concurrency: 
 		}
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 1 · 新卡 2）/);
+		assert.match(harness.widget().join(" "), /今日剩余卡片（复习 1 · 新卡 3）/);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -1915,7 +1933,7 @@ test("fallback session model is reused for the critic after configured generator
 		db.close();
 		assert.ok(primaryAuthCalls >= 1, "configured provider was attempted first");
 		assert.equal(fallback.state.callCount, 2, "fallback handles generation and independent critique");
-		assert.equal(count, 3);
+		assert.equal(count, 11, "full daily batch committed via the fallback model");
 	} finally {
 		primary.unregister();
 		fallback.unregister();
@@ -2647,10 +2665,11 @@ test("lesson items leave introduced_at NULL until first display", { concurrency:
 		const db = openTestDb();
 		const items = db.prepare("SELECT introduced_at FROM items ORDER BY id").all() as any[];
 		db.close();
-		assert.equal(items.length, 3, "three lesson items");
+		assert.equal(items.length, 11, "one daily batch of lesson items");
 		assert.ok(items[0].introduced_at, "first item stamped at display");
-		assert.equal(items[1].introduced_at, null, "second item not yet displayed");
-		assert.equal(items[2].introduced_at, null, "third item not yet displayed");
+		for (let i = 1; i < items.length; i++) {
+			assert.equal(items[i].introduced_at, null, `queued item ${i} not yet displayed`);
+		}
 	} finally {
 		registration.unregister();
 		fake.restore();

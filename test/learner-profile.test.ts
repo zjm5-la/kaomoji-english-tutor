@@ -547,9 +547,13 @@ test("in-budget sentence passes the deterministic gate and may reach the LLM cri
 
 test("generateLesson accepts a valid 9-word B0 cloze lesson (lower budget min)", async () => {
 	// Under a B0 budget (word range [8,12]), a valid 9-word cloze sentence must be
-	// accepted ready=true with exactly one blank.
+	// accepted ready=true as part of a full daily batch (10 word/phrase + 1 cloze).
 	let calls = 0;
 	let captured = "";
+	const dailyWordItems = Array.from({ length: 10 }, (_, i) =>
+		i % 3 === 2
+			? { type: "phrase", text: `lazy dog number ${i}`, phonetic: "", meaning: `懒狗${i}`, example: `The lazy dog number ${i} sleeps.`, example_cn: `懒狗${i}在睡。` }
+			: { type: "word", text: `fox${i}`, phonetic: "/fɒks/", meaning: `狐${i}`, example: `The fox${i} runs.`, example_cn: `狐${i}在跑。` });
 	const llm = {
 		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => {
 			calls++;
@@ -557,8 +561,7 @@ test("generateLesson accepts a valid 9-word B0 cloze lesson (lower budget min)",
 			return JSON.stringify({
 				ready: true, topic: "b0-lesson",
 				items: [
-					{ type: "word", text: "fox", meaning: "狐", example: "The fox runs.", example_cn: "狐在跑。" },
-					{ type: "phrase", text: "lazy dog", meaning: "懒狗", example: "The lazy dog sleeps.", example_cn: "懒狗在睡。" },
+					...dailyWordItems,
 					{
 					type: "cloze", text: "The brown fox ___ (jump) over the lazy dog now.", meaning: "jumps",
 					example: "The brown fox jumps over the lazy dog now.", example_cn: "那只棕狐现在跳过了懒狗。（考点：第三人称单数）",
@@ -576,6 +579,43 @@ test("generateLesson accepts a valid 9-word B0 cloze lesson (lower budget min)",
 	assert.equal(decision.ready, true, "9-word B0 cloze passes the budget min");
 	assert.equal(calls, 1, "single generation call for a complete valid cloze");
 	assert.match(captured, /8-12/, "B0 word range reaches the generation prompt");
+});
+
+test("generateLesson rejects a legacy 3-item batch shape", async () => {
+	const llm = {
+		complete: async () => JSON.stringify({
+			ready: true, topic: "legacy",
+			items: [
+				{ type: "word", text: "fox", meaning: "狐", example: "The fox runs.", example_cn: "狐在跑。" },
+				{ type: "phrase", text: "lazy dog", meaning: "懒狗", example: "The lazy dog sleeps.", example_cn: "懒狗在睡。" },
+				{ type: "cloze", text: "The brown fox ___ (jump) over the lazy dog now.", meaning: "jumps", example: "The brown fox jumps over the lazy dog now.", example_cn: "那只棕狐现在跳过了懒狗。", chunks: ["The brown fox", "jumps over the lazy dog", "now"] },
+			],
+		}),
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	await assert.rejects(
+		generateLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "a conversation", [], FAKE_CONFIG, undefined, adaptive),
+		/INVALID_LESSON_SHAPE/,
+		"the daily batch must be 10 word/phrase items + 1 cloze",
+	);
+});
+
+test("deterministic critic gate rejects a phrase-heavy batch before any LLM call", async () => {
+	let calls = 0;
+	const llm = { complete: async () => { calls++; return ""; }, dispose: async () => {} } as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const phrase = (i: number) => ({ type: "phrase", text: `phrase number ${i}`, meaning: `词组${i}`, example: `Use phrase number ${i} now.`, example_cn: `用词组${i}。` });
+	const word = (i: number) => ({ type: "word", text: `word${i}`, meaning: `词${i}`, example: `Use word${i} now.`, example_cn: `用词${i}。` });
+	const items = [phrase(1), phrase(2), phrase(3), phrase(4), word(1), word(2), word(3), word(4), word(5), word(6), {
+		type: "cloze", text: "The brown fox ___ (jump) over the lazy dog now.", meaning: "jumps",
+		example: "The brown fox jumps over the lazy dog now.", example_cn: "那只棕狐现在跳过了懒狗。",
+		chunks: ["The brown fox", "jumps over the lazy dog", "now"],
+	}] as GeneratedItem[];
+	const verdict = await critiqueLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, { topic: "t", items }, [], FAKE_CONFIG, adaptive);
+	assert.equal(verdict.pass, false);
+	assert.ok(verdict.issues.some((i) => i.severity === "blocker" && /词组/.test(i.description)), "phrase-majority blocker raised");
+	assert.equal(calls, 0, "composition gate must not call the LLM");
 });
 
 test("generateReplacement prompt injects the profile + budget block", async () => {
