@@ -75,7 +75,7 @@ pi install git:github.com/zjm5-la/pi-english-anki
   "thinkingLevel": "medium",
   "intervalMinutes": 10,
   "dailyNewLimit": 3,
-  "maxTokens": 4096,
+  "maxTokens": 262144,
   "showWidget": true,
   "verbose": false
 }
@@ -88,7 +88,7 @@ pi install git:github.com/zjm5-la/pi-english-anki
 | `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `intervalMinutes` | `10` | 无现成队列卡时的自动检查/备课间隔（分钟）；设为 `0` 可关闭；现成队列卡之间不等待 |
 | `dailyNewLimit` | `3` | 每天首次展示的计划新卡上限；`0` 为不限，Skip 补卡不占额度 |
-| `maxTokens` | `4096` | 备课 LLM 响应的最大 token 数（须覆盖模型的隐藏推理开销） |
+| `maxTokens` | `262144` | 所有备课/审查/评价 LLM 调用的输出 token 上限（实际生效值会被模型自身上限收窄） |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
@@ -178,7 +178,7 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `intervalMinutes` | `10` | Background check/lesson interval when no stored card is ready; `0` disables it; ready queued cards have no inter-card wait |
 | `dailyNewLimit` | `3` | Planned cards first shown per day; `0` is unlimited and Skip replacements are quota-free |
-| `maxTokens` | `4096` | Max tokens for lesson generation (must cover the model's hidden reasoning) |
+| `maxTokens` | `262144` | Output-token ceiling for every generation/critique/evaluation call (clamped by the model's own limit) |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 

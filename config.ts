@@ -26,10 +26,13 @@ export const LESSON_CLOZE_ITEMS = 1;
 /** The daily batch is words-majority: phrases may not exceed this count. */
 export const LESSON_MAX_PHRASES = 3;
 
+/** Unified output-token ceiling for every generation/evaluation LLM call (256k). */
+export const MAX_OUTPUT_TOKENS = 262_144;
+
 export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
 	dailyNewLimit: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS,
-	maxTokens: 8192,
+	maxTokens: MAX_OUTPUT_TOKENS,
 	showWidget: true,
 	verbose: false,
 };
