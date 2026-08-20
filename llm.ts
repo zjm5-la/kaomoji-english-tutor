@@ -131,6 +131,15 @@ interface ResolvedModel {
 /** Max critic-driven revision rounds before a lesson is discarded. */
 export const MAX_LESSON_REVISIONS = 2;
 
+/** Same-model retries for transient replacement output-shape errors (BAD_JSON etc.). */
+export const REPLACEMENT_SHAPE_RETRIES = 1;
+
+/** Transient model-output shape errors worth an immediate blind retry. */
+function isTransientShapeError(err: unknown): boolean {
+	const code = String((err as Error & { code?: string })?.code || (err as Error)?.message || "");
+	return code === "BAD_JSON" || code === "INVALID_READY" || code === "EMPTY_REPLACEMENT";
+}
+
 export async function generateLesson(
 	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
@@ -576,12 +585,24 @@ export async function generateReplacement(
 		conversation,
 		"</conversation>",
 	].join("\n");
-	const text = await llm.complete(ctx, resolved, {
-		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
-		prompt,
-		maxTokens: 2048,
-		thinkingLevel: config.thinkingLevel,
-	});
+	// Same-model retry loop: transient output-shape errors (mostly truncated or
+	// unparseable JSON) get an immediate retry before the caller's model fallback.
+	for (let attempt = 0; ; attempt++) {
+		const text = await llm.complete(ctx, resolved, {
+			systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
+			prompt,
+			maxTokens: config.maxTokens,
+			thinkingLevel: config.thinkingLevel,
+		});
+		try {
+			return parseReplacementDecision(text, skipped.type);
+		} catch (err) {
+			if (attempt >= REPLACEMENT_SHAPE_RETRIES || !isTransientShapeError(err)) throw err;
+		}
+	}
+}
+
+function parseReplacementDecision(text: string, expectedType: GeneratedItem["type"]): ReplacementDecision {
 	const json = extractJsonObjectText(text);
 	if (!json) throw new Error("BAD_JSON");
 	let parsed: Record<string, unknown>;
@@ -594,7 +615,7 @@ export async function generateReplacement(
 		return { ready: false, reason: typeof parsed.reason === "string" ? parsed.reason : undefined };
 	}
 	if (parsed.ready !== true) throw new Error("INVALID_READY");
-	const item = parseGeneratedItem(parsed.item, skipped.type);
+	const item = parseGeneratedItem(parsed.item, expectedType);
 	if (!item) throw new Error("EMPTY_REPLACEMENT");
 	return { ready: true, item };
 }

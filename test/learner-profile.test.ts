@@ -656,6 +656,47 @@ test("generateReplacement rejects a cloze whose text appends the answer", async 
 	);
 });
 
+test("generateReplacement retries once after BAD_JSON and then succeeds", async () => {
+	const responses = [
+		"oops not json",
+		JSON.stringify({
+			ready: true,
+			item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+		}),
+	];
+	let calls = 0;
+	let capturedMaxTokens = 0;
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { maxTokens: number }) => {
+			capturedMaxTokens = request.maxTokens;
+			return responses[calls++];
+		},
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const skipped = { type: "word", text: "known", meaning: "熟词" } as unknown as import("../db.ts").ItemRow;
+	const decision = await generateReplacement(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "conversation", [], FAKE_CONFIG, skipped, adaptive);
+	assert.ok(decision.ready, "retry produced a usable replacement");
+	assert.equal(decision.item.text, "deadline");
+	assert.equal(calls, 2, "one malformed output is retried once on the same model");
+	assert.equal(capturedMaxTokens, FAKE_CONFIG.maxTokens, "replacement uses the configured maxTokens budget");
+});
+
+test("generateReplacement gives up after one retry when the output stays malformed", async () => {
+	let calls = 0;
+	const llm = {
+		complete: async () => { calls++; return "still not json"; },
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const skipped = { type: "word", text: "known", meaning: "熟词" } as unknown as import("../db.ts").ItemRow;
+	await assert.rejects(
+		() => generateReplacement(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "conversation", [], FAKE_CONFIG, skipped, adaptive),
+		/BAD_JSON/,
+	);
+	assert.equal(calls, 2, "exactly one retry before propagating the error");
+});
+
 // -- Attempt question-snapshot log (备课依据) -------------------------------
 
 test("evaluated attempts persist the question snapshot and feed the lesson-prep block", () => {
