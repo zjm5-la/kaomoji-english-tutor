@@ -633,7 +633,7 @@ test("generateReplacement prompt injects the profile + budget block", async () =
 	assert.match(captured, /difficulty_budget/);
 	assert.match(captured, /12-18/, "B1 budget word range reaches the replacement prompt");
 	assert.doesNotMatch(captured, /中级学习者/);
-	assert.match(captured, /雅思备考核心词汇/, "replacement falls back to IELTS vocabulary when the conversation lacks content");
+	assert.match(captured, /雅思入门\/基础段/, "replacement falls back to beginner-band IELTS vocabulary when the conversation lacks content");
 });
 
 test("generateReplacement rejects a cloze whose text appends the answer", async () => {
