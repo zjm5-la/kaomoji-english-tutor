@@ -481,6 +481,8 @@ test("generation prompt receives the concise profile + budget block", async () =
 	assert.match(captured, /difficulty_budget/);
 	assert.match(captured, /12-18/); // B1 word range reaches the prompt
 	assert.match(captured, /句法：B1/);
+	assert.match(captured, /雅思/, "IELTS vocabulary source is offered");
+	assert.match(captured, /至少 3 个来自会话/, "at least 3 items must come from the conversation");
 	// No hardcoded "中级学习者" assumption leaks into the prompt.
 	assert.doesNotMatch(captured, /中级学习者/);
 });
@@ -631,6 +633,7 @@ test("generateReplacement prompt injects the profile + budget block", async () =
 	assert.match(captured, /difficulty_budget/);
 	assert.match(captured, /12-18/, "B1 budget word range reaches the replacement prompt");
 	assert.doesNotMatch(captured, /中级学习者/);
+	assert.match(captured, /雅思备考核心词汇/, "replacement falls back to IELTS vocabulary when the conversation lacks content");
 });
 
 test("generateReplacement rejects a cloze whose text appends the answer", async () => {

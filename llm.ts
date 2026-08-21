@@ -154,20 +154,21 @@ export async function generateLesson(
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
 	const prompt = [
-		"你是「英语小宠物」的备课大脑。先判断下面的会话是否已经形成值得学习的明确主题。",
-		"如果信息不足，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。不要为了完成任务硬凑学习卡。",
-		"只有信息充分时，才围绕主题准备一整天的课量：共 " + (LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS) + " 个学习项，其中 " + LESSON_WORD_ITEMS + " 个单词或词组（以单词为主，词组不超过 " + LESSON_MAX_PHRASES + " 个），" + (LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空") + "。",
+		`你是「英语小宠物」的备课大脑。学习者正在备考雅思，每天需要一整天的课量：共 ${LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS} 个学习项，其中 ${LESSON_WORD_ITEMS} 个单词或词组（以单词为主，词组不超过 ${LESSON_MAX_PHRASES} 个），${LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空"}。`,
+		"",
+		"词汇来源（两条线，缺一不可）：",
+		`- 会话线：从下面会话中提取真实、常用的英语表达，${LESSON_WORD_ITEMS} 个单词/词组中至少 3 个来自会话；会话可提取的有效表达不足 3 个时全部提取，剩余名额用雅思词汇补足`,
+		"- 雅思线：其余学习项从雅思备考核心词汇中选择（听说读写高频学术与生活词汇），贴合下面的画像与预算",
 		"",
 		"备课条件：",
-		"- 只要会话中出现过真实、常用的英语表达（单词、词组、完整句子），就可以备课",
 		"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得当前学习者掌握的英语",
-		"- 只有纯寒暄、单字命令、无意义占位或环境通知才返回 ready=false",
-		"- 有英语内容就倾向 ready=true，不要因为话题不够像传统英语课而拒绝",
+		"- 即使会话缺乏可提取的英语内容（纯寒暄、单字命令、环境通知），也用雅思词汇出满一批，topic 填「雅思词汇」，不要拒绝备课",
+		"- 只有会话内容完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
 		"",
 		"学习项要求：",
-		"- 内容要真实常用，贴近主题的实际使用场景，难度须贴合下面的画像与预算",
+		"- 内容要真实常用：会话来源的贴近会话语境，雅思来源的选自雅思高频词表；难度都须贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
-		"- 教学项围绕同一主题：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
+		"- 教学项围绕同一主题组织（会话主题或雅思主题）：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
 		`- 每个学习项必须互不重复；${LESSON_WORD_ITEMS} 个单词/词组项彼此独立，各自配一个小巧自然的例句`,
 		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
 		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
@@ -566,14 +567,15 @@ export async function generateReplacement(
 		? '{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}'
 		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
 	const prompt = [
-		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟。`,
-		`请根据会话主题补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
-		"如果会话信息不足以生成真实有用的同类型卡片，只输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
+		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟，且用户正在备考雅思。`,
+		`请补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
+		"优先从下面会话中提取真实表达；会话没有合适内容时，从雅思备考核心词汇中选择同类型卡片（听说读写高频学术与生活词汇），不要因为会话缺乏英语内容而拒绝。",
+		"只有完全无法生成时才输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
 		isCloze
 			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，text 只放挖空句且句尾不得附加 = 答案或 → 答案，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
-			: "内容要真实常用，贴近当前会话主题，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn。",
+			: "内容要真实常用：会话来源的贴近当前会话语境，雅思来源的选自雅思高频词表，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn。",
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog
 			? ["", "最近出题与作答记录（新→旧）：", recentLog, "避免重复近期刚练过的内容；若反馈指向出题缺陷，避免同类出题。"]
