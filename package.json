@@ -21,6 +21,7 @@
     "sentence-cycle.ts",
     "learner-profile.ts",
     "pi-sdk-llm.ts",
+    "sync.ts",
     "README.md"
   ],
   "pi": {
