@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_OUTPUT_TOKENS, type PetConfig } from "./config.ts";
+import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, MAX_OUTPUT_TOKENS, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import type { ItemRow } from "./db.ts";
 import type { SentenceExerciseView } from "./render.ts";
@@ -59,7 +59,8 @@ function extractJsonObjectText(text: string): string | undefined {
 	return start >= 0 && end > start ? cleaned.slice(start, end + 1) : undefined;
 }
 
-function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]): GeneratedItem | undefined {
+/** Parse and structurally validate one generated item; undefined when malformed. */
+export function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]): GeneratedItem | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const record = raw as Record<string, unknown>;
 	const type = record.type;
@@ -140,6 +141,19 @@ function isTransientShapeError(err: unknown): boolean {
 	return code === "BAD_JSON" || code === "INVALID_READY" || code === "EMPTY_REPLACEMENT";
 }
 
+/** Explicit batch composition override (partial batches fill the day's remaining quota). */
+export interface LessonBatch {
+	wordItems: number;
+	clozeItems: number;
+}
+
+const DEFAULT_LESSON_BATCH: LessonBatch = { wordItems: LESSON_WORD_ITEMS, clozeItems: LESSON_CLOZE_ITEMS };
+
+/** Phrases may not exceed the words-majority cap nor the batch size itself. */
+function phraseCapFor(wordItems: number): number {
+	return Math.min(LESSON_MAX_PHRASES, wordItems);
+}
+
 export async function generateLesson(
 	llm: PiSdkLlmClient,
 	ctx: ExtensionContext,
@@ -150,14 +164,16 @@ export async function generateLesson(
 	feedback?: CritiqueIssue[],
 	adaptive?: AdaptiveContext,
 	recentLog?: string,
+	batch?: LessonBatch,
 ): Promise<LessonDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
+	const { wordItems, clozeItems } = batch ?? DEFAULT_LESSON_BATCH;
 	const prompt = [
-		`你是「英语小宠物」的备课大脑。学习者正在备考雅思，每天需要一整天的课量：共 ${LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS} 个学习项，其中 ${LESSON_WORD_ITEMS} 个单词或词组（以单词为主，词组不超过 ${LESSON_MAX_PHRASES} 个），${LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空"}。`,
+		`你是「英语小宠物」的备课大脑。学习者正在备考雅思，每天需要一整天的课量：共 ${wordItems + clozeItems} 个学习项，其中 ${wordItems} 个单词或词组（以单词为主，词组不超过 ${phraseCapFor(wordItems)} 个）${clozeItems > 0 ? (clozeItems > 1 ? `，${clozeItems} 个语法填空` : "，1 个语法填空") : ""}。`,
 		"",
 		"词汇来源（两条线，缺一不可）：",
-		`- 会话线：从下面会话中提取真实、常用的英语表达，${LESSON_WORD_ITEMS} 个单词/词组中至少 3 个来自会话；会话可提取的有效表达不足 3 个时全部提取，剩余名额用雅思词汇补足`,
+		`- 会话线：从下面会话中提取真实、常用的英语表达，${wordItems} 个单词/词组中至少 3 个来自会话；会话可提取的有效表达不足 3 个时全部提取，剩余名额用雅思词汇补足`,
 		"- 雅思线：学习者是低水平初学者，其余学习项从雅思入门/基础段（约 4.0-5.5 分，A2-B1）的高频常用核心词汇中选取（听说读写都常见的日常与基础词汇）；严格遵循下方画像的「词汇层次」，画像词汇档低于 B2 时禁止生僻学术词、低频难词；例句用日常简单句",
 		"- 难度限制只约束雅思线的选词；会话线的词不受词汇层次限制——工作场景立即能用、马上就能理解的词（哪怕偏难）优先级高于难度预算，照常提取",
 		"",
@@ -169,17 +185,20 @@ export async function generateLesson(
 		"学习项要求：",
 		"- 内容要真实常用：会话来源的贴近会话语境，雅思来源的选自雅思高频词表；难度都须贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
-		"- 教学项围绕同一主题组织（会话主题或雅思主题）：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
-		`- 每个学习项必须互不重复；${LESSON_WORD_ITEMS} 个单词/词组项彼此独立，各自配一个小巧自然的例句`,
-		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
-		"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
-		"- cloze 的句子必须在语法上锁死唯一答案：若同一个空存在多种语法正确的填法（如 isn't called 与 won't be called 都成立），必须加时间/语境锚点（如 once the migration finishes）排除歧义，否则换考点或改写句子",
-		"- cloze 的 meaning 填正确答案（如 was committed）；text 只放挖空句，严禁在句尾附加 = was committed、→ was committed 等答案；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
-		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`,
+		...(clozeItems > 0
+			? ["- 教学项围绕同一主题组织（会话主题或雅思主题）：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
+				`- 每个学习项必须互不重复；${wordItems} 个单词/词组项彼此独立，各自配一个小巧自然的例句`,
+				"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空格后用括号给出所填词的原形提示，如 The fix that ___ (commit) this morning won't take effect.",
+				"- cloze 的考点必须是明确的语法点（时态、语态、主谓一致、单复数、介词、冠词、非谓语、词形变化等），答案唯一且为最小形式",
+				"- cloze 的句子必须在语法上锁死唯一答案：若同一个空存在多种语法正确的填法（如 isn't called 与 won't be called 都成立），必须加时间/语境锚点（如 once the migration finishes）排除歧义，否则换考点或改写句子",
+				"- cloze 的 meaning 填正确答案（如 was committed）；text 只放挖空句，严禁在句尾附加 = was committed、→ was committed 等答案；example 填把答案代入后的完整正确句子；example_cn 填整句中文翻译，可附一句考点说明",
+				`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`]
+			: ["- 教学项围绕同一主题组织（会话主题或雅思主题），形成一个统一的教学单元",
+				`- 每个学习项必须互不重复；${wordItems} 个单词/词组项彼此独立，各自配一个小巧自然的例句`]),
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
 		'- 只输出 JSON，不要任何其他文字：',
-		`{"ready":true,"topic":"主题名","items":[${Array.from({ length: LESSON_WORD_ITEMS }, () => '{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"}').join(",")}${Array.from({ length: LESSON_CLOZE_ITEMS }, () => ',{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}').join("")}]}`,
-		"- cloze 必须带 chunks（2-6 个意群，按顺序拼接后覆盖代入答案后的完整句子）",
+		`{"ready":true,"topic":"主题名","items":[${Array.from({ length: wordItems }, () => '{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"}').join(",")}${Array.from({ length: clozeItems }, () => ',{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}').join("")}]}`,
+		...(clozeItems > 0 ? ["- cloze 必须带 chunks（2-6 个意群，按顺序拼接后覆盖代入答案后的完整句子）"] : []),
 		"- 不要与已学内容重复，也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
 			? ["", "上一次备课被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
@@ -222,17 +241,17 @@ export async function generateLesson(
 	}
 	if (parsed.ready !== true) throw new Error("INVALID_READY");
 
-	if (!Array.isArray(parsed.items) || parsed.items.length !== LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS) throw new Error("INVALID_LESSON_SHAPE");
+	if (!Array.isArray(parsed.items) || parsed.items.length !== wordItems + clozeItems) throw new Error("INVALID_LESSON_SHAPE");
 	const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
 	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
 	const items = parsedItems as GeneratedItem[];
-	// The word/phrase slots are homogeneous now: at least one word, phrases capped,
-	// sentence cards are legacy review-only.
+	// The word/phrase slots are homogeneous now: at least one word, phrases capped
+	// (never above the batch size), sentence cards are legacy review-only.
 	const wordCount = items.filter((item) => item.type === "word").length;
 	const phraseCount = items.filter((item) => item.type === "phrase").length;
 	const clozeCount = items.filter((item) => item.type === "cloze").length;
-	if (wordCount + phraseCount !== LESSON_WORD_ITEMS || phraseCount > LESSON_MAX_PHRASES || wordCount < 1) throw new Error("INVALID_LESSON_SHAPE");
-	if (clozeCount !== LESSON_CLOZE_ITEMS) throw new Error("INVALID_LESSON_SHAPE");
+	if (wordCount + phraseCount !== wordItems || phraseCount > phraseCapFor(wordItems) || wordCount < 1) throw new Error("INVALID_LESSON_SHAPE");
+	if (clozeCount !== clozeItems) throw new Error("INVALID_LESSON_SHAPE");
 	// Grammar clozes are the dedicated slots now; sentences are legacy review-only.
 	if (items.some((item) => item.type === "sentence")) throw new Error("INVALID_LESSON_SHAPE");
 	if (items.filter((item) => item.type === "cloze").some((item) => !validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
@@ -269,6 +288,7 @@ export async function critiqueLesson(
 	known: string[],
 	config: PetConfig,
 	adaptive?: AdaptiveContext,
+	composition?: LessonBatch | null,
 ): Promise<CritiqueVerdict> {
 	const failClosed = (summary: string): CritiqueVerdict => ({ available: false, pass: false, issues: [], summary });
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
@@ -280,11 +300,16 @@ export async function critiqueLesson(
 	// regardless of the model critic's verdict.
 	const budgetBlockers: CritiqueIssue[] = [];
 	const phraseCount = lesson.items.filter((item) => item.type === "phrase").length;
-	if (lesson.items.length === LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS && phraseCount > LESSON_MAX_PHRASES) {
+	// composition === null marks a user-customized batch: no fixed composition to
+	// enforce, per-item quality checks below still apply in full.
+	const compositionBatch = composition ?? DEFAULT_LESSON_BATCH;
+	if (composition !== null &&
+		lesson.items.length === compositionBatch.wordItems + compositionBatch.clozeItems &&
+		phraseCount > phraseCapFor(compositionBatch.wordItems)) {
 		budgetBlockers.push({
 			severity: "blocker",
 			category: "composition",
-			description: `词组数量 ${phraseCount} 超过单词为主的批次上限 ${LESSON_MAX_PHRASES}，请减词组换单词`,
+			description: `词组数量 ${phraseCount} 超过单词为主的批次上限 ${phraseCapFor(compositionBatch.wordItems)}，请减词组换单词`,
 		});
 	}
 	for (const item of lesson.items) {
@@ -345,7 +370,9 @@ export async function critiqueLesson(
 		"审查标准：",
 		"- 英语单词/词组/句子必须正确、自然",
 		"- 词汇难度须符合画像「词汇层次」：雅思来源的词必须是入门/基础段常用核心词，生僻学术词、低频难词记 blocker；但会话来源的词（工作场景立即能用/能理解的）不受词汇层次限制，不得因偏难而拒收",
-		`- 批次组成：${LESSON_WORD_ITEMS} 个单词/词组项以单词为主（词组不超过 ${LESSON_MAX_PHRASES} 个）加 ${LESSON_CLOZE_ITEMS > 1 ? LESSON_CLOZE_ITEMS + " 个语法填空" : "1 个语法填空"}；同批学习项之间不得重复或近乎重复；违反记 blocker`,
+		...(composition === null
+			? ["- 批次组成：用户定制批次，类型限 word/phrase/cloze，数量按用户提示词；同批学习项之间不得重复或近乎重复；违反记 blocker"]
+			: [`- 批次组成：${compositionBatch.wordItems} 个单词/词组项以单词为主（词组不超过 ${phraseCapFor(compositionBatch.wordItems)} 个）${compositionBatch.clozeItems > 0 ? ` 加 ${compositionBatch.clozeItems > 1 ? compositionBatch.clozeItems + " 个语法填空" : "1 个语法填空"}` : ""}；同批学习项之间不得重复或近乎重复；违反记 blocker`]),
 		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；chunks 必须是 2-6 个意群且拼接覆盖完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
 		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
@@ -622,4 +649,83 @@ function parseReplacementDecision(text: string, expectedType: GeneratedItem["typ
 	const item = parseGeneratedItem(parsed.item, expectedType);
 	if (!item) throw new Error("EMPTY_REPLACEMENT");
 	return { ready: true, item };
+}
+
+// -- /anki:add custom card generation ---------------------------------------
+
+export type CustomCardsDecision =
+	| { ready: true; items: GeneratedItem[] }
+	| { ready: false; reason?: string };
+
+/**
+ * Make cards from a user-supplied prompt (types: word/phrase/cloze only).
+ * Card count follows the prompt, defaulting to 5, clamped to MAX_CUSTOM_PER_ADD.
+ */
+export async function generateCustomCards(
+	llm: PiSdkLlmClient,
+	ctx: ExtensionContext,
+	resolved: ResolvedModel,
+	userPrompt: string,
+	known: string[],
+	config: PetConfig,
+	adaptive?: AdaptiveContext,
+	feedback?: CritiqueIssue[],
+): Promise<CustomCardsDecision> {
+	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+	const budget = ctxAdaptive.budget;
+	const prompt = [
+		"用户想按下面的提示词定制学习卡。学习者正在备考雅思。",
+		`卡片类型限 word（单词）、phrase（词组）、cloze（语法填空）；数量按提示词理解，未写明数量时做 5 张；单次最多 ${MAX_CUSTOM_PER_ADD} 张，提示词要求更多时只做最重要的前 ${MAX_CUSTOM_PER_ADD} 张。`,
+		"提示词完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
+		"信息充分时只输出 JSON，不要任何其他文字：",
+		`{"ready":true,"items":[{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}]}`,
+		"内容要求：",
+		"- 内容要真实常用、贴合提示词的意图，难度贴合下面的画像与预算",
+		"- word 和 phrase 的例句短小自然，贴近提示词的实际使用场景",
+		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空后括号给所填词的原形提示；考点必须是明确的语法点，答案唯一且为最小形式；meaning 填正确答案，text 只放挖空句，严禁句尾附加 = 答案；example 是代入答案后的完整句子，example_cn 填整句中文翻译；chunks 是 2-6 个按顺序拼接覆盖完整句子的意群",
+		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然；提示词只要词汇时可不用 cloze`,
+		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning；释义只给一个首选说法，不并列近义改写，确有多个义项才用「；」并列",
+		"- 每张卡互不重复，也不得与已有内容重复：" + (known.length ? known.join("、") : "（暂无）"),
+		...(feedback && feedback.length
+			? ["", "上一次制卡被审查拒绝，请针对以下问题改进（不要原样重复被拒内容）：",
+				...feedback.map((i) => `- [${i.severity}] ${i.category}: ${i.description}`)]
+			: []),
+		"",
+		formatAdaptiveBlock(ctxAdaptive.profile, budget),
+		"",
+		"<user_request>",
+		userPrompt,
+		"</user_request>",
+	].join("\n");
+
+	const text = await llm.complete(ctx, resolved, {
+		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
+		prompt,
+		maxTokens: config.maxTokens,
+		thinkingLevel: config.thinkingLevel,
+	});
+
+	const json = extractJsonObjectText(text);
+	if (!json) throw new Error("BAD_JSON");
+	let parsed: Record<string, unknown>;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		throw new Error("BAD_JSON");
+	}
+	if (parsed.ready === false) {
+		return { ready: false, reason: typeof parsed.reason === "string" ? parsed.reason : undefined };
+	}
+	if (parsed.ready !== true) throw new Error("INVALID_READY");
+	if (!Array.isArray(parsed.items) || parsed.items.length < 1) throw new Error("INVALID_CUSTOM_SHAPE");
+	const items: GeneratedItem[] = [];
+	for (const raw of parsed.items) {
+		const item = parseGeneratedItem(raw);
+		if (!item || item.type === "sentence") throw new Error("INVALID_CUSTOM_ITEM");
+		if (item.type === "cloze" && !validClozeItem(item)) throw new Error("INVALID_CUSTOM_ITEM");
+		items.push(item);
+	}
+	const texts = new Set(items.map((item) => item.text.trim().toLowerCase()));
+	if (texts.size !== items.length) throw new Error("INVALID_CUSTOM_ITEM");
+	return { ready: true, items: items.slice(0, MAX_CUSTOM_PER_ADD) };
 }

@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 11;
+const SCHEMA_TARGET_VERSION = 12;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -337,6 +337,19 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// generator's third slot becomes cloze instead of progressive sentences.
 	(db: DatabaseSync) => {
 		rebuildItemsTableForCloze(db);
+	},
+	// v12: staging queue for /anki:add custom cards. Cards are made immediately
+	// but released into items day by day, consuming the daily new-card quota.
+	(db: DatabaseSync) => {
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS custom_card_queue (
+				id INTEGER PRIMARY KEY,
+				created_at TEXT NOT NULL,
+				prompt TEXT NOT NULL,
+				fingerprint TEXT NOT NULL,
+				payload TEXT NOT NULL
+			);
+		`);
 	},
 ];
 
@@ -706,7 +719,7 @@ export function insertItem(
 		levels_cn?: string[];
 		chunks?: string[];
 		keyWords?: GeneratedItem["keyWords"];
-		introductionKind?: "planned" | "replacement";
+		introductionKind?: "planned" | "replacement" | "custom";
 	},
 ): number {
 	const senseId = ensureLexicalSense(db, type, text, meaning, now);
@@ -830,7 +843,7 @@ export function advanceReviewDirectional(
 export function countTodayNew(db: DatabaseSync, now: Date): number {
 	const row = db
 		.prepare(
-			"SELECT COUNT(*) AS n FROM items WHERE introduction_kind = 'planned' AND introduced_at >= ?",
+			"SELECT COUNT(*) AS n FROM items WHERE introduction_kind IN ('planned', 'custom') AND introduced_at >= ?",
 		)
 		.get(localDayStartISO(now)) as { n: number };
 	return Number(row.n);
@@ -893,4 +906,54 @@ export function consumeReplacement(
 	queue.shift();
 	setStat(db, "pending_replacements", JSON.stringify(queue));
 	return true;
+}
+
+// -- /anki:add custom-card queue --------------------------------------------
+
+export interface CustomQueueRow {
+	id: number;
+	created_at: string;
+	prompt: string;
+	fingerprint: string;
+	payload: string;
+}
+
+/** Stage a finished custom card; FIFO order follows insertion (rowid) order. */
+export function enqueueCustomCard(
+	db: DatabaseSync,
+	prompt: string,
+	item: GeneratedItem,
+): void {
+	db.prepare(
+			"INSERT INTO custom_card_queue (created_at, prompt, fingerprint, payload) VALUES (?, ?, ?, ?)",
+	).run(
+		new Date().toISOString(),
+		prompt,
+		contentFingerprint(item.type, item.text, item.meaning),
+		JSON.stringify(item),
+	);
+}
+
+/** Oldest-first queue rows (FIFO). */
+export function peekCustomQueue(db: DatabaseSync, limit: number): CustomQueueRow[] {
+	return db
+		.prepare("SELECT * FROM custom_card_queue ORDER BY id ASC LIMIT ?")
+		.all(limit) as CustomQueueRow[];
+}
+
+export function listCustomQueue(db: DatabaseSync): CustomQueueRow[] {
+	return db
+		.prepare("SELECT * FROM custom_card_queue ORDER BY id ASC")
+		.all() as CustomQueueRow[];
+}
+
+export function removeCustomQueueRows(db: DatabaseSync, ids: number[]): void {
+	if (!ids.length) return;
+	const del = db.prepare("DELETE FROM custom_card_queue WHERE id = ?");
+	for (const id of ids) del.run(id);
+}
+
+export function customQueueCount(db: DatabaseSync): number {
+	const row = db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue").get() as { n: number };
+	return Number(row.n);
 }

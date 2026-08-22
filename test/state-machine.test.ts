@@ -1247,7 +1247,7 @@ test("single coordinator commits one lesson batch", { concurrency: false }, asyn
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		const a = await makeSession({ model, modelRegistry: registry, sessionId: "lesson-a" });
 		const b = await makeSession({ model, modelRegistry: registry, sessionId: "lesson-b" });
 		await fake.fire();
@@ -1324,9 +1324,9 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const attemptCols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 11, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","schema_meta","schema_migrations"]) {
+			assert.deepEqual({ ...meta }, { schema_version: 12, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","custom_card_queue","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
 			for (const c of ["lesson_id","lexical_sense_id","role","content_fingerprint","content_version","introduced_at","introduction_kind","introduction_accuracy","content_status","legacy_duplicate_of","fsrs_status","fsrs_error","fsrs_corrupt_at"]) {
@@ -1375,7 +1375,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 11);
+		assert.equal(meta.schema_version, 12);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -1417,7 +1417,7 @@ test("v7 restores fractional elapsed_days false-positive quarantines without los
 		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 11);
+		assert.equal(meta.schema_version, 12);
 		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
 		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1447,7 +1447,7 @@ test("v8 upgrades an existing v7 database and preserves directionless attempts",
 		const cols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((row) => row.name);
 		const attempt = db.prepare("SELECT verdict, direction FROM attempts WHERE id = 'legacy-attempt'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 11);
+		assert.equal(meta.schema_version, 12);
 		assert.ok(cols.includes("direction"), "direction migrated");
 		assert.deepEqual({ ...attempt }, { verdict: "correct", direction: null });
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1493,7 +1493,7 @@ test("v11 upgrades an existing v10 database and admits cloze items", { concurren
 			new Date(0).toISOString(),
 		);
 		db.close();
-		assert.equal(meta.schema_version, 11, "v11 migration applied");
+		assert.equal(meta.schema_version, 12, "v11 migration applied");
 		assert.deepEqual({ ...card }, { text: "preserved", meaning: "保留" }, "existing cards survive the rebuild");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
@@ -1739,7 +1739,7 @@ test("generated lesson items carry unique content fingerprints", { concurrency: 
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "fp-a" });
 		await fake.fire();
 		await fake.flush();
@@ -1763,7 +1763,7 @@ test("word/phrase items link to a lexical sense; cloze items do not", { concurre
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "sense-a" });
 		await fake.fire();
 		await fake.flush();
@@ -1822,7 +1822,7 @@ test("deterministic budget gate rejects an out-of-budget generated lesson with z
 			fauxAssistantMessage(longLessonResponse("too-long-3")),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "budget-gate" });
 		await fake.fire();
 		await fake.flush();
@@ -1854,7 +1854,7 @@ test("critic bad JSON fails closed and commits no lesson", { concurrency: false 
 			fauxAssistantMessage(JSON.stringify({ ready: false, reason: "defer revision" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "critic-bad-json" });
 		await fake.fire();
 		await fake.flush();
@@ -1882,7 +1882,7 @@ test("revision loop recovers a lesson after an initial critic rejection", { conc
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "rev-a" });
 		await fake.fire();
 		await fake.flush();
@@ -1924,7 +1924,7 @@ test("fallback session model is reused for the critic after configured generator
 				return { ok: true, apiKey: "test-key" };
 			},
 		};
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3, provider: primaryModel.provider, model: primaryModel.id });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0, provider: primaryModel.provider, model: primaryModel.id });
 		await makeSession({ model: fallbackModel, modelRegistry: registry, sessionId: "model-fallback" });
 		await fake.fire();
 		await fake.flush();
@@ -2151,7 +2151,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 11, "schema migrated to v11");
+	assert.equal(meta.schema_version, 12, "schema migrated to v12");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });
@@ -2233,7 +2233,7 @@ test("lesson generation stamps content_fingerprint and lexical_sense_id", { conc
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		const s = await makeSession({ model, modelRegistry: registry, sessionId: "fp" });
 		await fake.fire();
 		await fake.flush();
@@ -2658,7 +2658,7 @@ test("lesson items leave introduced_at NULL until first display", { concurrency:
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		await makeSession({ model, modelRegistry: registry, sessionId: "intro-test" });
 		await fake.fire();
 		await fake.flush();
@@ -2939,6 +2939,400 @@ test("after a forward Again, a due reverse surfaces in reverse direction", { con
 		assert.ok(dirs.every((d) => typeof d.fsrs_state === "string"), "both direction rows exist after the first rating");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
+		fake.restore();
+	}
+});
+
+// -- /anki:add custom queue release (harness level) ------------------------
+
+function queueWord(text: string, meaning: string) {
+	return { type: "word", text, phonetic: "/x/", meaning, example: `The ${text} helps.`, example_cn: `${meaning}有帮助。` };
+}
+
+function queueCloze() {
+	return {
+		type: "cloze",
+		text: "The report that ___ (submit) yesterday is now public.",
+		phonetic: "",
+		meaning: "was submitted",
+		example: "The report that was submitted yesterday is now public.",
+		example_cn: "昨天提交的那份报告现在公开了。",
+		chunks: ["The report", "that was submitted yesterday", "is now public"],
+	};
+}
+
+/** Stage a finished card in custom_card_queue the way /anki:add does. */
+function enqueueCustom(db: DatabaseSync, item: { type: string; text: string; meaning: string }) {
+	db.prepare("INSERT INTO custom_card_queue (created_at, prompt, fingerprint, payload) VALUES (?, ?, ?, ?)")
+		.run(new Date().toISOString(), "test", contentFingerprint(item.type, item.text, item.meaning), JSON.stringify(item));
+}
+
+const queueLength = (db: DatabaseSync) =>
+	Number((db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue").get() as any).n);
+
+/** Make the global slot claimable: no active card, pacing window elapsed. */
+function clearGlobalSlot(db: DatabaseSync) {
+	db.prepare("UPDATE runtime_state SET active_item_id = NULL, next_check_at = ? WHERE id = 1").run(new Date(0).toISOString());
+}
+
+/** Await an async condition by draining microtasks/macrotasks. */
+async function until(fake: ReturnType<typeof installFakeTimers>, condition: () => boolean, label: string) {
+	for (let i = 0; i < 200 && !condition(); i++) await fake.flush();
+	assert.ok(condition(), label);
+}
+
+test("queued custom cards release FIFO: first card activated as teach, rest wait shown=0", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "custom-release-fifo" });
+		const db = openTestDb();
+		enqueueCustom(db, queueWord("alpha", "阿尔法"));
+		enqueueCustom(db, queueWord("beta", "贝塔"));
+		enqueueCustom(db, queueWord("gamma", "伽马"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const items = (check.prepare("SELECT text, shown, introduced_at IS NOT NULL AS stamped, introduction_kind FROM items ORDER BY id").all() as any[]).map((row) => ({ ...row }));
+		const state = check.prepare("SELECT active_item_id, active_kind FROM runtime_state WHERE id=1").get() as any;
+		const queued = queueLength(check);
+		check.close();
+		assert.deepEqual(items, [
+			{ text: "alpha", shown: 1, stamped: 1, introduction_kind: "custom" },
+			{ text: "beta", shown: 0, stamped: 0, introduction_kind: "custom" },
+			{ text: "gamma", shown: 0, stamped: 0, introduction_kind: "custom" },
+		]);
+		assert.equal(state.active_item_id, 1, "the first queued card is activated immediately");
+		assert.equal(state.active_kind, "teach");
+		assert.equal(queued, 0, "released rows leave the queue");
+		assert.match(harness.widget().join(" "), /alpha/);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("a cloze at the head of the custom queue is activated as a review quiz", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "custom-release-cloze" });
+		const db = openTestDb();
+		enqueueCustom(db, queueCloze());
+		enqueueCustom(db, queueWord("beta", "贝塔"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const state = check.prepare("SELECT active_item_id, active_kind FROM runtime_state WHERE id=1").get() as any;
+		const queued = queueLength(check);
+		check.close();
+		assert.equal(state.active_item_id, 1, "the queued cloze is activated first");
+		assert.equal(state.active_kind, "review", "cloze cards quiz from the very first showing");
+		assert.equal(queued, 0);
+		assert.match(harness.widget().join(" "), /___/, "the quiz face shows the blanked sentence");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("custom release is capped by the day's remaining new-card quota", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 2 });
+		const harness = await makeSession({ sessionId: "custom-quota-cap" });
+		const db = openTestDb();
+		for (const text of ["q1", "q2", "q3", "q4", "q5"]) enqueueCustom(db, queueWord(text, `词 ${text}`));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const released = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queued = queueLength(check);
+		const state = check.prepare("SELECT active_kind FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(released, 2, "only the remaining quota is released");
+		assert.equal(queued, 3, "the rest stays queued for later days");
+		assert.equal(state.active_kind, "teach");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("a queue shorter than the quota releases everything at once", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 11 });
+		const harness = await makeSession({ sessionId: "custom-quota-short" });
+		const db = openTestDb();
+		for (const text of ["r1", "r2", "r3", "r4", "r5"]) enqueueCustom(db, queueWord(text, `词 ${text}`));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const released = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queued = queueLength(check);
+		check.close();
+		assert.equal(released, 5, "a short queue releases in full");
+		assert.equal(queued, 0);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("a long queue releases at most the full daily quota", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 11 });
+		const harness = await makeSession({ sessionId: "custom-quota-long" });
+		const db = openTestDb();
+		for (let i = 1; i <= 15; i++) enqueueCustom(db, queueWord(`long${i}`, `词 ${i}`));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const released = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const queued = queueLength(check);
+		check.close();
+		assert.equal(released, 11, "exactly the daily quota is released");
+		assert.equal(queued, 4);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("custom release defers while a global card is active or replacements are pending", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		// Scenario 1: an active global card short-circuits petTick before release.
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		let harness = await makeSession({ sessionId: "custom-defer-active" });
+		let db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','busy','忙',?,?,1)")
+			.run(new Date().toISOString(), "2099-01-01T00:00:00.000Z");
+		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_version=1, next_check_at=? WHERE id=1")
+			.run(new Date(0).toISOString());
+		enqueueCustom(db, queueWord("hold1", "扣一"));
+		enqueueCustom(db, queueWord("hold2", "扣二"));
+		db.close();
+		await fake.fire();
+		db = openTestDb();
+		assert.equal(queueLength(db), 2, "active card: queue untouched");
+		assert.equal(Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n), 1, "active card: nothing released");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+
+		// Scenario 2: a pending replacement obligation gates the release too.
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		harness = await makeSession({ sessionId: "custom-defer-replacement" });
+		db = openTestDb();
+		db.prepare("INSERT INTO stats(key, value) VALUES('pending_replacements', ?)").run(JSON.stringify(["word"]));
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','skipme','已跳',?,?,1)")
+			.run(new Date().toISOString(), "2099-01-01T00:00:00.000Z");
+		enqueueCustom(db, queueWord("hold3", "扣三"));
+		enqueueCustom(db, queueWord("hold4", "扣四"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		await fake.flush();
+		db = openTestDb();
+		assert.equal(queueLength(db), 2, "pending replacement: queue untouched");
+		assert.equal(Number((db.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind='custom'").get() as any).n), 0, "pending replacement: nothing released");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("custom release defers while a review is due or the daily quota is exhausted", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		// Scenario 1: a due review wins the tick before any custom release.
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		let harness = await makeSession({ sessionId: "custom-defer-due" });
+		let db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','review','复习',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		enqueueCustom(db, queueWord("hold5", "扣五"));
+		enqueueCustom(db, queueWord("hold6", "扣六"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		db = openTestDb();
+		assert.equal(queueLength(db), 2, "due review: queue untouched");
+		const state = db.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		db.close();
+		assert.equal(state.active_item_id, 1, "the due review is claimed instead");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+
+		// Scenario 2: the daily quota is already spent.
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		harness = await makeSession({ sessionId: "custom-defer-quota" });
+		db = openTestDb();
+		const now = new Date().toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at,introduction_kind) VALUES('word','spent','已用',?,?,1,?,'planned')")
+			.run(now, "2099-01-01T00:00:00.000Z", now);
+		enqueueCustom(db, queueWord("hold7", "扣七"));
+		enqueueCustom(db, queueWord("hold8", "扣八"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		db = openTestDb();
+		assert.equal(queueLength(db), 2, "quota exhausted: queue untouched");
+		assert.equal(Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n), 1, "quota exhausted: nothing released");
+		const idle = db.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		db.close();
+		assert.equal(idle.active_item_id, null, "no card is activated over quota");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("a fingerprint collision drops only the queued row; the rest still release", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
+		const harness = await makeSession({ sessionId: "custom-collision" });
+		const db = openTestDb();
+		const now = new Date().toISOString();
+		// The deck already contains "menu" (introduced today): the queued copy collides.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at,introduction_kind,content_fingerprint) VALUES('word','menu','菜单',?,?,1,?,'planned',?)")
+			.run(now, "2099-01-01T00:00:00.000Z", now, contentFingerprint("word", "menu", "菜单"));
+		enqueueCustom(db, queueWord("menu", "菜单"));
+		enqueueCustom(db, queueWord("bill", "账单"));
+		clearGlobalSlot(db);
+		db.close();
+		await fake.fire();
+		const check = openTestDb();
+		const items = (check.prepare("SELECT text, shown, introduction_kind FROM items ORDER BY id").all() as any[]).map((row) => ({ ...row }));
+		const state = check.prepare("SELECT active_item_id, active_kind FROM runtime_state WHERE id=1").get() as any;
+		const queued = queueLength(check);
+		check.close();
+		assert.deepEqual(items, [
+			{ text: "menu", shown: 1, introduction_kind: "planned" },
+			{ text: "bill", shown: 1, introduction_kind: "custom" },
+		], "the colliding row inserts nothing; the fresh row still releases");
+		assert.equal(queued, 0, "both queue rows are consumed");
+		assert.equal(state.active_item_id, 2, "the first releasable card is activated");
+		assert.equal(state.active_kind, "teach");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("after a custom release, the remaining quota triggers a partial lesson batch", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-custom-partial" });
+	try {
+		// A 9-word lesson exactly fills 11 - 2 custom cards; the default {10,1}
+		// batch shape would reject this response (INVALID_LESSON_SHAPE).
+		const partialLesson = JSON.stringify({
+			ready: true,
+			topic: "aviation",
+			items: ["aviation", "cockpit", "turbulence", "altitude", "runway", "hangar", "taxiway", "beacon", "vector"].map((text) => ({
+				type: "word", text, phonetic: "/x/", meaning: `词 ${text}`,
+				example: `The ${text} matters.`, example_cn: `${text} 很重要。`,
+			})),
+		});
+		registration.setResponses([
+			fauxAssistantMessage(partialLesson),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 11 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "custom-partial" });
+		const db = openTestDb();
+		enqueueCustom(db, queueWord("alpha", "阿尔法"));
+		enqueueCustom(db, queueWord("beta", "贝塔"));
+		clearGlobalSlot(db);
+		db.close();
+
+		await fake.fire(); // release: alpha activated (teach).
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		await fake.fire(); // beta claimed as a custom new card.
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		// The rating pushed the pacing window to the next interval; simulate the
+		// elapsed interval so the deferred partial-batch generation can run.
+		{ const c = openTestDb(); c.prepare("UPDATE runtime_state SET next_check_at = ? WHERE id=1").run(new Date(0).toISOString()); c.close(); }
+		await fake.fire(); // no due cards left: generate a partial lesson for the 9 remaining slots.
+		await until(fake, () => {
+			const check = openTestDb();
+			const n = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+			check.close();
+			return n === 11;
+		}, "partial lesson fills the remaining 9 slots");
+
+		const check = openTestDb();
+		const byKind = Object.fromEntries(
+			(check.prepare("SELECT introduction_kind, COUNT(*) AS n FROM items GROUP BY introduction_kind").all() as any[])
+				.map((row) => [row.introduction_kind, row.n]),
+		);
+		const state = check.prepare("SELECT active_kind FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual(byKind, { custom: 2, planned: 9 }, "2 released custom cards + a 9-item partial batch");
+		assert.equal(state.active_kind, "teach", "the first partial-batch card is activated");
+		assert.equal(registration.state.callCount, 2, "one generation + one critic call, no retries");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("/anki:add enqueues critic-approved cards and releases the first one immediately", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-add-cmd" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				items: [
+					{ type: "word", text: "napkin", phonetic: "/ˈnæpkɪn/", meaning: "餐巾", example: "Please hand me a napkin.", example_cn: "请递给我一张餐巾。" },
+					{ type: "word", text: "receipt", phonetic: "/rɪˈsiːt/", meaning: "收据", example: "Keep the receipt for returns.", example_cn: "退货要保留收据。" },
+				],
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "add-immediate" });
+		const db = openTestDb();
+		clearGlobalSlot(db);
+		db.close();
+
+		await harness.commands["anki:add"].handler("2 张餐厅常用词", harness.ctx);
+		await until(fake, () => {
+			const check = openTestDb();
+			const active = (check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any).active_item_id;
+			check.close();
+			return active != null;
+		}, "the first enqueued card is released right after /anki:add");
+
+		const check = openTestDb();
+		const items = (check.prepare("SELECT text, shown, introduction_kind FROM items ORDER BY id").all() as any[]).map((row) => ({ ...row }));
+		const queued = queueLength(check);
+		const state = check.prepare("SELECT active_item_id, active_kind FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.deepEqual(items, [
+			{ text: "napkin", shown: 1, introduction_kind: "custom" },
+			{ text: "receipt", shown: 0, introduction_kind: "custom" },
+		]);
+		assert.equal(queued, 0, "both cards moved into items within the quota");
+		assert.equal(state.active_item_id, 1);
+		assert.equal(state.active_kind, "teach");
+		assert.match(harness.widget().join(" "), /napkin/);
+		assert.ok(harness.notifications().some((message) => message.includes("已做好 2 张卡并入队")));
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
 		fake.restore();
 	}
 });

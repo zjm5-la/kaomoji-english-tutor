@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { countTodayNew, getStat, SCHEDULABLE, type ItemRow } from "./db.ts";
+import { countTodayNew, customQueueCount, getStat, SCHEDULABLE, type ItemRow } from "./db.ts";
 
 // -- Pet faces ------------------------------------------------------------
 
@@ -26,12 +26,12 @@ function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: nu
 	const reviews = Number((db.prepare(
 		`SELECT COUNT(*) AS n FROM items WHERE shown = 1 AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
-	// Queued replacements are quota-free; planned cards consume the remaining daily quota.
+	// Queued replacements are quota-free; planned/custom cards consume the remaining daily quota.
 	const queuedReplacement = Number((db.prepare(
 		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND introduction_kind = 'replacement' AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
 	const queuedPlanned = Number((db.prepare(
-		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND (introduction_kind = 'planned' OR introduction_kind IS NULL) AND due_at < ? ${SCHEDULABLE}`,
+		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
 	const remainingPlanned = dailyNewLimit === 0
 		? queuedPlanned
@@ -43,11 +43,16 @@ function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: nu
 export function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
 	const streak = Number(getStat(db, "streak_days") ?? 0);
 	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
-	if (remaining.total === 0) return "";
-	const breakdown = remaining.newCards > 0
-		? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
-		: `（复习 ${remaining.reviews}）`;
-	return `🔥 连续学习 ${streak} 天 · 今日剩余卡片${breakdown}`;
+	const queued = customQueueCount(db);
+	if (remaining.total === 0 && queued === 0) return "";
+	const parts: string[] = [];
+	if (remaining.total > 0) {
+		parts.push(`今日剩余卡片${remaining.newCards > 0
+			? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
+			: `（复习 ${remaining.reviews}）`}`);
+	}
+	if (queued > 0) parts.push(`排队 ${queued}`);
+	return `🔥 连续学习 ${streak} 天 · ${parts.join(" · ")}`;
 }
 
 /** Parse a JSON column safely. */

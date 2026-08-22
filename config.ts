@@ -26,6 +26,9 @@ export const LESSON_CLOZE_ITEMS = 1;
 /** The daily batch is words-majority: phrases may not exceed this count. */
 export const LESSON_MAX_PHRASES = 3;
 
+/** Upper bound on cards a single /anki:add may enqueue (safety clamp). */
+export const MAX_CUSTOM_PER_ADD = 20;
+
 /** Unified output-token ceiling for every generation/evaluation LLM call (256k). */
 export const MAX_OUTPUT_TOKENS = 262_144;
 

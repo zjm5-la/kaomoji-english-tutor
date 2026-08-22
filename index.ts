@@ -7,12 +7,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
-import { AUTO_DETECT_MODELS, DEFAULTS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, dueDirection, directionFsrsState, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, markShown, openDb, pendingReplacementTypes, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
-import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, type AnswerEvaluation, type GeneratedItem, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
+import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
@@ -583,12 +583,12 @@ export default function piEnglishAnkiExtension(
 					due = replacement;
 					isReview = false;
 				} else {
-					// Enforce the planned first-display quota (0 = unlimited, for compatibility).
+					// Enforce the planned/custom first-display quota (0 = unlimited, for compatibility).
 					if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
 						db.exec("ROLLBACK");
 						return undefined;
 					}
-					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind = 'planned' OR introduction_kind IS NULL) ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
+					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 						.get(now.toISOString()) as ItemRow | undefined;
 					isReview = false;
 				}
@@ -1500,6 +1500,98 @@ export default function piEnglishAnkiExtension(
 		}
 	}
 
+	/**
+	 * Release queued /anki:add cards into items, FIFO, consuming today's
+	 * remaining new-card quota (0 = unlimited). The first released card is
+	 * activated immediately; the rest wait in items as first-display cards.
+	 * Pure DB work: no generation token, no LLM call.
+	 */
+	function releaseCustomQueue(ctx: ExtensionContext, now: Date): boolean {
+		if (!db) return false;
+		if (customQueueCount(db) === 0) return false;
+		let released: ItemRow | undefined;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const state = getRuntimeState(db);
+			if (
+				state.active_item_id != null ||
+				!pacingReady(state, now) ||
+				pendingReplacementTypes(db).length > 0 ||
+				getDueItem(db, now)
+			) {
+				db.exec("ROLLBACK");
+				return false;
+			}
+			if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
+				db.exec("ROLLBACK");
+				return false;
+			}
+			const remaining = config.dailyNewLimit > 0
+				? config.dailyNewLimit - countTodayNew(db, now)
+				: customQueueCount(db);
+			const rows = peekCustomQueue(db, remaining);
+			if (rows.length === 0) {
+				db.exec("ROLLBACK");
+				return false;
+			}
+			const removed: number[] = [];
+			let firstId: number | undefined;
+			let firstType: string | undefined;
+			for (const row of rows) {
+				removed.push(row.id);
+				// A queued card may collide with a card the normal lesson flow added
+				// after enqueue: drop the row instead of violating the unique fingerprint.
+				if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(row.fingerprint)) continue;
+				// Re-validate the staged payload: a corrupt or malformed row is dropped
+				// on the same path as a collision (the row is still removed below).
+				const item = (() => {
+					try { return parseGeneratedItem(JSON.parse(row.payload)); } catch { return undefined; }
+				})();
+				if (!item) continue;
+				const id = insertItem(db, item.type, item.text, item.phonetic || null, item.meaning, item.example || null, item.example_cn || null, now, {
+					levels: item.levels,
+					levels_cn: item.levels_cn,
+					chunks: item.chunks,
+					keyWords: item.keyWords,
+					introductionKind: "custom",
+				});
+				if (firstId == null) {
+					firstId = id;
+					firstType = item.type;
+				}
+			}
+			removeCustomQueueRows(db, removed);
+			if (firstId == null) {
+				// Everything queued already exists in the deck: nothing released.
+				db.exec("COMMIT");
+				return false;
+			}
+			markShown(db, firstId);
+			db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(now.toISOString(), firstId);
+			bumpStat(db, "total_learned", 1);
+			touchStreak(db, now);
+			setRuntimeState(db, {
+				active_item_id: firstId,
+				// Cloze cards quiz from the very first showing (see claimDueItem).
+				active_kind: firstType === "cloze" ? "review" : "teach",
+				active_direction: "forward",
+				active_version: state.active_version + 1,
+				...EMPTY_SENTENCE_CYCLE,
+				next_check_at: now.toISOString(),
+			});
+			released = db.prepare("SELECT * FROM items WHERE id = ?").get(firstId) as unknown as ItemRow | undefined;
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[pi-english-anki] Custom queue release failed: ${err}`);
+			return false;
+		}
+		if (released) {
+			if (!showItem(ctx, released)) renderGlobalCard(ctx);
+		}
+		return true;
+	}
+
 	async function petTick(ctx: ExtensionContext) {
 		const generation = sessionGeneration;
 		if (isCtxStale(ctx)) return;
@@ -1559,14 +1651,26 @@ export default function piEnglishAnkiExtension(
 		}
 		if (replacementWaiting) return;
 
-		// 2. Otherwise teach new items (LLM), up to the daily limit (0 = unlimited), single-owner.
+		// 2. Queued /anki:add cards claim the day's remaining new-card quota FIFO,
+		// ahead of fresh lesson generation (pure DB work, no LLM).
+		if (releaseCustomQueue(ctx, now)) return;
+
+		// 3. Otherwise teach new items (LLM), up to the daily limit (0 = unlimited), single-owner.
 		if (config.dailyNewLimit === 0 || countTodayNew(db, now) < config.dailyNewLimit) {
 			if (pendingLLMCall && !resetHungLlmCall()) return;
-			await generateAndInsert(ctx, now);
+			// Partial batches fill only the day's remaining quota; the manual
+			// /anki:teach path keeps the full default batch.
+			const slots = config.dailyNewLimit > 0
+				? config.dailyNewLimit - countTodayNew(db, now)
+				: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS;
+			await generateAndInsert(ctx, now, {
+				wordItems: Math.min(LESSON_WORD_ITEMS, slots),
+				clozeItems: slots >= LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS ? LESSON_CLOZE_ITEMS : 0,
+			});
 			return;
 		}
 
-		// 3. Nothing to do: the pet dozes off
+		// 4. Nothing to do: the pet dozes off
 		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 	}
 
@@ -1580,7 +1684,7 @@ export default function piEnglishAnkiExtension(
 		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.max(1, config.intervalMinutes) * 60_000).toISOString() });
 	}
 
-	async function generateAndInsert(ctx: ExtensionContext, _now: Date) {
+	async function generateAndInsert(ctx: ExtensionContext, _now: Date, batch?: LessonBatch) {
 		const conversationSnapshot = buildConversation(ctx.sessionManager.getBranch());
 		const conversation = manualTeachTopic || conversationSnapshot;
 		const isManual = manualTeachTopic !== "";
@@ -1620,7 +1724,7 @@ export default function piEnglishAnkiExtension(
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog);
+				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
 				if (!effectiveResolved.fromSession && ctx.model &&
@@ -1630,7 +1734,7 @@ export default function piEnglishAnkiExtension(
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog);
+					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch);
 					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
 				} else {
@@ -1650,17 +1754,17 @@ export default function piEnglishAnkiExtension(
 
 			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined);
+			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
 			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
-				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog);
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog, batch);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
 				lesson = revised;
-				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined);
+				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			}
@@ -1751,6 +1855,145 @@ export default function piEnglishAnkiExtension(
 			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
 			logGenStatus(`error: ${lastError}`);
 			deferPacing();
+		} finally {
+			if (db) releaseGeneration(generationToken);
+			if (sessionGeneration === generation) {
+				pendingLLMCall = false;
+				pendingLLMCallAt = 0;
+			}
+		}
+	}
+
+	/** Make custom cards from a user prompt (LLM) and stage them in the FIFO queue. */
+	async function runAddCustomCards(ctx: ExtensionContext, userPrompt: string): Promise<void> {
+		if (!db) return;
+		const generationToken = claimGeneration();
+		if (!generationToken) {
+			ctx.ui.notify("另一轮生成正在进行中，请稍后再试", "info");
+			return;
+		}
+		// Same adaptive snapshot semantics as generateAndInsert: taken after the
+		// generation claim, before any LLM await, and shared by every call below.
+		const adaptive: AdaptiveContext = (() => {
+			const profile = computeLearnerProfile(db!, new Date());
+			return { profile, budget: smoothBudget(db!, deriveBudget(profile)) };
+		})();
+		const known = [
+			...knownList(db),
+			...listCustomQueue(db).flatMap((row) => {
+				try { return [(JSON.parse(row.payload) as GeneratedItem).text]; } catch { return []; }
+			}),
+		];
+		const generation = sessionGeneration;
+		pendingLLMCall = true;
+		pendingLLMCallAt = Date.now();
+		updateWidget(ctx, FACES.teach, ["制卡中，喵…"]);
+		try {
+			let effectiveResolved = resolveModel(ctx);
+			if (!effectiveResolved) throw new Error("NO_MODEL");
+			logGenStatus(`model:${resolvedModelName}`);
+			let decision: CustomCardsDecision;
+			try {
+				decision = await generateCustomCards(llm, ctx, effectiveResolved, userPrompt, known, config, adaptive);
+			} catch (err) {
+				if (sessionGeneration !== generation) return;
+				if (!effectiveResolved.fromSession && ctx.model &&
+					(ctx.model.provider !== effectiveResolved.provider || ctx.model.id !== effectiveResolved.model)) {
+					effectiveResolved = {
+						provider: ctx.model.provider,
+						model: ctx.model.id,
+						fromSession: true,
+					};
+					decision = await generateCustomCards(llm, ctx, effectiveResolved, userPrompt, known, config, adaptive);
+					if (sessionGeneration !== generation) return;
+					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
+				} else {
+					throw err;
+				}
+			}
+			if (sessionGeneration !== generation || !db) return;
+			if (!ownsGeneration(getRuntimeState(db), generationToken)) return;
+			if (!decision.ready) {
+				ctx.ui.notify(`没能根据提示词做出卡：${decision.reason || "信息不足"}`, "warning");
+				logGenStatus(`custom_not_ready: ${decision.reason || ""}`);
+				return;
+			}
+			let items = decision.items;
+			// Independent critic with a custom composition descriptor (fail-closed).
+			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "定制卡", items }, known, config, adaptive, null);
+			if (sessionGeneration !== generation) return;
+			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
+				const revised = await generateCustomCards(llm, ctx, effectiveResolved, userPrompt, known, config, adaptive, verdict.issues);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+				if (!revised.ready) break;
+				items = revised.items;
+				verdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "定制卡", items }, known, config, adaptive, null);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			}
+			if (!verdict.pass) {
+				ctx.ui.notify(
+					verdict.available ? "定制卡内容质量未达标，稍后再试…" : "内容审查暂时不可用，稍后再试…",
+					"warning",
+				);
+				logGenStatus(`${verdict.available ? "custom_critic_rejected" : "critic_unavailable"}: ${verdict.summary || ""}`);
+				return;
+			}
+			// Drop items duplicating the deck or the queue; keep the rest (the user
+			// asked for these cards, so deliver every non-duplicate instead of
+			// rejecting the whole batch).
+			const queueFingerprints = new Set(listCustomQueue(db).map((row) => row.fingerprint));
+			const kept: GeneratedItem[] = [];
+			const dropped: string[] = [];
+			for (const item of items) {
+				const fingerprint = contentFingerprint(item.type, item.text, item.meaning);
+				if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fingerprint) || queueFingerprints.has(fingerprint)) {
+					dropped.push(item.text);
+					continue;
+				}
+				queueFingerprints.add(fingerprint);
+				kept.push(item);
+			}
+			if (kept.length === 0) {
+				ctx.ui.notify("这些卡都已在牌组或队列里，未入队", "info");
+				logGenStatus("custom_all_duplicates");
+				return;
+			}
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const state = getRuntimeState(db);
+				if (!ownsGeneration(state, generationToken, new Date())) {
+					db.exec("ROLLBACK");
+				logGenStatus("custom_enqueue_deferred");
+				ctx.ui.notify("制卡超时未入队，请重试 /anki:add", "warning");
+				return;
+			}
+				for (const item of kept) enqueueCustomCard(db, userPrompt, item);
+				db.exec("COMMIT");
+			} catch (err) {
+				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+				throw err;
+			}
+			const total = customQueueCount(db);
+			const eta = config.dailyNewLimit > 0
+				? `按每日 ${config.dailyNewLimit} 张预计 ${Math.ceil(total / Math.max(1, config.dailyNewLimit))} 天放完`
+				: "不限速，将尽快放出";
+			ctx.ui.notify(`已做好 ${kept.length} 张卡并入队（队列共 ${total} 张，${eta}）`, "info");
+			if (dropped.length) {
+				ctx.ui.notify(`其中 ${dropped.length} 张与已有卡片/队列重复，已丢弃：${dropped.join("、").slice(0, 200)}`, "info");
+			}
+			logGenStatus(`custom_ok: ${kept.length} 张（丢弃 ${dropped.length}）`);
+			// Try to surface the first queued card right away; pacing, an active
+			// card, or quota otherwise defer it to the next tick.
+			releaseCustomQueue(ctx, new Date());
+		} catch (err) {
+			if (sessionGeneration !== generation) return;
+			const msg = (err as Error)?.message || String(err);
+			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
+			ctx.ui.notify(`制卡失败：${lastError}`, "error");
+			logGenStatus(`custom_error: ${lastError}`);
 		} finally {
 			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) {
@@ -2011,6 +2254,53 @@ export default function piEnglishAnkiExtension(
 			void generateAndInsert(ctx, new Date())
 				.catch((err) => console.error(`[pi-english-anki] teach failed: ${err}`))
 				.finally(() => scheduleTimer());
+		},
+	});
+
+	pi.registerCommand("anki:add", {
+		description: "按提示词定制学习卡：立即制卡入队，逐日占用新卡额度",
+		handler: async (args, ctx) => {
+			const userPrompt = String(args ?? "").trim();
+			if (!userPrompt) {
+				ctx.ui.notify("用法：/anki:add <提示词>（例如 /anki:add 5 张餐厅点餐常用英语）", "info");
+				return;
+			}
+			if (!db) {
+				ctx.ui.notify("数据库不可用", "error");
+				return;
+			}
+			if (pendingLLMCall) {
+				ctx.ui.notify("上一轮备课还在进行中，请稍候", "info");
+				return;
+			}
+			ctx.ui.notify(`正在按提示词制卡：「${userPrompt.slice(0, 50)}」`, "info");
+			void runAddCustomCards(ctx, userPrompt)
+				.catch((err) => console.error(`[pi-english-anki] add failed: ${err}`))
+				.finally(() => scheduleTimer());
+		},
+	});
+
+	pi.registerCommand("anki:queue", {
+		description: "查看排队的定制卡（只读）",
+		handler: async (_args, ctx) => {
+			if (!db) return;
+			const rows = listCustomQueue(db);
+			if (rows.length === 0) {
+				ctx.ui.notify("没有排队的定制卡", "info");
+				return;
+			}
+			const lines = rows.slice(0, 15).map((row) => {
+				let item: GeneratedItem | undefined;
+				try { item = JSON.parse(row.payload) as GeneratedItem; } catch { /* corrupt row */ }
+				return item
+					? `${row.id}. ${TYPE_LABELS[item.type] ?? item.type} ${item.text} — ${item.meaning}`
+					: `${row.id}. （无法解析的队列项）`;
+			});
+			if (rows.length > 15) lines.push(`…以及 ${rows.length - 15} 张更多`);
+			const eta = config.dailyNewLimit > 0
+				? `，按每日 ${config.dailyNewLimit} 张预计 ${Math.ceil(rows.length / Math.max(1, config.dailyNewLimit))} 天放完`
+				: "，不限速，将尽快放出";
+			ctx.ui.notify(`${lines.join("\n")}\n共 ${rows.length} 张${eta}`, "info");
 		},
 	});
 

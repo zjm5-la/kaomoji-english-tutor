@@ -18,7 +18,8 @@
 ### 机制
 
 - **时间触发**：默认每 10 分钟自动检查备课/到期状态（可配置）；若队列里已有可学习卡，评分后会像 Anki 一样立即显示下一张，不在两张卡之间强制等待
-- **按需备课**：条件满足后生成一天的完整批次：10 个单词或词组（以单词为主，词组最多 3 个）加 1 个语法填空。学习者备考雅思：单词/词组至少 3 个来自当前会话的真实表达，其余从雅思入门/基础段（4.0-5.5 分，A2-B1）高频常用核心词选取（雅思线贴合画像词汇档、初学阶段禁超纲学术难词，critic 把关；会话来源的工作词汇不受难度限制，立即能用即优先）；会话缺乏英语内容时也用雅思词汇出满一批。新卡只在首次真正展示时消耗每日额度；Skip 补卡严格一换一、额度外，并让位于已到期复习，补卡同样可用雅思词汇兜底
+- **按需备课**：条件满足后生成一天的完整批次：10 个单词或词组（以单词为主，词组最多 3 个）加 1 个语法填空。学习者备考雅思：单词/词组至少 3 个来自当前会话的真实表达，其余从雅思入门/基础段（4.0-5.5 分，A2-B1）高频常用核心词选取（雅思线贴合画像词汇档、初学阶段禁超纲学术难词，critic 把关；会话来源的工作词汇不受难度限制，立即能用即优先）；会话缺乏英语内容时也用雅思词汇出满一批。新卡只在首次真正展示时消耗每日额度；当天额度有剩余时允许备课以不足额的部分批次补足；Skip 补卡严格一换一、额度外，并让位于已到期复习，补卡同样可用雅思词汇兜底
+- **定制加卡**：`/anki:add <提示词>` 立即用 LLM 按提示词制卡（类型限单词/词组/语法填空，数量按提示词、未写明默认 5 张，单次上限 20 张，独立 critic 把关），做好的卡进入 FIFO 排队（随 SQLite 同步）；每个 tick 按当日剩余新卡额度从队首放出，队列卡让位于到期复习与 Skip 补卡；与已有卡/队列重复的定制卡在入队时丢弃。`/anki:queue` 可查看队列与预计放完天数，widget 状态行显示排队张数
 - **适应难度**：从近 60 天答题记录确定性聚合学习者画像（句法/词汇档位、首轮通过率、辅助依赖、归一化薄弱点），推导客观难度预算（句长区间、句法复杂度、词汇层次、生词上限、爬坡方向）。备课与独立 critic 都接入同一预算；句长/生词数超出预算会被审查客观打回。冷启动先验为 B1；零/低证据时默认巩固而非拉伸，预算经迟滞平滑（升档每次备课最多一档、降档立即、拉伸需连续两次信号）。B0–B3 为未校准的内部难度档，不是 CEFR 测量
 - **统一 Pi SDK 通信**：备课、独立 critic、修订、补卡、句子数据补全及答案评价全部通过隔离的 Pi SDK 内存会话执行；内部会话不加载扩展、skills、项目上下文或文件工具。生成内容和补卡只有通过独立 critic 才会写入
 - **语法填空**：每道题是一句英文恰挖一个空（空后括号给原形提示），专考时态、语态、主谓一致、介词等明确语法点，答案唯一；题面只显示英文句（中文翻译和考点说明留在答案面）；**首次出场就直接做题**，首答即真实掌握证据，无教学面；本地精确评判、SDK LLM 兄底。更早生成的渐进默写句子卡不再新增，存量卡片照常复习（L1 填空 → L2 分句 → L3 整句）
@@ -57,7 +58,9 @@ pi install git:github.com/zjm5-la/pi-english-anki
 | `/anki:answer <答案>` | 单词/词组双向回忆，或提交句子渐进输出；系统本地匹配或调用 SDK LLM 判定 |
 | `/anki:hint` | 显示当前单词/词组回忆提示，或句子当前级别的英文首字提示 |
 | `/anki:stats` | 显示掌握阶段分布、强化需求、答题正确率，以及学习者画像（档位/置信度/首轮通过率/辅助/薄弱点）与当前难度预算 |
-| `/anki:teach <话题>` | 立即就指定话题备课（绕过自动话题检测） |
+| `/anki:teach <话题>` | 立即就指定话题备课（绕过自动话题检测；始终整批生成） |
+| `/anki:add <提示词>` | 按提示词定制学习卡：立即制卡入队，逐日占用新卡额度放出（如 `/anki:add 5 张餐厅点餐常用英语`） |
+| `/anki:queue` | 只读查看排队的定制卡与预计放完天数 |
 | `/anki:good` | 手动自评记得：单独记录为自评，调度保守（至多 Hard），不产生客观掌握证据；句子卡不能跳过真实输出 |
 | `/anki:again` | 手动评分为忘了；句子在任意级别都可结束本轮并从 L1 重新调度 |
 | `/anki:skip` | 标记为很熟，至少 365 天后再出现，并尝试补充同类型卡片 |
@@ -110,7 +113,8 @@ A kaomoji pet that lives in a widget below the editor, prepares lessons from you
 ### How it works
 
 - **Time-triggered**: checks lesson/readiness state every 10 minutes by default; when another stored card is ready, rating immediately surfaces it Anki-style with no forced inter-card delay
-- **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates 1 word, 1 phrase, and 1 grammar cloze. Planned cards consume quota only on first display; Skip replacements are strictly one-for-one, quota-free, and yield to due reviews
+- **Readiness-aware lessons**: the model waits when the conversation lacks a useful topic, and identical rejected context is not sent again. When ready, it creates a full daily batch; when the day's quota is partially spent, a smaller partial batch fills only the remainder. Planned cards consume quota only on first display; Skip replacements are strictly one-for-one, quota-free, and yield to due reviews
+- **Custom cards**: `/anki:add <prompt>` makes cards from your prompt immediately via the LLM (word/phrase/cloze only; count from the prompt, default 5, capped at 20 per call; independent critic gates quality), then stages them in a FIFO queue synced with the SQLite DB. Each tick releases as many queued cards as the day's remaining new-card quota allows, after due reviews and Skip replacements; duplicates against the deck or the queue are dropped at enqueue time. `/anki:queue` lists the queue and the estimated drain time; the widget status line shows the queue length
 - **Unified Pi SDK transport**: lesson generation, independent critique, revision, replacements, sentence-data completion, and answer evaluation all run through isolated in-memory Pi SDK sessions with no discovered extensions, skills, project context, or file tools. Lessons and replacements are inserted only after independent critic approval
 - **Grammar cloze**: each card is one English sentence with exactly one blank (lemma hint in parentheses), targeting a single clear grammar point (tense, voice, agreement, prepositions, ...) with a unique answer; the question face shows only the English sentence (translation and grammar note stay on the answer face); **the very first showing is already the quiz** — the first answer is genuine mastery evidence, no teach face; graded by local exact match with isolated SDK LLM fallback. Legacy progressive sentence cards are no longer generated but keep being reviewed normally (L1 cloze → L2 clause → L3 full sentence)
 - **Spaced repetition**: items use [FSRS](https://github.com/open-spaced-repetition/fsrs.js). Word/phrase Chinese→English production and English→Chinese recognition are distinct skills with independent FSRS states and due times (legacy state migrates into both directions); the two directions are forced at least 24h apart so a just-reviewed direction cannot prime the other; a due card surfaces its actually-due direction, ties favor production so recognition cannot leak the answer. Assistance-aware scheduling: unassisted correct = Good, correct after a hint = at most Hard, correct after a flip/reveal = Again; manual `/anki:good` is recorded separately as a self-report and scheduled conservatively (at most Hard), never as objective evidence. Unavailable evaluation writes no score. A sentence allows corrective retries but commits one Good/Again based on the first-recall path; corrupt FSRS state is preserved and quarantined instead of silently reset
@@ -148,7 +152,9 @@ Or add to `settings.json`:
 | `/anki:answer <answer>` | Submit bidirectional word/phrase recall or progressive written sentence output; checked locally or by the SDK evaluator |
 | `/anki:hint` | Show the current word/phrase recall hint or the sentence level's initial-letter hint |
 | `/anki:stats` | Show mastery-stage distribution, reinforcement needs, answer accuracy, plus the learner profile (bands/confidence/first-pass rates/assistance/error focus) and current difficulty budget |
-| `/anki:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness) |
+| `/anki:teach <topic>` | Prepare a lesson on a specific topic now (bypasses auto-readiness; always a full batch) |
+| `/anki:add <prompt>` | Make custom cards from a prompt now, queue them, and release them day by day against the daily new-card quota (e.g. `5 restaurant words`) |
+| `/anki:queue` | Read-only list of queued custom cards and the estimated days to drain |
 | `/anki:good` | Manual self-report of knowing: recorded separately and scheduled conservatively (at most Hard), never objective mastery evidence; cannot bypass required sentence output |
 | `/anki:again` | Manually rate forgotten; from any sentence level, end the cycle and schedule the next attempt from L1 |
 | `/anki:skip` | Mark as well known, return after at least 365 days, and attempt a same-type replacement |
